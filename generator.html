@@ -54,13 +54,12 @@ const PALETTE = {
 	wall: '#888888', wallOutline: '#000000', gate: '#efe9d8',
 	bridgeDock: '#c8a46a', bridgeDockOutline: '#000000',
 	seed: '#c0392b',
-	block: '#888888',
+	block: '#000000',
 	building: '#888888', buildingStroke: '#000000',
 	garden: '#b9f05a', gardenStroke: '#000000',
 	alley: '#a99d77',
 	// Orienteering landmarks dropped into chamfered corner gaps.
-	featureTree: '#2f8f3e', featureFountain: '#2b7fc4', featureOutline: '#1c1c1c',
-};
+	featureObject: '#000', featureFountain: '#2b7fc4'};
 const RIVER_BANK_SCALE = 1.3;
 
 let data = null, bounds = null;
@@ -227,9 +226,10 @@ function drawBridges(river) {
 		const i = river.course.findIndex((p) => Math.abs(p.x - bridge.x) < 1e-6 && Math.abs(p.y - bridge.y) < 1e-6);
 		if (i <= 0 || i >= river.course.length - 1) continue;
 		let d = '';
+		let a, b;
 		if (bridge.from && bridge.to) {
-			const a = endpointAlongEdge(bridge, bridge.from);
-			const b = endpointAlongEdge(bridge, bridge.to);
+			a = endpointAlongEdge(bridge, bridge.from);
+			b = endpointAlongEdge(bridge, bridge.to);
 			const c = bridgePoint(bridge);
 			d = `M${a.x},${a.y} Q${c.x},${c.y} ${b.x},${b.y}`;
 		} else {
@@ -238,9 +238,14 @@ function drawBridges(river) {
 			const len = Math.hypot(dx, dy) || 1;
 			const nx = -dy / len * riverWidth * 0.6;
 			const ny = dx / len * riverWidth * 0.6;
-			d = `M${bridge.x - nx},${bridge.y - ny} L${bridge.x + nx},${bridge.y + ny}`;
+			a = { x: bridge.x - nx, y: bridge.y - ny };
+			b = { x: bridge.x + nx, y: bridge.y + ny };
+			d = `M${a.x},${a.y} L${b.x},${b.y}`;
 		}
-		for (const [stroke, width] of [[PALETTE.bridgeDockOutline, 1.6], [PALETTE.bridgeDock, 0.8]]) {
+		const fill = '#e4d7b6';
+		const fillWidth = 1.6;
+		const outlineWidth = fillWidth + 0.4; // 0.05 rim on each side
+		for (const [stroke, width] of [[PALETTE.bridgeDockOutline, outlineWidth], [fill, fillWidth]]) {
 			const path = document.createElementNS(SVGNS, 'path');
 			path.setAttribute('d', d); path.setAttribute('fill', 'none');
 			path.setAttribute('stroke', stroke); path.setAttribute('stroke-width', width);
@@ -254,10 +259,23 @@ function drawDocks(docks) {
 	if (!docks || docks.length === 0) return;
 	for (const dock of docks) {
 		const w = dock.large ? 2 : 1;
+		// Revert dock fill to its original width; outline is a thin black rim on the sides
+		// plus a flat cap at the sea end.
+		const fillWidth = 1.6 * w;
+		const outlineWidth = fillWidth + 0.4 * w; // 0.2 rim on each side
+		const fill = '#e4d7b6';
 		for (const pier of dock.piers || []) {
 			if (!pier.from || !pier.to) continue;
-			const d = `M${pier.from.x},${pier.from.y} L${pier.to.x},${pier.to.y}`;
-			for (const [stroke, width] of [[PALETTE.bridgeDockOutline, 3.2 * w], [PALETTE.bridgeDock, 1.6 * w]]) {
+			const dx = pier.to.x - pier.from.x;
+			const dy = pier.to.y - pier.from.y;
+			const len = Math.hypot(dx, dy) || 1;
+			const ux = dx / len;
+			const uy = dy / len;
+			// Extend the black outline slightly past the sea-side end so it forms a flat end cap.
+			const seaCap = { x: pier.to.x + ux * outlineWidth / 10, y: pier.to.y + uy * outlineWidth / 10 };
+			const dFill = `M${pier.from.x},${pier.from.y} L${pier.to.x},${pier.to.y}`;
+			const dOutline = `M${pier.from.x},${pier.from.y} L${seaCap.x},${seaCap.y}`;
+			for (const [stroke, width, d] of [[PALETTE.bridgeDockOutline, outlineWidth, dOutline], [fill, fillWidth, dFill]]) {
 				const path = document.createElementNS(SVGNS, 'path');
 				path.setAttribute('d', d); path.setAttribute('fill', 'none');
 				path.setAttribute('stroke', stroke); path.setAttribute('stroke-width', width);
@@ -268,19 +286,95 @@ function drawDocks(docks) {
 	}
 }
 
+// Fillet radius for the block outline corners equals the building-lot shrink distance.
+// Alley gap defaults to 0.8, so gap/2 = 0.4.
+const BLOCK_OUTLINE_FILLET = 0.4;
+
+function roundedBlockPath(points, r) {
+	if (!points || points.length < 3) return null;
+	const n = points.length;
+	const leftNormal = (dx, dy, len) => (len > 0 ? { x: -dy / len, y: dx / len } : null);
+
+	const segs = [];
+	for (let i = 0; i < n; i++) {
+		const A = points[(i - 1 + n) % n];
+		const B = points[i];
+		const C = points[(i + 1) % n];
+
+		const inDx = B.x - A.x, inDy = B.y - A.y;
+		const outDx = C.x - B.x, outDy = C.y - B.y;
+		const inLen = Math.hypot(inDx, inDy);
+		const outLen = Math.hypot(outDx, outDy);
+		if (inLen < 1e-9 || outLen < 1e-9) return null;
+
+		const inUx = inDx / inLen, inUy = inDy / inLen;
+		const outUx = outDx / outLen, outUy = outDy / outLen;
+		const dot = inUx * outUx + inUy * outUy;
+		const turn = Math.acos(Math.max(-1, Math.min(1, dot)));
+		if (turn < 1e-6) return null;
+
+		// Interior bisector for a CCW polygon is the sum of the edge left-normals.
+		const lnIn = leftNormal(inDx, inDy, inLen);
+		const lnOut = leftNormal(outDx, outDy, outLen);
+		const bisX = lnIn.x + lnOut.x;
+		const bisY = lnIn.y + lnOut.y;
+		const bisLen = Math.hypot(bisX, bisY);
+		if (bisLen < 1e-9) return null;
+		const nBisX = bisX / bisLen;
+		const nBisY = bisY / bisLen;
+
+		const halfTurn = turn / 2;
+		const tanHalf = Math.tan(halfTurn);
+		const cosHalf = Math.cos(halfTurn);
+		if (tanHalf < 1e-9 || cosHalf < 1e-9) return null;
+
+		// Clamp tangent distance so the fillet never overruns an edge.
+		let d = r * tanHalf;
+		d = Math.min(d, inLen * 0.499, outLen * 0.499);
+		const effR = d / tanHalf;
+		const centerDist = effR / cosHalf;
+
+		const t1x = B.x - inUx * d;
+		const t1y = B.y - inUy * d;
+		const t2x = B.x + outUx * d;
+		const t2y = B.y + outUy * d;
+		const cx = B.x + nBisX * centerDist;
+		const cy = B.y + nBisY * centerDist;
+
+		const a1 = Math.atan2(t1y - cy, t1x - cx);
+		const a2 = Math.atan2(t2y - cy, t2x - cx);
+		let delta = a2 - a1;
+		while (delta > Math.PI) delta -= 2 * Math.PI;
+		while (delta < -Math.PI) delta += 2 * Math.PI;
+		const sweep = delta > 0 ? 1 : 0;
+		const largeArc = Math.abs(delta) > Math.PI ? 1 : 0;
+
+		segs.push({ t1x, t1y, t2x, t2y, cx, cy, r: effR, sweep, largeArc });
+	}
+
+	let d = `M${segs[0].t2x},${segs[0].t2y}`;
+	for (let i = 0; i < n; i++) {
+		const next = segs[(i + 1) % n];
+		d += ` L${next.t1x},${next.t1y}`;
+		d += ` A${next.r},${next.r} 0 ${next.largeArc},${next.sweep} ${next.t2x},${next.t2y}`;
+	}
+	return d + 'Z';
+}
+
 function drawBlocks(blocks) {
 	if (!blocks || blocks.length === 0) return;
 	let d = '';
 	for (const b of blocks) {
 		if (!b || b.length < 3) continue;
-		d += 'M' + b.map((p) => p.x + ',' + p.y).join('L') + 'Z';
+		const rounded = roundedBlockPath(b, BLOCK_OUTLINE_FILLET);
+		if (rounded) d += rounded;
 	}
 	if (!d) return;
 	const el = document.createElementNS(SVGNS, 'path');
 	el.setAttribute('d', d);
 	el.setAttribute('fill', 'none');
 	el.setAttribute('stroke', PALETTE.block);
-	el.setAttribute('stroke-width', '0.12');
+	el.setAttribute('stroke-width', '0.06');
 	el.setAttribute('stroke-linejoin', 'round');
 	el.setAttribute('fill-rule', 'evenodd');
 	vp.appendChild(el);
@@ -312,9 +406,9 @@ function drawFeatures(features) {
 		if (!Number.isFinite(f.x) || !Number.isFinite(f.y)) continue;
 		const c = document.createElementNS(SVGNS, 'circle');
 		c.setAttribute('cx', f.x); c.setAttribute('cy', f.y); c.setAttribute('r', r);
-		c.setAttribute('fill', f.kind === 'fountain' ? PALETTE.featureFountain : PALETTE.featureTree);
-		c.setAttribute('stroke', PALETTE.featureOutline);
-		c.setAttribute('stroke-width', '0.12');
+		c.setAttribute('stroke', f.kind === 'fountain' ? PALETTE.featureFountain : PALETTE.featureObject);
+		c.setAttribute('stroke-width', '0.2');
+		c.setAttribute('fill', "none");
 		vp.appendChild(c);
 	}
 }
@@ -341,11 +435,8 @@ function render(d) {
 		const el = document.createElementNS(SVGNS, 'polygon');
 		el.setAttribute('points', w.polygon.map((p) => p.x + ',' + p.y).join(' '));
 		const fill = w.water ? PALETTE.waterFill : w.inner ? PALETTE.innerFill : PALETTE.outerFill;
-		const stroke = w.water ? PALETTE.waterStroke : w.inner ? PALETTE.innerStroke : PALETTE.outerStroke;
 		el.setAttribute('fill', fill);
-		el.setAttribute('stroke', stroke);
-		el.setAttribute('stroke-width', '1');
-		el.setAttribute('vector-effect', 'non-scaling-stroke');
+		el.setAttribute('stroke', 'none');
 		vp.appendChild(el);
 	}
 	drawBlocks(d.blocks);

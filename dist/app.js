@@ -3510,11 +3510,11 @@
       if (!wall.shape || wall.shape.length < 3) continue;
       const isCastle = !!wall.isCastle;
       const strokeColor = isCastle ? palette.castleWall : palette.wall;
-      const strokeWidth = isCastle ? mainWidth * 0.45 : mainWidth * 0.3;
+      const strokeWidth = 0.18;
       const segPath = wallSegmentsPath(wall, riverWidth, riverNodes);
       if (segPath) {
-        layerWalls.appendChild(makePath(segPath, { stroke: palette.wallOutline, strokeWidth: strokeWidth + 0.45 }));
-        layerWalls.appendChild(makePath(segPath, { stroke: strokeColor, strokeWidth }));
+        layerWalls.appendChild(makePath(segPath, { stroke: palette.wallOutline, strokeWidth: strokeWidth + 0.45, linecap: "round" }));
+        layerWalls.appendChild(makePath(segPath, { stroke: strokeColor, strokeWidth, linecap: "round" }));
       } else {
         const outline = makePolygon(wall.shape, { fill: "none", stroke: palette.wallOutline, strokeWidth: strokeWidth + 0.45 });
         outline.setAttribute("stroke-linejoin", "round");
@@ -3526,7 +3526,7 @@
       const towerR = Math.max(mainWidth * 1.5, 0.6);
       for (const t of wall.towers || []) {
         const pos = adjustedTowerPos(wall, t, riverWidth, riverNodes, towerR);
-        layerWalls.appendChild(makeCircle(pos, towerR, { fill: palette.tower, stroke: palette.wallOutline, strokeWidth: 0.225 }));
+        layerWalls.appendChild(makeCircle(pos, towerR, { fill: palette.tower, stroke: palette.wallOutline, strokeWidth: 0.18 }));
       }
       for (const g2 of wall.gates || []) {
         if (riverNodes.has(`${g2.x},${g2.y}`)) continue;
