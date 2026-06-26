@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ward generator (port of MFCG, part 1)</title>
+<style>
+	html, body { margin: 0; height: 100%; overflow: hidden; background: #efe9d8; font-family: -apple-system, "Segoe UI", sans-serif; }
+	#map { width: 100vw; height: 100vh; display: block; touch-action: none; cursor: grab; }
+	#bar { position: fixed; top: 8px; left: 8px; right: 8px; display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center;
+		background: rgba(28,30,32,.85); color: #eee; padding: 8px 10px; border-radius: 8px; font-size: 13px; }
+	#bar label { display: flex; align-items: center; gap: 5px; }
+	#bar input[type=number] { width: 78px; }
+	#bar input { background: #1b1d1f; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; }
+	#bar button { background: #5b9bd5; color: #0e1116; border: none; border-radius: 4px; padding: 6px 11px; font-weight: 600; cursor: pointer; }
+	#bar button.sec { background: #2a2e33; color: #eee; }
+	#status { margin-left: auto; opacity: .85; }
+</style>
+</head>
+<body>
+<div id="bar">
+	<label>seed <input id="seed" type="number" min="1" step="1" value="42" /></label>
+	<button id="rnd" class="sec">random</button>
+	<label>size <input id="size" type="range" min="6" max="40" step="1" value="15" /><span id="sizeval">15</span></label>
+	<label><input id="plaza" type="checkbox" checked /> plaza</label>
+	<label><input id="coast" type="checkbox" checked /> coast</label>
+	<label><input id="river" type="checkbox" checked /> river</label>
+	<label><input id="walls" type="checkbox" checked /> walls</label>
+	<label><input id="streets" type="checkbox" checked /> streets</label>
+	<label>outer ratio <input id="outerratio" type="range" min="4" max="8" step="0.5" value="8" /><span id="outerratioval">4x</span></label>
+	<label>road density <input id="roaddens" type="range" min="0" max="3" step="0.25" value="3" /><span id="roaddensval">3</span></label>
+	<label>gates <input id="gates" type="number" min="-1" max="16" step="1" value="-1" /></label>
+	<label><input id="seeds" type="checkbox" /> seeds</label>
+	<button id="gen">Generate</button>
+	<button id="fit" class="sec">Fit</button>
+	<span id="status">…</span>
+</div>
+<svg id="map" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
+
+<script type="module">
+import { generateWards } from './src/core/CityGen.js';
+
+const SVGNS = 'http://www.w3.org/2000/svg';
+const svg = document.getElementById('map');
+const vp = document.getElementById('vp');
+const statusEl = document.getElementById('status');
+const $ = (id) => document.getElementById(id);
+
+const PALETTE = {
+	innerFill: '#e4d7b6', innerStroke: '#9a8a63',   // city wards
+	outerFill: '#cdd6ac', outerStroke: '#9aa877',   // countryside wards
+	waterFill: '#9ec6dd', waterStroke: '#6f9bb5',   // sea / lakes
+	river: '#9ec6dd', riverBank: '#6f9bb5',         // river / canal
+	wall: '#232323', gate: '#efe9d8',
+	road: '#8f7f62', roadCore: '#efe9d8',
+	seed: '#c0392b',
+};
+const RIVER_BANK_SCALE = 1.3;
+
+let data = null, bounds = null;
+
+// Chaikin's corner-cutting (reference: Hf.render / com.watabou.geom.Chaikin).
+// Each interior vertex is replaced by two points 1/4 toward each neighbour;
+// endpoints are preserved. 3 iterations matches the reference river rendering.
+function chaikinSmooth(pts, iterations) {
+	if (pts.length < 3) return pts;
+	let a = pts;
+	for (let it = 0; it < iterations; it++) {
+		const h = [a[0]];
+		for (let i = 1, n = a.length - 1; i < n; i++) {
+			const g = a[i], p = a[i - 1], nx = a[i + 1];
+			h.push({ x: g.x * 0.75 + p.x * 0.25, y: g.y * 0.75 + p.y * 0.25 });
+			h.push({ x: g.x * 0.75 + nx.x * 0.25, y: g.y * 0.75 + nx.y * 0.25 });
+		}
+		h.push(a[a.length - 1]);
+		a = h;
+	}
+	return a;
+}
+
+function polyPath(pts) {
+	if (pts.length < 2) return '';
+	return 'M' + pts.map(p => p.x + ',' + p.y).join('L');
+}
+
+function dist(a, b) {
+	return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function previewDeltaFromPath(delta, path, width) {
+	if (!delta || path.length < 2) return delta;
+	const p0 = path[0], p1 = path[1];
+	const dx = p1.x - p0.x, dy = p1.y - p0.y;
+	const len = Math.hypot(dx, dy) || 1;
+	const tx = dx / len, ty = dy / len;
+	const hw = width / 2;
+	const a = { x: p0.x - ty * hw, y: p0.y + tx * hw };
+	const b = { x: p0.x + ty * hw, y: p0.y - tx * hw };
+	const right = dist(a, delta.right) <= dist(b, delta.right) ? a : b;
+	const left = right === a ? b : a;
+	const ctrlLen = Math.max(dist(delta.right, delta.rightCtrl1), len * 0.5);
+	return {
+		...delta,
+		right,
+		rightCtrl1: { x: right.x - tx * ctrlLen, y: right.y - ty * ctrlLen },
+		leftCtrl2: { x: left.x - tx * ctrlLen, y: left.y - ty * ctrlLen },
+		left,
+	};
+}
+
+function deltaPath(dl) {
+	let d = `M${dl.right.x},${dl.right.y}`;
+	d += ` C${dl.rightCtrl1.x},${dl.rightCtrl1.y} ${dl.rightCtrl2.x},${dl.rightCtrl2.y} ${dl.prevShore.x},${dl.prevShore.y}`;
+	if (dl.isConvex) d += ` L${dl.mouth.x},${dl.mouth.y}`;
+	d += ` L${dl.nextShore.x},${dl.nextShore.y}`;
+	d += ` C${dl.leftCtrl1.x},${dl.leftCtrl1.y} ${dl.leftCtrl2.x},${dl.leftCtrl2.y} ${dl.left.x},${dl.left.y}`;
+	return d + ' Z';
+}
+
+function drawWall(wall) {
+	if (!wall || !wall.shape || wall.shape.length < 2) return;
+	const thickness = 3.2;
+	for (let i = 0; i < wall.shape.length; i++) {
+		if (wall.segments && wall.segments[i] === false) continue;
+		const a = wall.shape[i];
+		const b = wall.shape[(i + 1) % wall.shape.length];
+		const seg = document.createElementNS(SVGNS, 'line');
+		seg.setAttribute('x1', a.x); seg.setAttribute('y1', a.y);
+		seg.setAttribute('x2', b.x); seg.setAttribute('y2', b.y);
+		seg.setAttribute('stroke', PALETTE.wall); seg.setAttribute('stroke-width', thickness);
+		seg.setAttribute('stroke-linecap', 'round'); seg.setAttribute('stroke-linejoin', 'round');
+		vp.appendChild(seg);
+	}
+	for (const t of wall.towers || []) {
+		const tower = document.createElementNS(SVGNS, 'circle');
+		tower.setAttribute('cx', t.x); tower.setAttribute('cy', t.y);
+		tower.setAttribute('r', thickness * 1.15); tower.setAttribute('fill', PALETTE.wall);
+		vp.appendChild(tower);
+	}
+	for (const gate of wall.gates || []) {
+		const idx = wall.shape.findIndex((p) => Math.abs(p.x - gate.x) < 1e-6 && Math.abs(p.y - gate.y) < 1e-6);
+		if (idx === -1) continue;
+		const prev = wall.shape[(idx + wall.shape.length - 1) % wall.shape.length];
+		const next = wall.shape[(idx + 1) % wall.shape.length];
+		const dx = next.x - prev.x, dy = next.y - prev.y;
+		const len = Math.hypot(dx, dy) || 1;
+		const ux = dx / len * thickness * 1.9, uy = dy / len * thickness * 1.9;
+		const cut = document.createElementNS(SVGNS, 'line');
+		cut.setAttribute('x1', gate.x - ux); cut.setAttribute('y1', gate.y - uy);
+		cut.setAttribute('x2', gate.x + ux); cut.setAttribute('y2', gate.y + uy);
+		cut.setAttribute('stroke', PALETTE.gate); cut.setAttribute('stroke-width', thickness * 2.2);
+		cut.setAttribute('stroke-linecap', 'butt');
+		vp.appendChild(cut);
+	}
+}
+
+function drawRoads(roads) {
+	if (!roads || !roads.arteries) return;
+	for (const road of roads.arteries) {
+		if (!road || road.length < 2) continue;
+		const d = polyPath(road);
+		const outline = document.createElementNS(SVGNS, 'path');
+		outline.setAttribute('d', d); outline.setAttribute('fill', 'none');
+		outline.setAttribute('stroke', PALETTE.road); outline.setAttribute('stroke-width', '2.4');
+		outline.setAttribute('stroke-linecap', 'round'); outline.setAttribute('stroke-linejoin', 'round');
+		vp.appendChild(outline);
+		const core = document.createElementNS(SVGNS, 'path');
+		core.setAttribute('d', d); core.setAttribute('fill', 'none');
+		core.setAttribute('stroke', PALETTE.roadCore); core.setAttribute('stroke-width', '1.2');
+		core.setAttribute('stroke-linecap', 'round'); core.setAttribute('stroke-linejoin', 'round');
+		vp.appendChild(core);
+	}
+}
+
+function drawBridges(river) {
+	if (!river || !river.bridges || !river.course || river.course.length < 3) return;
+	const riverWidth = Number.isFinite(river.width) ? river.width : 5;
+	const bridgePoint = (bridge) => ({ x: bridge.x, y: bridge.y });
+	const endpointAlongEdge = (bridge, edgePoint) => {
+		const dx = edgePoint.x - bridge.x, dy = edgePoint.y - bridge.y;
+		const len = Math.hypot(dx, dy) || 1;
+		const distance = Math.min(len * 0.85, Math.max(riverWidth * 0.95, 4.5));
+		return { x: bridge.x + dx / len * distance, y: bridge.y + dy / len * distance };
+	};
+	for (const bridge of river.bridges) {
+		const i = river.course.findIndex((p) => Math.abs(p.x - bridge.x) < 1e-6 && Math.abs(p.y - bridge.y) < 1e-6);
+		if (i <= 0 || i >= river.course.length - 1) continue;
+		let d = '';
+		if (bridge.from && bridge.to) {
+			const a = endpointAlongEdge(bridge, bridge.from);
+			const b = endpointAlongEdge(bridge, bridge.to);
+			const c = bridgePoint(bridge);
+			d = `M${a.x},${a.y} Q${c.x},${c.y} ${b.x},${b.y}`;
+		} else {
+			const prev = river.course[i - 1], next = river.course[i + 1];
+			const dx = next.x - prev.x, dy = next.y - prev.y;
+			const len = Math.hypot(dx, dy) || 1;
+			const nx = -dy / len * riverWidth * 0.8;
+			const ny = dx / len * riverWidth * 0.8;
+			d = `M${bridge.x - nx},${bridge.y - ny} L${bridge.x + nx},${bridge.y + ny}`;
+		}
+		for (const [stroke, width] of [[PALETTE.road, 2.4], [PALETTE.roadCore, 1.2]]) {
+			const path = document.createElementNS(SVGNS, 'path');
+			path.setAttribute('d', d); path.setAttribute('fill', 'none');
+			path.setAttribute('stroke', stroke); path.setAttribute('stroke-width', width);
+			path.setAttribute('stroke-linecap', 'round'); path.setAttribute('stroke-linejoin', 'round');
+			vp.appendChild(path);
+		}
+	}
+}
+
+function drawDocks(docks) {
+	if (!docks || docks.length === 0) return;
+	for (const dock of docks) {
+		for (const pier of dock.piers || []) {
+			if (!pier.from || !pier.to) continue;
+			const d = `M${pier.from.x},${pier.from.y} L${pier.to.x},${pier.to.y}`;
+			for (const [stroke, width] of [[PALETTE.road, 2.4], [PALETTE.roadCore, 1.2]]) {
+				const path = document.createElementNS(SVGNS, 'path');
+				path.setAttribute('d', d); path.setAttribute('fill', 'none');
+				path.setAttribute('stroke', stroke); path.setAttribute('stroke-width', width);
+				path.setAttribute('stroke-linecap', 'round'); path.setAttribute('stroke-linejoin', 'round');
+				vp.appendChild(path);
+			}
+		}
+	}
+}
+
+function render(d) {
+	while (vp.firstChild) vp.removeChild(vp.firstChild);
+	for (const w of d.wards) {
+		if (!w.polygon || w.polygon.length < 3) continue;
+		const el = document.createElementNS(SVGNS, 'polygon');
+		el.setAttribute('points', w.polygon.map((p) => p.x + ',' + p.y).join(' '));
+		const fill = w.water ? PALETTE.waterFill : w.inner ? PALETTE.innerFill : PALETTE.outerFill;
+		const stroke = w.water ? PALETTE.waterStroke : w.inner ? PALETTE.innerStroke : PALETTE.outerStroke;
+		el.setAttribute('fill', fill);
+		el.setAttribute('stroke', stroke);
+		el.setAttribute('stroke-width', '1');
+		el.setAttribute('vector-effect', 'non-scaling-stroke');
+		vp.appendChild(el);
+	}
+	drawRoads(d.roads);
+	if (d.river && d.river.course && d.river.course.length >= 2) {
+		const course = d.river.delta
+			? [{ x: (d.river.course[0].x + d.river.course[1].x) / 2, y: (d.river.course[0].y + d.river.course[1].y) / 2 }, ...d.river.course.slice(1)]
+			: d.river.course;
+		const visualCourse = chaikinSmooth(course, 3);
+		const pathD = polyPath(visualCourse);
+		const mk = (stroke, w) => {
+			const e = document.createElementNS(SVGNS, 'path');
+			e.setAttribute('d', pathD); e.setAttribute('fill', 'none');
+			e.setAttribute('stroke', stroke); e.setAttribute('stroke-width', w);
+			e.setAttribute('stroke-linecap', d.river.delta ? 'butt' : 'round'); e.setAttribute('stroke-linejoin', 'round');
+			return e;
+		};
+
+		if (d.river.delta) {
+			const bank = previewDeltaFromPath(d.river.delta, visualCourse, d.river.width * RIVER_BANK_SCALE);
+			const bankFill = document.createElementNS(SVGNS, 'path');
+			bankFill.setAttribute('d', deltaPath(bank)); bankFill.setAttribute('fill', PALETTE.riverBank); bankFill.setAttribute('stroke', 'none');
+			vp.appendChild(bankFill);
+			vp.appendChild(mk(PALETTE.riverBank, d.river.width * RIVER_BANK_SCALE));
+
+			const dl = previewDeltaFromPath(d.river.delta, visualCourse, d.river.width + Math.max(0.8, d.river.width * 0.04));
+			const fill = document.createElementNS(SVGNS, 'path');
+			fill.setAttribute('d', deltaPath(dl)); fill.setAttribute('fill', PALETTE.river); fill.setAttribute('stroke', 'none');
+			vp.appendChild(fill);
+			vp.appendChild(mk(PALETTE.river, d.river.width));
+
+			let od = `M${dl.right.x},${dl.right.y} C${dl.rightCtrl1.x},${dl.rightCtrl1.y} ${dl.rightCtrl2.x},${dl.rightCtrl2.y} ${dl.prevShore.x},${dl.prevShore.y}`;
+			od += ` M${dl.left.x},${dl.left.y} C${dl.leftCtrl2.x},${dl.leftCtrl2.y} ${dl.leftCtrl1.x},${dl.leftCtrl1.y} ${dl.nextShore.x},${dl.nextShore.y}`;
+			const outline = document.createElementNS(SVGNS, 'path');
+			outline.setAttribute('d', od); outline.setAttribute('fill', 'none');
+			outline.setAttribute('stroke', PALETTE.riverBank); outline.setAttribute('stroke-width', '1');
+			vp.appendChild(outline);
+		} else {
+			vp.appendChild(mk(PALETTE.riverBank, d.river.width * RIVER_BANK_SCALE));
+			vp.appendChild(mk(PALETTE.river, d.river.width));
+		}
+		drawBridges(d.river);
+	}
+	drawDocks(d.docks);
+	drawWall(d.wall);
+	if ($('seeds').checked) {
+		// approximate seed markers at ward centroids (the real seeds aren't kept in output)
+		for (const w of d.wards) {
+			let cx = 0, cy = 0;
+			for (const p of w.polygon) { cx += p.x; cy += p.y; }
+			const c = document.createElementNS(SVGNS, 'circle');
+			c.setAttribute('cx', cx / w.polygon.length); c.setAttribute('cy', cy / w.polygon.length);
+			c.setAttribute('r', '1.5'); c.setAttribute('fill', PALETTE.seed);
+			c.setAttribute('vector-effect', 'non-scaling-stroke');
+			vp.appendChild(c);
+		}
+	}
+	bounds = d.bounds;
+	fit();
+	const roadCount = d.roads && d.roads.arteries ? d.roads.arteries.length : 0;
+	const dockPierCount = (d.docks || []).reduce((sum, dock) => sum + (dock.piers ? dock.piers.length : 0), 0);
+	const gateText = d.wall && d.wall.gates ? ` · ${d.wall.gates.length} gates` : '';
+	const innerCount = d.wards.filter((w) => w.inner).length;
+	const outerCount = d.wards.filter((w) => !w.inner && !w.water).length;
+	const waterCount = d.wards.filter((w) => w.water).length;
+	const dockText = dockPierCount > 0 ? ` · ${dockPierCount} dock piers` : '';
+	statusEl.textContent = `seed ${d.seed} · size ${d.size} · ${d.wards.length} wards (${innerCount} city, ${outerCount} outer, ${waterCount} water)${gateText} · ${roadCount} arteries${dockText}`;
+}
+
+function generate() {
+	const startTime = performance.now();
+	const params = {
+		seed: parseInt($('seed').value, 10) || 1,
+		size: parseInt($('size').value, 10),
+		plaza: $('plaza').checked,
+		coast: $('coast').checked,
+		river: $('river').checked,
+		walls: $('walls').checked,
+		streets: $('streets').checked,
+		outerRatio: parseFloat($('outerratio').value) || 8,
+		roadDensity: parseFloat($('roaddens').value) || 0,
+		gates: parseInt($('gates').value, 10),
+	};
+	const t0 = performance.now();
+	try {
+		data = generateWards(params);
+		render(data);
+		statusEl.textContent += ` · ${(performance.now() - t0).toFixed(0)}ms`;
+	} catch (e) { statusEl.textContent = 'error: ' + e.message; }
+	const endTime = performance.now();
+	console.log(`Generation took ${endTime - startTime} milliseconds`);
+}
+
+// pan / zoom
+let tx = 0, ty = 0, scale = 1;
+const apply = () => vp.setAttribute('transform', `translate(${tx},${ty}) scale(${scale})`);
+function fit(pad = 0.07) {
+	if (!bounds) return;
+	const w = svg.clientWidth || window.innerWidth || 1000, h = svg.clientHeight || window.innerHeight || 800;
+	const bw = Math.max(1e-3, bounds.maxX - bounds.minX), bh = Math.max(1e-3, bounds.maxY - bounds.minY);
+	scale = Math.min((w * (1 - 2 * pad)) / bw, (h * (1 - 2 * pad)) / bh);
+	tx = w / 2 - ((bounds.minX + bounds.maxX) / 2) * scale;
+	ty = h / 2 - ((bounds.minY + bounds.maxY) / 2) * scale;
+	apply();
+}
+const pts = new Map();
+let lp = null, ld = 0, lm = null;
+const reset = () => { const a = [...pts.values()]; if (a.length === 1) lp = a[0]; else if (a.length >= 2) { lm = { x: (a[0].x + a[1].x) / 2, y: (a[0].y + a[1].y) / 2 }; ld = Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) || 1; } };
+svg.addEventListener('pointerdown', (e) => { pts.set(e.pointerId, { x: e.clientX, y: e.clientY }); svg.setPointerCapture(e.pointerId); reset(); svg.style.cursor = 'grabbing'; });
+svg.addEventListener('pointermove', (e) => {
+	if (!pts.has(e.pointerId)) return; pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+	const a = [...pts.values()], r = svg.getBoundingClientRect();
+	if (a.length === 1) { tx += a[0].x - lp.x; ty += a[0].y - lp.y; lp = a[0]; apply(); }
+	else if (a.length >= 2) {
+		const mx = (a[0].x + a[1].x) / 2, my = (a[0].y + a[1].y) / 2, d = Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) || 1;
+		tx += mx - lm.x; ty += my - lm.y;
+		const f = d / ld, sx = mx - r.left, sy = my - r.top;
+		tx = sx - (sx - tx) * f; ty = sy - (sy - ty) * f; scale *= f; lm = { x: mx, y: my }; ld = d; apply();
+	}
+});
+const up = (e) => { pts.delete(e.pointerId); reset(); if (pts.size === 0) svg.style.cursor = 'grab'; };
+svg.addEventListener('pointerup', up); svg.addEventListener('pointercancel', up);
+svg.addEventListener('wheel', (e) => { e.preventDefault(); const r = svg.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top, f = e.deltaY < 0 ? 1.1 : 1 / 1.1; tx = sx - (sx - tx) * f; ty = sy - (sy - ty) * f; scale *= f; apply(); }, { passive: false });
+
+$('gen').onclick = generate;
+$('fit').onclick = () => fit();
+$('rnd').onclick = () => { $('seed').value = Math.floor(Math.random() * 2147483646) + 1; generate(); };
+$('size').oninput = () => { $('sizeval').textContent = $('size').value; };
+$('outerratio').oninput = () => { $('outerratioval').textContent = `${$('outerratio').value}x`; generate(); };
+$('roaddens').oninput = () => { $('roaddensval').textContent = $('roaddens').value; generate(); };
+$('plaza').onchange = generate;
+$('coast').onchange = generate;
+$('river').onchange = generate;
+$('walls').onchange = generate;
+$('streets').onchange = generate;
+$('gates').onchange = generate;
+$('gates').oninput = generate;
+$('seeds').onchange = () => { if (data) render(data); };
+generate();
+</script>
+</body>
+</html>

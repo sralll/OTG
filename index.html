@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>City Generator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+	:root {
+		--bg: #1b1d1f;
+		--panel-bg: #24272b;
+		--panel-border: #383c41;
+		--text: #d8dadd;
+		--text-dim: #8b9097;
+		--accent: #5b9bd5;
+		--accent-hover: #76aee0;
+		--input-bg: #1b1d1f;
+		--input-border: #41464d;
+	}
+
+	* {
+		box-sizing: border-box;
+	}
+
+	html, body {
+		margin: 0;
+		padding: 0;
+		height: 100%;
+		background: var(--bg);
+		color: var(--text);
+		font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+		font-size: 14px;
+	}
+
+	#app {
+		display: flex;
+		flex-direction: row;
+		height: 100vh;
+		width: 100vw;
+		overflow: hidden;
+	}
+
+	#sidebar {
+		flex: 0 0 280px;
+		background: var(--panel-bg);
+		border-right: 1px solid var(--panel-border);
+		padding: 16px;
+		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 14px;
+	}
+
+	#sidebar h1 {
+		font-size: 16px;
+		margin: 0 0 4px 0;
+		color: var(--text);
+	}
+
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.field label {
+		font-size: 12px;
+		color: var(--text-dim);
+		display: flex;
+		justify-content: space-between;
+	}
+
+	.field input[type="number"],
+	.field input[type="range"] {
+		width: 100%;
+		background: var(--input-bg);
+		border: 1px solid var(--input-border);
+		color: var(--text);
+		border-radius: 4px;
+		padding: 4px 6px;
+	}
+
+	.row {
+		display: flex;
+		gap: 8px;
+	}
+
+	.row > * {
+		flex: 1;
+	}
+
+	.checkbox-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 13px;
+	}
+
+	.checkbox-row input {
+		accent-color: var(--accent);
+	}
+
+	fieldset {
+		border: 1px solid var(--panel-border);
+		border-radius: 6px;
+		padding: 10px 12px 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	legend {
+		font-size: 12px;
+		color: var(--text-dim);
+		padding: 0 4px;
+	}
+
+	button {
+		background: var(--accent);
+		border: none;
+		color: #0e1116;
+		font-weight: 600;
+		padding: 8px 10px;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: 13px;
+	}
+
+	button:hover {
+		background: var(--accent-hover);
+	}
+
+	button.secondary {
+		background: var(--input-bg);
+		border: 1px solid var(--input-border);
+		color: var(--text);
+		font-weight: 500;
+	}
+
+	button.secondary:hover {
+		background: #2a2e33;
+	}
+
+	#status {
+		margin-top: auto;
+		font-size: 12px;
+		color: var(--text-dim);
+		white-space: pre-wrap;
+		border-top: 1px solid var(--panel-border);
+		padding-top: 10px;
+	}
+
+	#status.error {
+		color: #e07a7a;
+	}
+
+	#canvas-wrap {
+		flex: 1 1 auto;
+		position: relative;
+		min-width: 0;
+	}
+
+	#city-svg {
+		width: 100%;
+		height: 100%;
+		display: block;
+		background: #e9e4d4;
+		touch-action: none;
+	}
+
+	/* Hamburger toggle — only shown on small screens */
+	#sidebar-toggle {
+		display: none;
+		position: fixed;
+		top: 10px;
+		left: 10px;
+		z-index: 30;
+		width: 42px;
+		height: 42px;
+		padding: 0;
+		font-size: 20px;
+		line-height: 42px;
+		text-align: center;
+		border-radius: 8px;
+		background: var(--panel-bg);
+		color: var(--text);
+		border: 1px solid var(--panel-border);
+		box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+	}
+
+	@media (max-width: 700px) {
+		#sidebar-toggle {
+			display: block;
+		}
+		#sidebar {
+			position: absolute;
+			top: 0;
+			left: 0;
+			height: 100%;
+			width: 86%;
+			max-width: 330px;
+			z-index: 20;
+			padding-top: 60px; /* clear the toggle button */
+			box-shadow: 4px 0 16px rgba(0, 0, 0, 0.5);
+			transition: transform 0.2s ease;
+		}
+		#app.nav-closed #sidebar {
+			transform: translateX(-100%);
+		}
+		/* bigger touch targets */
+		.field input[type="number"],
+		button {
+			padding: 10px;
+			font-size: 15px;
+		}
+		.checkbox-row {
+			padding: 4px 0;
+			font-size: 15px;
+		}
+	}
+</style>
+</head>
+<body>
+<div id="app">
+	<button type="button" id="sidebar-toggle" aria-label="Toggle controls">&#9776;</button>
+	<div id="sidebar">
+		<h1>City Generator</h1>
+
+		<fieldset>
+			<legend>Seed</legend>
+			<div class="row">
+				<div class="field">
+					<label for="seed">Seed</label>
+					<input type="number" id="seed" min="1" step="1" value="42" />
+				</div>
+			</div>
+			<button type="button" id="random-seed" class="secondary">Random seed</button>
+		</fieldset>
+
+		<fieldset>
+			<legend>Layout</legend>
+			<div class="field">
+				<label for="nPatches">Patches <span id="nPatches-value">15</span></label>
+				<input type="range" id="nPatches" min="6" max="40" step="1" value="15" />
+			</div>
+			<div class="field">
+				<label for="extraSquares">Extra squares</label>
+				<input type="number" id="extraSquares" min="0" max="6" step="1" value="2" />
+			</div>
+		</fieldset>
+
+		<fieldset>
+			<legend>Features</legend>
+			<label class="checkbox-row"><input type="checkbox" id="walls" checked /> Walls</label>
+			<label class="checkbox-row"><input type="checkbox" id="plaza" checked /> Plaza</label>
+			<label class="checkbox-row"><input type="checkbox" id="citadel" checked /> Citadel</label>
+			<label class="checkbox-row"><input type="checkbox" id="cathedral" checked /> Cathedral</label>
+		</fieldset>
+
+		<fieldset>
+			<legend>Street widths</legend>
+			<div class="field">
+				<label for="width-main">Main</label>
+				<input type="number" id="width-main" min="0.1" step="0.1" value="2.0" />
+			</div>
+			<div class="field">
+				<label for="width-regular">Regular</label>
+				<input type="number" id="width-regular" min="0.1" step="0.1" value="1.0" />
+			</div>
+			<div class="field">
+				<label for="width-alley">Alley</label>
+				<input type="number" id="width-alley" min="0.1" step="0.1" value="0.6" />
+			</div>
+		</fieldset>
+
+		<fieldset>
+			<legend>Water</legend>
+			<label class="checkbox-row"><input type="checkbox" id="water-enabled" checked /> Enable water</label>
+			<label class="checkbox-row"><input type="checkbox" id="sea-enabled" checked /> Sea coastline</label>
+			<div class="field">
+				<label for="coast-distance">Coast distance (×Rc)</label>
+				<input type="number" id="coast-distance" min="0.2" step="0.1" value="1.1" />
+			</div>
+			<div class="field">
+				<label for="coast-waviness">Coast waviness</label>
+				<input type="number" id="coast-waviness" min="0" step="0.02" value="0.18" />
+			</div>
+			<label class="checkbox-row"><input type="checkbox" id="river-enabled" checked /> River (mouth into sea)</label>
+			<div class="field">
+				<label for="river-width">River width (×Rc)</label>
+				<input type="number" id="river-width" min="0.02" step="0.02" value="0.16" />
+			</div>
+			<div class="field">
+				<label for="river-amplitude">River bend amplitude</label>
+				<input type="number" id="river-amplitude" min="0" step="0.05" value="0.5" />
+			</div>
+			<div class="field">
+				<label for="river-frequency">River bends (frequency)</label>
+				<input type="number" id="river-frequency" min="0.5" step="0.5" value="2.5" />
+			</div>
+		</fieldset>
+
+		<fieldset>
+			<legend>Display</legend>
+			<label class="checkbox-row"><input type="checkbox" id="curved-wards" checked /> Curved wards (flow)</label>
+			<label class="checkbox-row"><input type="checkbox" id="show-markers" /> Show debug markers</label>
+		</fieldset>
+
+		<button type="button" id="regenerate">Regenerate</button>
+		<button type="button" id="fit-view" class="secondary">Fit view</button>
+
+		<div id="status">Ready.</div>
+	</div>
+
+	<div id="canvas-wrap">
+		<svg id="city-svg" xmlns="http://www.w3.org/2000/svg">
+			<g id="viewport"></g>
+		</svg>
+	</div>
+</div>
+
+<!-- Bundled classic script so this file opens directly from disk (file://). ES modules are
+     blocked over file://, so we load the esbuild IIFE bundle instead. Rebuild after editing
+     src/ with `npm run build` (or `npm run watch`). -->
+<script src="dist/app.js?v=3"></script>
+<script>
+	// Collapsible sidebar for small screens (the generator UI is in the bundle above).
+	(function () {
+		var app = document.getElementById('app');
+		var btn = document.getElementById('sidebar-toggle');
+		if (window.matchMedia('(max-width: 700px)').matches) app.classList.add('nav-closed');
+		btn.addEventListener('click', function () {
+			app.classList.toggle('nav-closed');
+		});
+	})();
+</script>
+</body>
+</html>

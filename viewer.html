@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>City viewer (MFCG GeoJSON)</title>
+<style>
+	html, body { margin: 0; height: 100%; background: #e8e0c8; overflow: hidden; font-family: -apple-system, "Segoe UI", sans-serif; }
+	#map { width: 100vw; height: 100vh; display: block; touch-action: none; cursor: grab; }
+	#bar { position: fixed; top: 8px; left: 8px; right: 8px; display: flex; gap: 8px; align-items: center;
+		background: rgba(30,30,30,.82); color: #eee; padding: 8px 10px; border-radius: 8px; font-size: 13px; }
+	#bar input { width: 90px; background: #1b1d1f; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; }
+	#bar button { background: #5b9bd5; color: #0e1116; border: none; border-radius: 4px; padding: 6px 10px; font-weight: 600; cursor: pointer; }
+	#status { margin-left: auto; opacity: .85; }
+</style>
+</head>
+<body>
+<div id="bar">
+	<span>file</span>
+	<input id="file" value="reference/gt_42_15.json" />
+	<button id="load">Load</button>
+	<button id="fit">Fit</button>
+	<span id="status">…</span>
+</div>
+<svg id="map" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
+
+<script>
+const SVGNS = 'http://www.w3.org/2000/svg';
+const svg = document.getElementById('map');
+const vp = document.getElementById('vp');
+const statusEl = document.getElementById('status');
+
+// --- styling per MFCG layer (id) ---
+const STYLE = {
+	earth:     { fill: '#e8e0c8' },                                   // land
+	water:     { fill: '#9ec6dd' },                                   // sea / lakes
+	rivers:    { stroke: '#9ec6dd', widthKey: 'river', cap: 'round' },// river course (line)
+	greens:    { fill: '#bcd29a' },                                   // parks
+	fields:    { fill: '#dfe3b0' },                                   // farmland
+	squares:   { fill: '#e3d8b8' },                                   // plazas / markets
+	districts: { fill: 'none', stroke: 'rgba(80,70,50,.25)', width: 1, nonScaling: true },
+	buildings: { fill: '#e9dec0', stroke: '#3a332a', width: 0.4 },    // building lots
+	prisms:    { fill: 'rgba(58,51,42,.10)' },                        // building "roofs" (subtle)
+	roads:     { stroke: '#9a8767', widthKey: 'roadWidth', cap: 'round' },
+	planks:    { stroke: '#8a6a4a', widthKey: 'roadWidth', cap: 'butt' }, // bridges
+	walls:     { stroke: '#3a352c', widthKey: 'wallThickness', cap: 'round' },
+	trees:     { dot: '#7fa05a', r: 3 },
+};
+const ZORDER = ['earth','water','rivers','fields','greens','squares','districts','buildings','prisms','roads','planks','walls','trees'];
+
+function el(tag, attrs) { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+function ringToPts(ring) { return ring.map(p => p[0] + ',' + p[1]).join(' '); }
+
+function drawPolygonWithHoles(rings, style, parent) {
+	// outer ring + holes via a path with evenodd
+	let d = '';
+	for (const ring of rings) { d += 'M' + ring.map(p => p[0] + ',' + p[1]).join('L') + 'Z'; }
+	const p = el('path', { d, 'fill-rule': 'evenodd' });
+	if (style.fill) p.setAttribute('fill', style.fill); else p.setAttribute('fill', 'none');
+	if (style.stroke) { p.setAttribute('stroke', style.stroke); p.setAttribute('stroke-width', style.width || 1); if (style.nonScaling) p.setAttribute('vector-effect', 'non-scaling-stroke'); }
+	parent.appendChild(p);
+}
+function drawLine(pts, style, width, parent) {
+	const pl = el('polyline', { points: ringToPts(pts), fill: 'none', stroke: style.stroke, 'stroke-width': width,
+		'stroke-linecap': style.cap || 'round', 'stroke-linejoin': 'round' });
+	parent.appendChild(pl);
+}
+
+function drawGeom(geom, style, width, parent) {
+	switch (geom.type) {
+		case 'Polygon': drawPolygonWithHoles(geom.coordinates, style, parent); break;
+		case 'MultiPolygon': for (const poly of geom.coordinates) drawPolygonWithHoles(poly, style, parent); break;
+		case 'LineString': drawLine(geom.coordinates, style, width, parent); break;
+		case 'MultiLineString': for (const ls of geom.coordinates) drawLine(ls, style, width, parent); break;
+		case 'Point': parent.appendChild(el('circle', { cx: geom.coordinates[0], cy: geom.coordinates[1], r: style.r || 2, fill: style.dot })); break;
+		case 'MultiPoint': for (const pt of geom.coordinates) parent.appendChild(el('circle', { cx: pt[0], cy: pt[1], r: style.r || 2, fill: style.dot })); break;
+		case 'GeometryCollection': for (const g of geom.geometries) drawGeom(g, style, width, parent); break;
+	}
+}
+
+let bounds = null;
+function computeBounds(features) {
+	let mnx = 1e18, mny = 1e18, mxx = -1e18, mxy = -1e18;
+	const walk = (c) => { if (typeof c[0] === 'number') { mnx = Math.min(mnx, c[0]); mny = Math.min(mny, c[1]); mxx = Math.max(mxx, c[0]); mxy = Math.max(mxy, c[1]); } else for (const k of c) walk(k); };
+	for (const f of features) { if (f.coordinates) walk(f.coordinates); if (f.geometries) for (const g of f.geometries) if (g.coordinates) walk(g.coordinates); }
+	return { minX: mnx, minY: mny, maxX: mxx, maxY: mxy };
+}
+
+function render(geo) {
+	while (vp.firstChild) vp.removeChild(vp.firstChild);
+	const byId = {}; for (const f of geo.features) byId[f.id] = f;
+	const values = (byId.values) || {};
+	const widths = { roadWidth: values.roadWidth || 8, wallThickness: values.wallThickness || 6, river: values.roadWidth ? values.roadWidth * 1.6 : 14 };
+
+	for (const id of ZORDER) {
+		const f = byId[id]; if (!f) continue;
+		const style = STYLE[id]; if (!style) continue;
+		const layer = el('g', { id: 'layer-' + id });
+		const w = style.widthKey ? widths[style.widthKey] : (style.width || 1);
+		drawGeom(f, style, w, layer);
+		vp.appendChild(layer);
+	}
+	bounds = computeBounds(geo.features);
+	fit();
+	const counts = geo.features.map(f => f.id).filter(Boolean);
+	statusEl.textContent = `${geo.features.length} layers · v${values.version || '?'}`;
+}
+
+// --- pan / zoom ---
+let tx = 0, ty = 0, scale = 1;
+function apply() { vp.setAttribute('transform', `translate(${tx},${ty}) scale(${scale})`); }
+function fit(pad = 0.06) {
+	if (!bounds) return;
+	const w = svg.clientWidth || window.innerWidth || 1000, h = svg.clientHeight || window.innerHeight || 800;
+	const bw = Math.max(1e-3, bounds.maxX - bounds.minX), bh = Math.max(1e-3, bounds.maxY - bounds.minY);
+	scale = Math.min((w * (1 - 2 * pad)) / bw, (h * (1 - 2 * pad)) / bh);
+	tx = w / 2 - (bounds.minX + bounds.maxX) / 2 * scale;
+	ty = h / 2 - (bounds.minY + bounds.maxY) / 2 * scale;
+	apply();
+}
+const pts = new Map();
+let lp = null, ld = 0, lm = null;
+function reset() { const a = [...pts.values()]; if (a.length === 1) lp = a[0]; else if (a.length >= 2) { lm = { x: (a[0].x + a[1].x) / 2, y: (a[0].y + a[1].y) / 2 }; ld = Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) || 1; } }
+svg.addEventListener('pointerdown', e => { pts.set(e.pointerId, { x: e.clientX, y: e.clientY }); svg.setPointerCapture(e.pointerId); reset(); svg.style.cursor = 'grabbing'; });
+svg.addEventListener('pointermove', e => {
+	if (!pts.has(e.pointerId)) return; pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+	const a = [...pts.values()]; const r = svg.getBoundingClientRect();
+	if (a.length === 1) { tx += a[0].x - lp.x; ty += a[0].y - lp.y; lp = a[0]; apply(); }
+	else if (a.length >= 2) {
+		const mx = (a[0].x + a[1].x) / 2, my = (a[0].y + a[1].y) / 2, d = Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) || 1;
+		tx += mx - lm.x; ty += my - lm.y;
+		const f = d / ld, sx = mx - r.left, sy = my - r.top;
+		tx = sx - (sx - tx) * f; ty = sy - (sy - ty) * f; scale *= f;
+		lm = { x: mx, y: my }; ld = d; apply();
+	}
+});
+const up = e => { pts.delete(e.pointerId); reset(); if (pts.size === 0) svg.style.cursor = 'grab'; };
+svg.addEventListener('pointerup', up); svg.addEventListener('pointercancel', up);
+svg.addEventListener('wheel', e => { e.preventDefault(); const r = svg.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top, f = e.deltaY < 0 ? 1.1 : 1 / 1.1; tx = sx - (sx - tx) * f; ty = sy - (sy - ty) * f; scale *= f; apply(); }, { passive: false });
+
+async function load(file) {
+	statusEl.textContent = 'loading…';
+	try { const r = await fetch(file + (file.includes('?') ? '' : '?t=' + Date.now())); render(await r.json()); }
+	catch (e) { statusEl.textContent = 'error: ' + e.message; }
+}
+document.getElementById('load').onclick = () => load(document.getElementById('file').value);
+document.getElementById('fit').onclick = () => fit();
+const qf = new URLSearchParams(location.search).get('file');
+if (qf) document.getElementById('file').value = qf;
+load(document.getElementById('file').value);
+</script>
+</body>
+</html>
