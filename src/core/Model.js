@@ -7,13 +7,13 @@ import { Point } from './Point.js';
 import { Polygon } from './Polygon.js';
 import { Voronoi } from './Voronoi.js';
 import { Patch } from './Patch.js';
-import { CurtainWall, findCircumference } from './CurtainWall.js';
+import { CurtainWall } from './CurtainWall.js';
 import { Topology } from './Topology.js';
 import { markOcean, buildRiverGeometry } from './Water.js';
 import { Random } from './Random.js';
 import { MathUtils } from './MathUtils.js';
 import { amin, remove } from './arrays.js';
-import { getCityBlock, insetShape, cathedralRate, marketRate, buildWardGeometry, subdivideAligned, principalAxis, districtAlleyParams, OPEN_TYPES } from './wards.js';
+import { getCityBlock, cathedralRate, marketRate, buildWardGeometry, OPEN_TYPES } from './wards.js';
 
 const N = 2147483647;
 
@@ -111,7 +111,6 @@ export class Model {
 		this.buildWalls();
 		this.buildStreets();
 		this.assignWards();
-		this.buildDistricts();
 		this.buildBlocks();
 		this.buildGeometry();
 	}
@@ -223,6 +222,15 @@ export class Model {
 
 	getNeighbours(patch) {
 		return this.patches.filter((p) => p !== patch && p.shape.borders(patch.shape));
+	}
+
+	getNeighbour(patch, v) {
+		const next = patch.shape.next(v);
+		return this.patches.find((p) => p !== patch && p.shape.findEdge(next, v) !== -1) || null;
+	}
+
+	isEnclosed(patch) {
+		return patch.withinCity && (patch.withinWalls || this.getNeighbours(patch).every((p) => p.withinCity));
 	}
 
 	// Vertices shared between a water cell and a land cell = the coastline. Excluded from the
@@ -554,45 +562,6 @@ export class Model {
 		for (const patch of this.patches) if (patch.type == null) patch.type = 'generic';
 	}
 
-	// Group adjacent residential wards into districts. Each district shares one orientation and
-	// one set of alley params, and its cells are MERGED and subdivided as a single shape in
-	// buildGeometry — so building blocks span the old cell boundaries (block-to-block coherence).
-	buildDistricts() {
-		this.districts = [];
-		const grouped = new Set();
-		const isResidential = (p) => p.withinCity && (p.type === 'generic' || p.type === 'gate');
-
-		for (const seed of this.inner) {
-			if (grouped.has(seed) || !isResidential(seed)) continue;
-
-			const cells = [seed];
-			grouped.add(seed);
-			const target = 2 + Math.floor(Random.float() * 3); // 2-4 cells
-			const frontier = [seed];
-			while (cells.length < target && frontier.length > 0) {
-				const cur = frontier.shift();
-				for (const nb of this.getNeighbours(cur)) {
-					if (cells.length >= target) break;
-					if (!grouped.has(nb) && isResidential(nb)) {
-						cells.push(nb);
-						grouped.add(nb);
-						frontier.push(nb);
-					}
-				}
-			}
-
-			const verts = [];
-			for (const p of cells) for (const v of p.shape) verts.push(v);
-			const axis = principalAxis(verts);
-			const params = districtAlleyParams();
-			for (const p of cells) {
-				p.districtAxis = axis;
-				p.alleyParams = params;
-			}
-			this.districts.push({ cells, axis, params });
-		}
-	}
-
 	// --- step 5: shrink each patch into a block, leaving room for roads ---
 	buildBlocks() {
 		for (const patch of this.patches) {
@@ -608,43 +577,13 @@ export class Model {
 		}
 	}
 
-	// Fill wards with building lots. Residential districts are subdivided as one MERGED shape so
-	// blocks relate across cells; everything else is subdivided per cell. Failures fall back
-	// gracefully and never abort the whole city. Produces a flat `this.buildings` list.
+	// Fill wards with building lots. Generic/gate wards use the reference CommonWard alley
+	// subdivision per patch; special wards keep their own geometry.
 	buildGeometry() {
 		const widths = this.cfg.streetWidths;
 		this.buildings = [];
-		const handled = new Set();
-
-		for (const d of this.districts) {
-			let blocks = [];
-			try {
-				const merged = d.cells.length === 1 ? d.cells[0].shape : findCircumference(d.cells);
-				const block = insetShape(this, merged, widths, true);
-				if (block && block.length >= 3)
-					blocks = subdivideAligned(block, d.axis, d.params.minSq, d.params.sizeChaos, d.params.gridChaos, widths.alley);
-			} catch (e) {
-				blocks = [];
-			}
-			// fallback: subdivide each cell separately (still using the shared district axis)
-			if (blocks.length === 0) {
-				for (const c of d.cells) {
-					try {
-						const b = insetShape(this, c.shape, widths, c.withinWalls, c);
-						if (b && b.length >= 3)
-							blocks = blocks.concat(subdivideAligned(b, d.axis, d.params.minSq, d.params.sizeChaos, d.params.gridChaos, widths.alley));
-					} catch (e) {
-						/* skip */
-					}
-				}
-			}
-			for (const b of blocks) this.buildings.push(b);
-			for (const c of d.cells) handled.add(c);
-		}
-
-		// Non-residential wards (cathedral, castle, market, plaza, park, farm) + countryside.
 		for (const patch of this.patches) {
-			if (handled.has(patch) || patch.isWater) continue;
+			if (patch.isWater) continue;
 			try {
 				for (const b of buildWardGeometry(this, patch, widths)) this.buildings.push(b);
 			} catch (e) {
@@ -656,6 +595,10 @@ export class Model {
 	toData() {
 		const pt = (p) => ({ x: p.x, y: p.y });
 		const poly = (pl) => Array.from(pl, pt);
+		const building = (pl) => ({
+			polygon: poly(pl),
+			class: pl.class || 'building',
+		});
 
 		const patches = this.patches.map((p, idx) => ({
 			id: idx,
@@ -715,7 +658,7 @@ export class Model {
 			cityRadius: this.cityRadius,
 			bounds: { minX, minY, maxX, maxY },
 			patches,
-			buildings: this.buildings.map(poly),
+			buildings: this.buildings.map(building),
 			arteries: this.arteries.map(poly),
 			streets: this.streets.map(poly),
 			roads: this.roads.map(poly),

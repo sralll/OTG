@@ -210,6 +210,32 @@ export function addObstacleCrossings(cells, wall, river) {
 			const connection = crossingConnection(counts.get(v), v, river.course[i - 1], river.course[i + 1]);
 			if (connection && !crossings.bridges.some((b) => b.point === v)) crossings.bridges.push({ point: v, from: connection.negative, to: connection.positive });
 		}
+
+		if (river.course.length >= 4 && crossings.bridges.length < 2) {
+			const bridgePoints = new Set(crossings.bridges.map((b) => b.point));
+			while (crossings.bridges.length < 2) {
+				let bestV = null;
+				let bestIdx = -1;
+				let bestScore = -Infinity;
+				for (let i = 1; i < river.course.length - 1; i++) {
+					const v = river.course[i];
+					if (bridgePoints.has(v) || wallNodes.has(v)) continue;
+					const score =
+						crossings.bridges.length > 0
+							? Math.min(...crossings.bridges.map((b) => Point.distance(b.point, v)))
+							: -Math.abs(i - river.course.length / 2);
+					if (score > bestScore) {
+						bestScore = score;
+						bestV = v;
+						bestIdx = i;
+					}
+				}
+				if (!bestV) break;
+				crossings.bridges.push({ point: bestV });
+				bridgePoints.add(bestV);
+			}
+		}
+
 		river.bridges = crossings.bridges;
 	}
 

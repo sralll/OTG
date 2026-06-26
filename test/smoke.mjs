@@ -52,7 +52,7 @@ for (const seed of seeds) {
 			scanPoints(`patch#${p.id}`, p.polygon, report);
 			if (p.block) scanPoints(`block#${p.id}`, p.block, report);
 		}
-		for (const bld of data.buildings || []) scanPoints('building', bld, report);
+		for (const bld of data.buildings || []) scanPoints('building', Array.isArray(bld) ? bld : bld.polygon, report);
 		for (const a of data.arteries) scanPoints('artery', a, report);
 		for (const r of data.roads) scanPoints('road', r, report);
 		for (const w of data.walls) {

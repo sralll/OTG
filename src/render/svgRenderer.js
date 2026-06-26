@@ -23,25 +23,19 @@ const DEFAULT_PALETTE = {
 		generic: '#838f6e',
 		farm: '#94a263',
 	},
-	blockFill: {
-		plaza: '#c9bd8e',
-		market: '#c2a161',
-		cathedral: '#9c7da6',
-		castle: '#a76668',
-		gate: '#85906f',
-		generic: '#8d9870',
-		farm: '#a3af74',
-	},
-	blockStroke: '#4b4334',
-	building: '#e9dec0',
-	buildingStroke: '#3a332a',
+	blockFill: '#d6d6d6',
+	building: '#888888',
+	buildingStroke: '#000000',
+	garden: '#b9f05a',
+	gardenStroke: '#000000',
 	water: '#9ec6dd',
 	waterStroke: '#5d829c',
-	road: '#5a5247',
-	roadCenter: '#84796a',
-	wall: '#3a352c',
-	castleWall: '#2a2620',
-	tower: '#2a2620',
+	bridgeDock: '#c8a46a',
+	bridgeDockOutline: '#000000',
+	wall: '#888888',
+	castleWall: '#888888',
+	wallOutline: '#000000',
+	tower: '#888888',
 	gateDot: '#c0392b',
 	center: '#2266cc',
 	background: '#e9e4d4',
@@ -137,6 +131,17 @@ function makeSmoothPath(pts, { stroke, strokeWidth, opacity } = {}) {
 	return el;
 }
 
+function makePath(d, { stroke, strokeWidth } = {}) {
+	const el = ns('path');
+	el.setAttribute('d', d);
+	el.setAttribute('fill', 'none');
+	if (stroke != null) el.setAttribute('stroke', stroke);
+	if (strokeWidth != null) el.setAttribute('stroke-width', String(strokeWidth));
+	el.setAttribute('stroke-linecap', 'round');
+	el.setAttribute('stroke-linejoin', 'round');
+	return el;
+}
+
 function makeCircle(p, r, { fill, stroke, strokeWidth, nonScaling } = {}) {
 	const el = ns('circle');
 	el.setAttribute('cx', String(p.x));
@@ -147,6 +152,33 @@ function makeCircle(p, r, { fill, stroke, strokeWidth, nonScaling } = {}) {
 	if (strokeWidth != null) el.setAttribute('stroke-width', String(strokeWidth));
 	if (nonScaling) el.setAttribute('vector-effect', 'non-scaling-stroke');
 	return el;
+}
+
+function makeGateSquare(gate, wall, size, { fill, stroke, strokeWidth } = {}) {
+	const idx = wall.shape.findIndex((p) => Math.abs(p.x - gate.x) < 1e-6 && Math.abs(p.y - gate.y) < 1e-6);
+	const h = size / 2;
+	let tx = 1;
+	let ty = 0;
+	if (idx !== -1) {
+		const prev = wall.shape[(idx + wall.shape.length - 1) % wall.shape.length];
+		const next = wall.shape[(idx + 1) % wall.shape.length];
+		const dx = next.x - prev.x;
+		const dy = next.y - prev.y;
+		const len = Math.hypot(dx, dy) || 1;
+		tx = dx / len;
+		ty = dy / len;
+	}
+	const nx = -ty;
+	const ny = tx;
+	return makePolygon(
+		[
+			{ x: gate.x - tx * h - nx * h, y: gate.y - ty * h - ny * h },
+			{ x: gate.x + tx * h - nx * h, y: gate.y + ty * h - ny * h },
+			{ x: gate.x + tx * h + nx * h, y: gate.y + ty * h + ny * h },
+			{ x: gate.x - tx * h + nx * h, y: gate.y - ty * h + ny * h },
+		],
+		{ fill, stroke, strokeWidth }
+	);
 }
 
 export function renderCity(groupEl, cityData, options = {}) {
@@ -207,6 +239,11 @@ export function renderCity(groupEl, cityData, options = {}) {
 		layerPatches.appendChild(el);
 	}
 
+	const zones = [];
+	for (const block of cityData.blocks || []) if (block && block.length >= 3) zones.push(block);
+	for (const patch of cityData.patches || []) if (patch.block && patch.block.length >= 3) zones.push(patch.block);
+	for (const zone of zones) layerBlocks.appendChild(makePolygon(zone, { fill: palette.blockFill, stroke: 'none' }));
+
 	// (no per-cell block layer — the buildings below are the content; ward ground is the fill above)
 
 	// 2b. Buildings: the subdivided lots (flat list; residential ones come from merged districts
@@ -214,8 +251,14 @@ export function renderCity(groupEl, cityData, options = {}) {
 	// scaling stroke (in user units) — NOT non-scaling: thousands of non-scaling strokes are
 	// very slow to rasterize (and would lag on a phone).
 	for (const b of cityData.buildings || []) {
-		if (!b || b.length < 3) continue;
-		layerBuildings.appendChild(makePolygon(b, { fill: palette.building, stroke: palette.buildingStroke, strokeWidth: 0.15 }));
+		const polygon = Array.isArray(b) ? b : b.polygon;
+		if (!polygon || polygon.length < 3) continue;
+		const isGarden = !Array.isArray(b) && b.class === 'garden';
+		layerBuildings.appendChild(makePolygon(polygon, {
+			fill: isGarden ? palette.garden : palette.building,
+			stroke: isGarden ? palette.gardenStroke : palette.buildingStroke,
+			strokeWidth: 0.18,
+		}));
 	}
 
 	// 2c. River: drawn as a thick rounded stroke along its cell-edge path (over the buildings it
@@ -228,15 +271,35 @@ export function renderCity(groupEl, cityData, options = {}) {
 		layerRiver.appendChild(makeSmoothPath(cityData.water.riverPath, { stroke: palette.water, strokeWidth: w }));
 	}
 
-	// 3. Arteries: thick road strokes that scale with the map (they represent real street width),
-	// plus a thinner lighter centerline on top for a "paved" look.
-	const mainWidth = widths.main || 2.0;
-	for (const artery of cityData.arteries || []) {
-		if (!artery || artery.length < 2) continue;
-		// smooth cubic curve -> roads bend at a nice radius instead of angular polyline joints
-		layerArteries.appendChild(makeSmoothPath(artery, { stroke: palette.road, strokeWidth: mainWidth }));
-		layerArteries.appendChild(makeSmoothPath(artery, { stroke: palette.roadCenter, strokeWidth: mainWidth * 0.3, opacity: 0.6 }));
+	if (cityData.river && cityData.river.bridges) {
+		const riverWidth = Number.isFinite(cityData.river.width) ? cityData.river.width : 5;
+		for (const bridge of cityData.river.bridges) {
+			let d = '';
+			if (bridge.from && bridge.to) {
+				const a = bridge.from;
+				const b = bridge.to;
+				d = `M${a.x},${a.y} Q${bridge.x},${bridge.y} ${b.x},${b.y}`;
+			} else {
+				const r = riverWidth * 0.8;
+				d = `M${bridge.x - r},${bridge.y} L${bridge.x + r},${bridge.y}`;
+			}
+			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDockOutline, strokeWidth: 3.0 }));
+			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDock, strokeWidth: 1.5 }));
+		}
 	}
+
+	for (const dock of cityData.docks || []) {
+		const scale = dock.large ? 2 : 1;
+		for (const pier of dock.piers || []) {
+			if (!pier.from || !pier.to) continue;
+			const d = `M${pier.from.x},${pier.from.y} L${pier.to.x},${pier.to.y}`;
+			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDockOutline, strokeWidth: 3.0 * scale }));
+			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDock, strokeWidth: 1.5 * scale }));
+		}
+	}
+
+	// 3. Roads are intentionally not drawn; their geometry still creates building-zone insets.
+	const mainWidth = widths.main || 2.0;
 
 	// 4. Walls: stroked polygon (no fill), thicker if castle wall. Towers as small filled
 	// circles, gates as small contrasting dots.
@@ -245,18 +308,20 @@ export function renderCity(groupEl, cityData, options = {}) {
 		const isCastle = !!wall.isCastle;
 		const strokeColor = isCastle ? palette.castleWall : palette.wall;
 		const strokeWidth = isCastle ? mainWidth * 0.9 : mainWidth * 0.6;
+		const outline = makePolygon(wall.shape, { fill: 'none', stroke: palette.wallOutline, strokeWidth: strokeWidth + 0.45 });
+		outline.setAttribute('stroke-linejoin', 'round');
+		layerWalls.appendChild(outline);
 		const el = makePolygon(wall.shape, { fill: 'none', stroke: strokeColor, strokeWidth });
 		el.setAttribute('stroke-linejoin', 'round');
 		layerWalls.appendChild(el);
 
 		const towerR = Math.max(mainWidth * 0.55, 0.6);
 		for (const t of wall.towers || []) {
-			layerWalls.appendChild(makeCircle(t, towerR, { fill: palette.tower }));
+			layerWalls.appendChild(makeCircle(t, towerR, { fill: palette.tower, stroke: palette.wallOutline, strokeWidth: 0.22 }));
 		}
 
-		const gateR = Math.max(mainWidth * 0.45, 0.5);
 		for (const g of wall.gates || []) {
-			layerWalls.appendChild(makeCircle(g, gateR, { fill: palette.gateDot, stroke: '#fff', strokeWidth: 0.3 }));
+			layerWalls.appendChild(makeGateSquare(g, wall, strokeWidth, { fill: palette.gateDot, stroke: '#fff', strokeWidth: 0.2 }));
 		}
 	}
 

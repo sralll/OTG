@@ -1351,19 +1351,80 @@
 
   // src/core/wards.js
   var OPEN_TYPES = /* @__PURE__ */ new Set(["plaza", "market", "park", "water"]);
+  function hasRiverEdge(model, v0, v1) {
+    const riverEdges = model.riverEdges;
+    return !!(riverEdges && (riverEdges.get(v0) && riverEdges.get(v0).has(v1) || riverEdges.get(v1) && riverEdges.get(v1).has(v0)));
+  }
+  function hasWallEdge(model, v0, v1) {
+    const wall = model && model.wall;
+    if (!wall || !wall.shape) return false;
+    const i = wall.shape.findEdge(v0, v1);
+    if (i !== -1) return !wall.segments || wall.segments[i] !== false;
+    const j = wall.shape.findEdge(v1, v0);
+    return j !== -1 && (!wall.segments || wall.segments[j] !== false);
+  }
+  function isShoreEdge(model, v0, v1) {
+    if (!model.patchByVertex) return false;
+    const edgePatches = model.patchByVertex(v0).filter((p) => p.shape.findEdge(v0, v1) !== -1 || p.shape.findEdge(v1, v0) !== -1);
+    return edgePatches.some((p) => p.isWater) && edgePatches.some((p) => !p.isWater);
+  }
+  function nodeClearance(model, v, widths) {
+    let clearance = 0;
+    if (model.water && model.water.riverPath && model.water.riverPath.includes(v))
+      clearance = Math.max(clearance, (model.riverWidth || 0) / 2 + widths.main * 0.6);
+    if (model.wall && model.wall.towers && model.wall.towers.includes(v))
+      clearance = Math.max(clearance, widths.main * 1.1);
+    if (model.citadelWall && model.citadelWall.towers && model.citadelWall.towers.includes(v))
+      clearance = Math.max(clearance, widths.main * 1.1);
+    return clearance;
+  }
+  function clippedCorner(poly, sourceShape, corner, clearance) {
+    if (!poly || poly.length < 3 || !(clearance > 0)) return poly;
+    const idx = sourceShape.indexOf(corner);
+    if (idx === -1) return poly;
+    const prev = sourceShape[(idx + sourceShape.length - 1) % sourceShape.length];
+    const next = sourceShape[(idx + 1) % sourceShape.length];
+    const prevLen = Point.distance(corner, prev);
+    const nextLen = Point.distance(corner, next);
+    if (prevLen < 1e-6 || nextLen < 1e-6) return poly;
+    const reach = Math.min(clearance, prevLen * 0.45, nextLen * 0.45);
+    if (!(reach > 1e-6)) return poly;
+    const a = corner.add(prev.subtract(corner).norm(reach));
+    const b = corner.add(next.subtract(corner).norm(reach));
+    const halves = poly.cut(a, b);
+    if (halves.length < 2) return poly;
+    let best = poly;
+    let bestDistance = -Infinity;
+    const minKeptArea = Math.abs(poly.square) * 0.55;
+    for (const half of halves) {
+      if (!half || half.length < 3 || Math.abs(half.square) < Math.max(1, minKeptArea)) continue;
+      const d = Point.distance(half.center, corner);
+      if (d > bestDistance) {
+        best = half;
+        bestDistance = d;
+      }
+    }
+    return best;
+  }
+  function clipObstacleCorners(poly, sourceShape, model, widths) {
+    let clipped = poly;
+    for (const v of sourceShape) {
+      const clearance = nodeClearance(model, v, widths);
+      if (clearance > 0) clipped = clippedCorner(clipped, sourceShape, v, clearance);
+      if (!clipped || clipped.length < 3) return null;
+    }
+    return clipped;
+  }
   function insetShape(model, shape, widths, withinWalls, patch = null) {
     const { main, regular, alley } = widths;
     const insetDist = [];
     const innerPatch = model.wall == null || withinWalls;
-    const riverEdges = model.riverEdges;
     shape.forEdge((v0, v1) => {
-      if (riverEdges && (riverEdges.get(v0) && riverEdges.get(v0).has(v1) || riverEdges.get(v1) && riverEdges.get(v1).has(v0))) {
-        insetDist.push((model.riverWidth + main) / 2);
-        return;
-      }
-      if (patch != null && model.wall != null && model.wall.bordersBy(patch, v0, v1)) {
-        insetDist.push(main / 2);
-        return;
+      let inset = (innerPatch ? regular : alley) / 2;
+      if (hasRiverEdge(model, v0, v1)) inset = Math.max(inset, (model.riverWidth + main) / 2);
+      if (isShoreEdge(model, v0, v1)) inset = Math.max(inset, (Math.max(model.riverWidth || 0, main) + regular) / 2);
+      if (patch != null && model.wall != null && model.wall.bordersBy(patch, v0, v1) || patch == null && hasWallEdge(model, v0, v1)) {
+        inset = Math.max(inset, main / 2);
       }
       let onStreet = innerPatch && model.plaza != null && model.plaza.shape.findEdge(v1, v0) !== -1;
       if (!onStreet) {
@@ -1373,9 +1434,11 @@
             break;
           }
       }
-      insetDist.push((onStreet ? main : innerPatch ? regular : alley) / 2);
+      if (onStreet) inset = Math.max(inset, main / 2);
+      insetDist.push(inset);
     });
-    return shape.isConvex() ? shape.shrink(insetDist) : shape.buffer(insetDist);
+    const base = shape.isConvex() ? shape.shrink(insetDist) : shape.buffer(insetDist);
+    return clipObstacleCorners(base, shape, model, widths);
   }
   function getCityBlock(model, patch, widths) {
     return insetShape(model, patch.shape, widths, patch.withinWalls, patch);
@@ -1453,6 +1516,160 @@
     }
     return [poly];
   }
+  function translatedShape(shape, dx, dy) {
+    return new Polygon(shape.map((p) => new Point(p.x + dx, p.y + dy)));
+  }
+  function segmentLineIntersection(p0, p1, a, b) {
+    const seg = p1.subtract(p0);
+    const edge = b.subtract(a);
+    const hit = GeomUtils.intersectLines(p0.x, p0.y, seg.x, seg.y, a.x, a.y, edge.x, edge.y);
+    if (hit == null || hit.x < -1e-6 || hit.x > 1 + 1e-6) return null;
+    return new Point(p0.x + seg.x * hit.x, p0.y + seg.y * hit.x);
+  }
+  function clipPolygonToConvexShape(poly, clipShape) {
+    if (!poly || poly.length < 3 || !clipShape || clipShape.length < 3) return null;
+    let out = poly.map((p) => p);
+    const orientation = clipShape.square >= 0 ? 1 : -1;
+    for (let i = 0; i < clipShape.length && out.length >= 3; i++) {
+      const a = clipShape[i];
+      const b = clipShape[(i + 1) % clipShape.length];
+      const inside = (p) => orientation * ((b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)) >= -1e-6;
+      const input = out;
+      out = [];
+      let prev = input[input.length - 1];
+      let prevInside = inside(prev);
+      for (const cur of input) {
+        const curInside = inside(cur);
+        if (curInside !== prevInside) {
+          const hit = segmentLineIntersection(prev, cur, a, b);
+          if (hit) out.push(hit);
+        }
+        if (curInside) out.push(cur);
+        prev = cur;
+        prevInside = curInside;
+      }
+    }
+    const clipped = new Polygon(out);
+    return clipped.length >= 3 && Math.abs(clipped.square) > 1e-6 ? clipped : null;
+  }
+  function indentFronts(lots, block) {
+    if (!block || block.length < 3) return lots;
+    const blockCenter = block.centroid;
+    return lots.map((lot) => {
+      const area = Math.abs(lot.square);
+      let inset = Math.min(Math.sqrt(area) / 3, 1.2) * Random.float();
+      if (inset < 0.5) return lot;
+      const lotCenter = lot.center;
+      const dir = new Point(blockCenter.x - lotCenter.x, blockCenter.y - lotCenter.y);
+      if (dir.length < 1e-6) return lot;
+      dir.normalize(inset);
+      const shiftedBlock = translatedShape(block, dir.x, dir.y);
+      const clipped = clipPolygonToConvexShape(lot, shiftedBlock);
+      if (!clipped || clipped.length < 3 || Math.abs(clipped.square) < area * 0.35) return lot;
+      return clipped;
+    });
+  }
+  function classifyGardenLots(lots) {
+    if (!lots || lots.length < 6) return lots;
+    const touches = (a, b) => {
+      for (let i = 0; i < a.length; i++) {
+        const a0 = a[i];
+        const a1 = a[(i + 1) % a.length];
+        for (let j = 0; j < b.length; j++) {
+          const b0 = b[j];
+          const b1 = b[(j + 1) % b.length];
+          if (Point.distance(a0, b1) < 1e-5 && Point.distance(a1, b0) < 1e-5 || Point.distance(a0, b0) < 1e-5 && Point.distance(a1, b1) < 1e-5) return true;
+        }
+      }
+      return false;
+    };
+    const garden = /* @__PURE__ */ new Set();
+    const target = Math.max(1, Math.min(4, Math.round(lots.length * (0.05 + Random.float() * 0.04))));
+    const order = lots.map((_, i) => i).sort(() => Random.float() - 0.5);
+    for (const i of order) {
+      if (garden.size >= target) break;
+      let adjacentGarden = false;
+      for (const g2 of garden) {
+        if (touches(lots[i], lots[g2])) {
+          adjacentGarden = true;
+          break;
+        }
+      }
+      if (!adjacentGarden) garden.add(i);
+    }
+    for (const i of garden) lots[i].class = "garden";
+    return lots;
+  }
+  function commonWardParams(model, patch) {
+    return [60, 0.52, 0.28, patch.type === "gate" ? 0.03 : 0.04];
+  }
+  function modelIsEnclosed(model, patch) {
+    return model && typeof model.isEnclosed === "function" ? model.isEnclosed(patch) : true;
+  }
+  function filterOutskirts(model, patch, geometry) {
+    if (!model || !patch || !patch.shape || !geometry || geometry.length === 0) return geometry;
+    if (modelIsEnclosed(model, patch)) return geometry;
+    const populatedEdges = [];
+    const addEdge2 = (v1, v2, factor = 1) => {
+      const dx = v2.x - v1.x;
+      const dy = v2.y - v1.y;
+      let maxVertex = null;
+      let maxDist = -Infinity;
+      for (const v of patch.shape) {
+        const dist = (v !== v1 && v !== v2 ? GeomUtils.distance2line(v1.x, v1.y, dx, dy, v.x, v.y) : 0) * factor;
+        if (dist > maxDist) {
+          maxDist = dist;
+          maxVertex = v;
+        }
+      }
+      if (maxVertex != null && Math.abs(maxDist) > 1e-6) populatedEdges.push({ x: v1.x, y: v1.y, dx, dy, d: maxDist });
+    };
+    patch.shape.forEdge((v1, v2) => {
+      let onRoad = false;
+      for (const street of model.arteries || []) {
+        if (street.contains(v1) && street.contains(v2)) {
+          onRoad = true;
+          break;
+        }
+      }
+      if (onRoad) {
+        addEdge2(v1, v2, 1);
+      } else if (typeof model.getNeighbour === "function") {
+        const n2 = model.getNeighbour(patch, v1);
+        if (n2 && n2.withinCity) addEdge2(v1, v2, modelIsEnclosed(model, n2) ? 1 : 0.4);
+      }
+    });
+    if (populatedEdges.length === 0) return geometry;
+    const gates = model.gates || [];
+    const density = patch.shape.map((v) => {
+      if (gates.includes(v)) return 1;
+      const touched = typeof model.patchByVertex === "function" ? model.patchByVertex(v) : [];
+      return touched.length > 0 && touched.every((p) => p.withinCity) ? 2 * Random.float() : 0;
+    });
+    return geometry.filter((building) => {
+      let minDist = 1;
+      for (const edge of populatedEdges) {
+        for (const v of building) {
+          const d = GeomUtils.distance2line(edge.x, edge.y, edge.dx, edge.dy, v.x, v.y);
+          const dist = d / edge.d;
+          if (dist < minDist) minDist = dist;
+        }
+      }
+      const weights = patch.shape.interpolate(building.center);
+      let p = 0;
+      for (let j = 0; j < weights.length; j++) p += density[j] * weights[j];
+      if (p <= 1e-6) return false;
+      minDist /= p;
+      return Random.fuzzy(1) > minDist;
+    });
+  }
+  function createCommonWardGeometry(model, patch, widths) {
+    const block = patch.block;
+    if (!block || block.length < 3) return [];
+    const [minSq, gridChaos, sizeChaos, emptyProb] = commonWardParams(model, patch);
+    const geometry = indentFronts(createAlleys(block, minSq, gridChaos, sizeChaos, emptyProb, true, widths.alley), block);
+    return classifyGardenLots(filterOutskirts(model, patch, geometry));
+  }
   function principalAxis(points) {
     let cx = 0;
     let cy = 0;
@@ -1493,36 +1710,226 @@
   function districtAlleyParams() {
     const norm3 = () => (Random.float() + Random.float() + Random.float()) / 3;
     const fuzzy4 = () => Math.abs((Random.float() + Random.float() + Random.float() + Random.float()) / 2 - 1);
-    return {
+    const params = {
       minSq: 15 + 40 * fuzzy4(),
       gridChaos: 0.2 + norm3() * 0.8,
       sizeChaos: 0.4 + norm3() * 0.6,
+      shapeFactor: 0.25 + norm3() * 2,
+      inset: 0.6 * (1 - fuzzy4()),
       blockSize: 4 + 10 * norm3()
     };
+    params.minFront = Math.sqrt(params.minSq);
+    return params;
   }
-  function subdivideAligned(poly, axis, minArea, sizeChaos, gridChaos, alley, depth = 0, useAxis = true) {
-    if (!poly || poly.length < 3) return [];
-    const area = Math.abs(poly.square);
-    const stop = minArea * Math.pow(2, sizeChaos * (2 * Random.float() - 1));
-    if (area < stop || depth > 20) return Random.bool(0.04) ? [] : [poly];
-    const dir = useAxis ? axis : new Point(-axis.y, axis.x);
-    const cutDir = new Point(-dir.y, dir.x);
-    const c = poly.centroid;
-    let mn = Infinity;
-    let mx = -Infinity;
-    for (const v of poly) {
-      const pr = (v.x - c.x) * dir.x + (v.y - c.y) * dir.y;
-      if (pr < mn) mn = pr;
-      if (pr > mx) mx = pr;
+  function polygonArea(poly) {
+    return Math.abs(poly ? poly.square : 0);
+  }
+  function pointInPolygon(poly, p) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const a = poly[i];
+      const b = poly[j];
+      if (a.y > p.y !== b.y > p.y && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
     }
-    const t = (mn + mx) / 2 + (Random.float() - 0.5) * (mx - mn) * 0.5 * gridChaos;
-    const cp = new Point(c.x + dir.x * t, c.y + dir.y * t);
-    const cp2 = new Point(cp.x + cutDir.x, cp.y + cutDir.y);
-    const halves = poly.cut(cp, cp2, alley);
-    if (halves.length < 2) return Random.bool(0.04) ? [] : [poly];
+    return inside;
+  }
+  function lineIntersections(poly, p, dir) {
+    const hits = [];
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
+      const edge = b.subtract(a);
+      const t = GeomUtils.intersectLines(p.x, p.y, dir.x, dir.y, a.x, a.y, edge.x, edge.y);
+      if (t == null || t.y <= 1e-6 || t.y >= 1 - 1e-6) continue;
+      const hit = new Point(p.x + dir.x * t.x, p.y + dir.y * t.x);
+      hits.push({ edge: i, t: t.x, point: hit });
+    }
+    hits.sort((a, b) => a.t - b.t);
+    return hits;
+  }
+  function splitByPath(poly, startEdge, endEdge, path) {
+    const start = path[0];
+    const end = path[path.length - 1];
+    const verts = poly.slice();
+    let a = startEdge;
+    let b = endEdge;
+    if (verts[a] !== start) {
+      if (a < b) b++;
+      verts.splice(++a, 0, start);
+    }
+    if (verts[b] !== end) {
+      if (b < a) a++;
+      verts.splice(++b, 0, end);
+    }
+    let first;
+    let second;
+    if (a < b) {
+      first = verts.slice(a + 1, b);
+      first.push(...path.slice().reverse());
+      second = verts.slice(b + 1).concat(verts.slice(0, a));
+      second.push(...path);
+    } else {
+      first = verts.slice(a + 1).concat(verts.slice(0, b));
+      first.push(...path.slice().reverse());
+      second = verts.slice(b + 1, a);
+      second.push(...path);
+    }
+    const p1 = new Polygon(first);
+    const p2 = new Polygon(second);
+    if (p1.length < 3 || p2.length < 3 || polygonArea(p1) < 1e-6 || polygonArea(p2) < 1e-6) return [new Polygon(poly)];
+    return [p1, p2];
+  }
+  function cutWithReferenceBend(poly, params, gap = 0, depth = 0) {
+    if (!poly || poly.length < 4) return [poly];
+    const axis = principalAxis(poly);
+    const cutDir = new Point(-axis.y, axis.x);
+    const center = poly.centroid;
+    const span = lineIntersections(poly, center, cutDir);
+    if (span.length < 2) return [poly];
+    const a = span[0];
+    const b = span[span.length - 1];
+    const straight = () => {
+      const halves2 = poly.cut(a.point, b.point, gap);
+      return halves2.length === 2 ? halves2 : [poly];
+    };
+    const length = Point.distance(a.point, b.point);
+    if (depth > 1 || length < params.minFront * 2 || Random.float() < 0.25) return straight();
+    const base = GeomUtils.interpolate(a.point, b.point, 0.5);
+    const offset = (Random.float() + Random.float() + Random.float()) / 3 - 0.5;
+    const bend = base.add(axis.scale(offset * params.minFront * params.gridChaos * 2.4));
+    if (!pointInPolygon(poly, bend)) return straight();
+    const halves = splitByPath(poly, a.edge, b.edge, [a.point, bend, b.point]);
+    if (halves.length !== 2) return straight();
+    const s1 = polygonArea(halves[0]);
+    const s2 = polygonArea(halves[1]);
+    if (s1 <= 1e-6 || s2 <= 1e-6 || Math.max(s1 / s2, s2 / s1) > 2 * Math.max(1.2, params.sizeChaos * 4)) return straight();
+    return halves;
+  }
+  function partitionReference(poly, params, minArea, variance, gap, depth = 0, isAtomic = null) {
+    if (!poly || poly.length < 3) return [];
+    const atomic = isAtomic ? isAtomic(poly) : polygonArea(poly) < minArea * Math.pow(variance, Math.abs((Random.float() + Random.float() + Random.float() + Random.float()) / 2 - 1));
+    if (atomic || depth > 18) return [poly];
+    let halves = cutWithReferenceBend(poly, params, gap, depth);
+    if (halves.length < 2) return [poly];
+    const a0 = polygonArea(halves[0]);
+    const a1 = polygonArea(halves[1]);
+    if (a0 <= 1e-6 || a1 <= 1e-6 || Math.max(a0 / a1, a1 / a0) > 2 * variance) return [poly];
     let out = [];
-    for (const h of halves) out = out.concat(subdivideAligned(h, axis, minArea, sizeChaos, gridChaos, alley, depth + 1, !useAxis));
+    for (const half of halves) out = out.concat(partitionReference(half, params, minArea, variance, gap, depth + 1, isAtomic));
     return out;
+  }
+  function inverseVertexBlend(poly, p, weights) {
+    let total = 0;
+    let value = 0;
+    for (const v of poly) {
+      const d = Math.max(1e-3, Point.distance(v, p));
+      const w = 1 / d;
+      total += w;
+      value += (weights.get(v) || 0) * w;
+    }
+    return total > 0 ? value / total : NaN;
+  }
+  function makeReferenceLots(block, params, forceSingle = false) {
+    if (forceSingle) return [block];
+    const lots = partitionReference(block, params, params.minSq, Math.max(4 * params.sizeChaos, 1.2), 0, 0);
+    const minLot = params.minSq / 4;
+    return lots.filter((lot) => lot.length >= 4 && polygonArea(lot) >= minLot);
+  }
+  function makeReferenceBlocks(groupShape, groupPatches, params, urban) {
+    const groupArea = polygonArea(groupShape);
+    const threshold = params.minSq * Math.pow(2, params.sizeChaos * (2 * Random.float() - 1)) * params.blockSize;
+    const blockM = /* @__PURE__ */ new Map();
+    for (const v of groupShape) {
+      const touching = groupPatches.filter((p) => p.shape.contains(v));
+      blockM.set(v, touching.length > 0 && touching.every((p) => p.withinWalls || p.withinCity) ? 1 : 9);
+    }
+    const isBlockSized = (poly) => polygonArea(poly) < params.minSq * params.blockSize * inverseVertexBlend(groupShape, poly.center, blockM);
+    const raw = groupArea > threshold ? partitionReference(groupShape, params, params.minSq * params.blockSize, 16 * params.gridChaos, 1.2, 0, urban ? null : isBlockSized) : [groupShape];
+    const blocks = [];
+    for (const shape of raw) {
+      const area = polygonArea(shape);
+      const minSq = params.minSq * Math.pow(2, params.sizeChaos * (2 * Random.float() - 1));
+      const forceSingle = area < minSq;
+      const lots = makeReferenceLots(shape, params, forceSingle);
+      if (lots.length > 0) blocks.push({ shape, lots });
+    }
+    return urban ? blocks : filterReferenceGroup(groupShape, groupPatches, blocks);
+  }
+  function filterReferenceGroup(groupShape, groupPatches, blocks) {
+    const weights = /* @__PURE__ */ new Map();
+    let prev = groupShape[groupShape.length - 1];
+    for (const v of groupShape) {
+      const inner = groupPatches.filter((p) => p.shape.contains(v)).every((p) => p.withinCity);
+      if (inner) {
+        weights.set(v, 1);
+      } else {
+        const edgeScore = (a) => {
+          if (!a) return 0;
+          const neighbour = groupPatches.find((p) => p.shape.findEdge(a, v) !== -1 || p.shape.findEdge(v, a) !== -1);
+          return neighbour && neighbour.withinCity ? 0.3 : 0;
+        };
+        weights.set(v, Math.max(edgeScore(prev), edgeScore(groupShape.next(v))));
+      }
+      prev = v;
+    }
+    const scale = Math.sqrt(groupPatches.length);
+    const offset = 0.5 * scale - 0.5;
+    const filtered = [];
+    for (const block of blocks) {
+      const lots = [];
+      for (const lot of block.lots) {
+        let p = inverseVertexBlend(groupShape, lot.center, weights);
+        p = p * scale - offset;
+        if (!Number.isNaN(p) && Random.float() < p) lots.push(lot);
+      }
+      if (lots.length > 0) filtered.push({ shape: block.shape, lots });
+    }
+    return filtered;
+  }
+  function connectedCommonGroups(model, patches) {
+    const eligible = patches.filter((p) => !p.isWater && p.withinCity && (p.type === "generic" || p.type === "gate"));
+    const unvisited = new Set(eligible);
+    const groups = [];
+    while (unvisited.size > 0) {
+      const start = unvisited.values().next().value;
+      const stack = [start];
+      const group = [];
+      unvisited.delete(start);
+      while (stack.length > 0) {
+        const p = stack.pop();
+        group.push(p);
+        for (const n2 of model.getNeighbours(p)) {
+          if (unvisited.has(n2)) {
+            unvisited.delete(n2);
+            stack.push(n2);
+          }
+        }
+      }
+      groups.push(group);
+    }
+    return groups;
+  }
+  function createCommonWardGroups(model, patches, widths) {
+    const blocks = [];
+    const buildings = [];
+    for (const group of connectedCommonGroups(model, patches)) {
+      let shape;
+      try {
+        shape = group.length === 1 ? group[0].shape : findCircumference(group);
+        shape = insetShape(model, shape, widths, group.every((p) => p.withinWalls), null);
+      } catch (e) {
+        shape = null;
+      }
+      if (!shape || shape.length < 3) continue;
+      const params = districtAlleyParams();
+      const urban = group.every((p) => p.withinWalls) && group.every((p) => model.isEnclosed(p));
+      const groupBlocks = makeReferenceBlocks(shape, group, params, urban);
+      for (const block of groupBlocks) {
+        blocks.push(block.shape);
+        for (const lot of block.lots) buildings.push(lot);
+      }
+    }
+    return { blocks, buildings: classifyGardenLots(indentFronts(buildings, null)) };
   }
   function buildWardGeometry(model, patch, widths) {
     if (patch.isWater) return [];
@@ -1547,10 +1954,9 @@
         if (!block || block.length < 3) return [];
         return createAlleys(block, 60 + 40 * Random.float(), 0.3, 0.5, 0.7, true, widths.alley);
       default: {
-        if (!block || block.length < 3) return [];
-        const params = patch.alleyParams || { minSq: 30, gridChaos: 0.5, sizeChaos: 0.6 };
-        const axis = patch.districtAxis || principalAxis(block);
-        return subdivideAligned(block, axis, params.minSq, params.sizeChaos, params.gridChaos, widths.alley);
+        if (patch.type !== "generic" && patch.type !== "gate") return [];
+        if (!patch.withinCity && patch.type !== "gate") return [];
+        return createCommonWardGeometry(model, patch, widths);
       }
     }
   }
@@ -1630,7 +2036,6 @@
       this.buildWalls();
       this.buildStreets();
       this.assignWards();
-      this.buildDistricts();
       this.buildBlocks();
       this.buildGeometry();
     }
@@ -1708,6 +2113,13 @@
     }
     getNeighbours(patch) {
       return this.patches.filter((p) => p !== patch && p.shape.borders(patch.shape));
+    }
+    getNeighbour(patch, v) {
+      const next = patch.shape.next(v);
+      return this.patches.find((p) => p !== patch && p.shape.findEdge(next, v) !== -1) || null;
+    }
+    isEnclosed(patch) {
+      return patch.withinCity && (patch.withinWalls || this.getNeighbours(patch).every((p) => p.withinCity));
     }
     // Vertices shared between a water cell and a land cell = the coastline. Excluded from the
     // road graph so streets/roads never touch the shore.
@@ -1981,41 +2393,6 @@
       }
       for (const patch of this.patches) if (patch.type == null) patch.type = "generic";
     }
-    // Group adjacent residential wards into districts. Each district shares one orientation and
-    // one set of alley params, and its cells are MERGED and subdivided as a single shape in
-    // buildGeometry — so building blocks span the old cell boundaries (block-to-block coherence).
-    buildDistricts() {
-      this.districts = [];
-      const grouped = /* @__PURE__ */ new Set();
-      const isResidential = (p) => p.withinCity && (p.type === "generic" || p.type === "gate");
-      for (const seed2 of this.inner) {
-        if (grouped.has(seed2) || !isResidential(seed2)) continue;
-        const cells = [seed2];
-        grouped.add(seed2);
-        const target = 2 + Math.floor(Random.float() * 3);
-        const frontier = [seed2];
-        while (cells.length < target && frontier.length > 0) {
-          const cur = frontier.shift();
-          for (const nb of this.getNeighbours(cur)) {
-            if (cells.length >= target) break;
-            if (!grouped.has(nb) && isResidential(nb)) {
-              cells.push(nb);
-              grouped.add(nb);
-              frontier.push(nb);
-            }
-          }
-        }
-        const verts = [];
-        for (const p of cells) for (const v of p.shape) verts.push(v);
-        const axis = principalAxis(verts);
-        const params = districtAlleyParams();
-        for (const p of cells) {
-          p.districtAxis = axis;
-          p.alleyParams = params;
-        }
-        this.districts.push({ cells, axis, params });
-      }
-    }
     // --- step 5: shrink each patch into a block, leaving room for roads ---
     buildBlocks() {
       for (const patch of this.patches) {
@@ -2030,47 +2407,32 @@
         }
       }
     }
-    // Fill wards with building lots. Residential districts are subdivided as one MERGED shape so
-    // blocks relate across cells; everything else is subdivided per cell. Failures fall back
-    // gracefully and never abort the whole city. Produces a flat `this.buildings` list.
+    // Fill wards with building lots. Generic/gate wards use the reference mfcg WardGroup
+    // pipeline; special wards keep their own geometry.
     buildGeometry() {
       const widths = this.cfg.streetWidths;
       this.buildings = [];
-      const handled = /* @__PURE__ */ new Set();
-      for (const d of this.districts) {
-        let blocks = [];
-        try {
-          const merged = d.cells.length === 1 ? d.cells[0].shape : findCircumference(d.cells);
-          const block = insetShape(this, merged, widths, true);
-          if (block && block.length >= 3)
-            blocks = subdivideAligned(block, d.axis, d.params.minSq, d.params.sizeChaos, d.params.gridChaos, widths.alley);
-        } catch (e) {
-          blocks = [];
-        }
-        if (blocks.length === 0) {
-          for (const c of d.cells) {
-            try {
-              const b = insetShape(this, c.shape, widths, c.withinWalls, c);
-              if (b && b.length >= 3)
-                blocks = blocks.concat(subdivideAligned(b, d.axis, d.params.minSq, d.params.sizeChaos, d.params.gridChaos, widths.alley));
-            } catch (e) {
-            }
-          }
-        }
-        for (const b of blocks) this.buildings.push(b);
-        for (const c of d.cells) handled.add(c);
-      }
       for (const patch of this.patches) {
-        if (handled.has(patch) || patch.isWater) continue;
+        if (patch.isWater) continue;
+        if (patch.type === "generic" || patch.type === "gate") continue;
         try {
           for (const b of buildWardGeometry(this, patch, widths)) this.buildings.push(b);
         } catch (e) {
         }
       }
+      try {
+        const common = createCommonWardGroups(this, this.patches, widths);
+        this.buildings.push(...common.buildings);
+      } catch (e) {
+      }
     }
     toData() {
       const pt = (p) => ({ x: p.x, y: p.y });
       const poly = (pl) => Array.from(pl, pt);
+      const building = (pl) => ({
+        polygon: poly(pl),
+        class: pl.class || "building"
+      });
       const patches = this.patches.map((p, idx) => ({
         id: idx,
         polygon: poly(p.shape),
@@ -2122,7 +2484,7 @@
         cityRadius: this.cityRadius,
         bounds: { minX, minY, maxX, maxY },
         patches,
-        buildings: this.buildings.map(poly),
+        buildings: this.buildings.map(building),
         arteries: this.arteries.map(poly),
         streets: this.streets.map(poly),
         roads: this.roads.map(poly),
@@ -2277,25 +2639,19 @@
       generic: "#838f6e",
       farm: "#94a263"
     },
-    blockFill: {
-      plaza: "#c9bd8e",
-      market: "#c2a161",
-      cathedral: "#9c7da6",
-      castle: "#a76668",
-      gate: "#85906f",
-      generic: "#8d9870",
-      farm: "#a3af74"
-    },
-    blockStroke: "#4b4334",
-    building: "#e9dec0",
-    buildingStroke: "#3a332a",
+    blockFill: "#d6d6d6",
+    building: "#888888",
+    buildingStroke: "#000000",
+    garden: "#b9f05a",
+    gardenStroke: "#000000",
     water: "#9ec6dd",
     waterStroke: "#5d829c",
-    road: "#5a5247",
-    roadCenter: "#84796a",
-    wall: "#3a352c",
-    castleWall: "#2a2620",
-    tower: "#2a2620",
+    bridgeDock: "#c8a46a",
+    bridgeDockOutline: "#000000",
+    wall: "#888888",
+    castleWall: "#888888",
+    wallOutline: "#000000",
+    tower: "#888888",
     gateDot: "#c0392b",
     center: "#2266cc",
     background: "#e9e4d4"
@@ -2362,6 +2718,16 @@
     if (opacity != null) el.setAttribute("opacity", String(opacity));
     return el;
   }
+  function makePath(d, { stroke, strokeWidth } = {}) {
+    const el = ns("path");
+    el.setAttribute("d", d);
+    el.setAttribute("fill", "none");
+    if (stroke != null) el.setAttribute("stroke", stroke);
+    if (strokeWidth != null) el.setAttribute("stroke-width", String(strokeWidth));
+    el.setAttribute("stroke-linecap", "round");
+    el.setAttribute("stroke-linejoin", "round");
+    return el;
+  }
   function makeCircle(p, r, { fill, stroke, strokeWidth, nonScaling } = {}) {
     const el = ns("circle");
     el.setAttribute("cx", String(p.x));
@@ -2372,6 +2738,32 @@
     if (strokeWidth != null) el.setAttribute("stroke-width", String(strokeWidth));
     if (nonScaling) el.setAttribute("vector-effect", "non-scaling-stroke");
     return el;
+  }
+  function makeGateSquare(gate, wall, size, { fill, stroke, strokeWidth } = {}) {
+    const idx = wall.shape.findIndex((p) => Math.abs(p.x - gate.x) < 1e-6 && Math.abs(p.y - gate.y) < 1e-6);
+    const h = size / 2;
+    let tx = 1;
+    let ty = 0;
+    if (idx !== -1) {
+      const prev = wall.shape[(idx + wall.shape.length - 1) % wall.shape.length];
+      const next = wall.shape[(idx + 1) % wall.shape.length];
+      const dx = next.x - prev.x;
+      const dy = next.y - prev.y;
+      const len = Math.hypot(dx, dy) || 1;
+      tx = dx / len;
+      ty = dy / len;
+    }
+    const nx = -ty;
+    const ny = tx;
+    return makePolygon(
+      [
+        { x: gate.x - tx * h - nx * h, y: gate.y - ty * h - ny * h },
+        { x: gate.x + tx * h - nx * h, y: gate.y + ty * h - ny * h },
+        { x: gate.x + tx * h + nx * h, y: gate.y + ty * h + ny * h },
+        { x: gate.x - tx * h + nx * h, y: gate.y - ty * h + ny * h }
+      ],
+      { fill, stroke, strokeWidth }
+    );
   }
   function renderCity(groupEl2, cityData, options = {}) {
     const palette = options.palette || DEFAULT_PALETTE;
@@ -2417,36 +2809,68 @@
       el.setAttribute("fill-opacity", "0.4");
       layerPatches.appendChild(el);
     }
+    const zones = [];
+    for (const block of cityData.blocks || []) if (block && block.length >= 3) zones.push(block);
+    for (const patch of cityData.patches || []) if (patch.block && patch.block.length >= 3) zones.push(patch.block);
+    for (const zone of zones) layerBlocks.appendChild(makePolygon(zone, { fill: palette.blockFill, stroke: "none" }));
     for (const b of cityData.buildings || []) {
-      if (!b || b.length < 3) continue;
-      layerBuildings.appendChild(makePolygon(b, { fill: palette.building, stroke: palette.buildingStroke, strokeWidth: 0.15 }));
+      const polygon = Array.isArray(b) ? b : b.polygon;
+      if (!polygon || polygon.length < 3) continue;
+      const isGarden = !Array.isArray(b) && b.class === "garden";
+      layerBuildings.appendChild(makePolygon(polygon, {
+        fill: isGarden ? palette.garden : palette.building,
+        stroke: isGarden ? palette.gardenStroke : palette.buildingStroke,
+        strokeWidth: 0.18
+      }));
     }
     if (cityData.water && cityData.water.riverPath && cityData.water.riverPath.length >= 2) {
       const w = cityData.water.riverWidth || 1;
       layerRiver.appendChild(makeSmoothPath(cityData.water.riverPath, { stroke: palette.waterStroke, strokeWidth: w * 1.18 }));
       layerRiver.appendChild(makeSmoothPath(cityData.water.riverPath, { stroke: palette.water, strokeWidth: w }));
     }
-    const mainWidth = widths.main || 2;
-    for (const artery of cityData.arteries || []) {
-      if (!artery || artery.length < 2) continue;
-      layerArteries.appendChild(makeSmoothPath(artery, { stroke: palette.road, strokeWidth: mainWidth }));
-      layerArteries.appendChild(makeSmoothPath(artery, { stroke: palette.roadCenter, strokeWidth: mainWidth * 0.3, opacity: 0.6 }));
+    if (cityData.river && cityData.river.bridges) {
+      const riverWidth = Number.isFinite(cityData.river.width) ? cityData.river.width : 5;
+      for (const bridge of cityData.river.bridges) {
+        let d = "";
+        if (bridge.from && bridge.to) {
+          const a = bridge.from;
+          const b = bridge.to;
+          d = `M${a.x},${a.y} Q${bridge.x},${bridge.y} ${b.x},${b.y}`;
+        } else {
+          const r = riverWidth * 0.8;
+          d = `M${bridge.x - r},${bridge.y} L${bridge.x + r},${bridge.y}`;
+        }
+        layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDockOutline, strokeWidth: 3 }));
+        layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDock, strokeWidth: 1.5 }));
+      }
     }
+    for (const dock of cityData.docks || []) {
+      const scale = dock.large ? 2 : 1;
+      for (const pier of dock.piers || []) {
+        if (!pier.from || !pier.to) continue;
+        const d = `M${pier.from.x},${pier.from.y} L${pier.to.x},${pier.to.y}`;
+        layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDockOutline, strokeWidth: 3 * scale }));
+        layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDock, strokeWidth: 1.5 * scale }));
+      }
+    }
+    const mainWidth = widths.main || 2;
     for (const wall of cityData.walls || []) {
       if (!wall.shape || wall.shape.length < 3) continue;
       const isCastle = !!wall.isCastle;
       const strokeColor = isCastle ? palette.castleWall : palette.wall;
       const strokeWidth = isCastle ? mainWidth * 0.9 : mainWidth * 0.6;
+      const outline = makePolygon(wall.shape, { fill: "none", stroke: palette.wallOutline, strokeWidth: strokeWidth + 0.45 });
+      outline.setAttribute("stroke-linejoin", "round");
+      layerWalls.appendChild(outline);
       const el = makePolygon(wall.shape, { fill: "none", stroke: strokeColor, strokeWidth });
       el.setAttribute("stroke-linejoin", "round");
       layerWalls.appendChild(el);
       const towerR = Math.max(mainWidth * 0.55, 0.6);
       for (const t of wall.towers || []) {
-        layerWalls.appendChild(makeCircle(t, towerR, { fill: palette.tower }));
+        layerWalls.appendChild(makeCircle(t, towerR, { fill: palette.tower, stroke: palette.wallOutline, strokeWidth: 0.22 }));
       }
-      const gateR = Math.max(mainWidth * 0.45, 0.5);
       for (const g2 of wall.gates || []) {
-        layerWalls.appendChild(makeCircle(g2, gateR, { fill: palette.gateDot, stroke: "#fff", strokeWidth: 0.3 }));
+        layerWalls.appendChild(makeGateSquare(g2, wall, strokeWidth, { fill: palette.gateDot, stroke: "#fff", strokeWidth: 0.2 }));
       }
     }
     if (showMarkers) {

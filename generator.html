@@ -28,7 +28,7 @@
 	<label><input id="walls" type="checkbox" checked /> walls</label>
 	<label><input id="streets" type="checkbox" checked /> streets</label>
 	<label>outer ratio <input id="outerratio" type="range" min="4" max="8" step="0.5" value="8" /><span id="outerratioval">4x</span></label>
-	<label>road density <input id="roaddens" type="range" min="0" max="3" step="0.25" value="3" /><span id="roaddensval">3</span></label>
+	<label>road density <input id="roaddens" type="range" min="0" max="5" step="0.25" value="5" /><span id="roaddensval">5</span></label>
 	<label>gates <input id="gates" type="number" min="-1" max="16" step="1" value="-1" /></label>
 	<label><input id="seeds" type="checkbox" /> seeds</label>
 	<button id="gen">Generate</button>
@@ -51,9 +51,12 @@ const PALETTE = {
 	outerFill: '#cdd6ac', outerStroke: '#9aa877',   // countryside wards
 	waterFill: '#9ec6dd', waterStroke: '#6f9bb5',   // sea / lakes
 	river: '#9ec6dd', riverBank: '#6f9bb5',         // river / canal
-	wall: '#232323', gate: '#efe9d8',
-	road: '#8f7f62', roadCore: '#efe9d8',
+	wall: '#888888', wallOutline: '#000000', gate: '#efe9d8',
+	bridgeDock: '#c8a46a', bridgeDockOutline: '#000000',
 	seed: '#c0392b',
+	block: '#d6d6d6',
+	building: '#888888', buildingStroke: '#000000',
+	garden: '#b9f05a', gardenStroke: '#000000',
 };
 const RIVER_BANK_SCALE = 1.3;
 
@@ -124,17 +127,20 @@ function drawWall(wall) {
 		if (wall.segments && wall.segments[i] === false) continue;
 		const a = wall.shape[i];
 		const b = wall.shape[(i + 1) % wall.shape.length];
-		const seg = document.createElementNS(SVGNS, 'line');
-		seg.setAttribute('x1', a.x); seg.setAttribute('y1', a.y);
-		seg.setAttribute('x2', b.x); seg.setAttribute('y2', b.y);
-		seg.setAttribute('stroke', PALETTE.wall); seg.setAttribute('stroke-width', thickness);
-		seg.setAttribute('stroke-linecap', 'round'); seg.setAttribute('stroke-linejoin', 'round');
-		vp.appendChild(seg);
+		for (const [stroke, width] of [[PALETTE.wallOutline, thickness + 0.8], [PALETTE.wall, thickness]]) {
+			const seg = document.createElementNS(SVGNS, 'line');
+			seg.setAttribute('x1', a.x); seg.setAttribute('y1', a.y);
+			seg.setAttribute('x2', b.x); seg.setAttribute('y2', b.y);
+			seg.setAttribute('stroke', stroke); seg.setAttribute('stroke-width', width);
+			seg.setAttribute('stroke-linecap', 'round'); seg.setAttribute('stroke-linejoin', 'round');
+			vp.appendChild(seg);
+		}
 	}
 	for (const t of wall.towers || []) {
 		const tower = document.createElementNS(SVGNS, 'circle');
 		tower.setAttribute('cx', t.x); tower.setAttribute('cy', t.y);
 		tower.setAttribute('r', thickness * 1.15); tower.setAttribute('fill', PALETTE.wall);
+		tower.setAttribute('stroke', PALETTE.wallOutline); tower.setAttribute('stroke-width', '0.7');
 		vp.appendChild(tower);
 	}
 	for (const gate of wall.gates || []) {
@@ -144,32 +150,24 @@ function drawWall(wall) {
 		const next = wall.shape[(idx + 1) % wall.shape.length];
 		const dx = next.x - prev.x, dy = next.y - prev.y;
 		const len = Math.hypot(dx, dy) || 1;
-		const ux = dx / len * thickness * 1.9, uy = dy / len * thickness * 1.9;
-		const cut = document.createElementNS(SVGNS, 'line');
-		cut.setAttribute('x1', gate.x - ux); cut.setAttribute('y1', gate.y - uy);
-		cut.setAttribute('x2', gate.x + ux); cut.setAttribute('y2', gate.y + uy);
-		cut.setAttribute('stroke', PALETTE.gate); cut.setAttribute('stroke-width', thickness * 2.2);
-		cut.setAttribute('stroke-linecap', 'butt');
+		const tx = dx / len, ty = dy / len;
+		const nx = -ty, ny = tx;
+		const h = thickness / 2;
+		const pts = [
+			{ x: gate.x - tx * h - nx * h, y: gate.y - ty * h - ny * h },
+			{ x: gate.x + tx * h - nx * h, y: gate.y + ty * h - ny * h },
+			{ x: gate.x + tx * h + nx * h, y: gate.y + ty * h + ny * h },
+			{ x: gate.x - tx * h + nx * h, y: gate.y - ty * h + ny * h },
+		];
+		const cut = document.createElementNS(SVGNS, 'polygon');
+		cut.setAttribute('points', pts.map((p) => p.x + ',' + p.y).join(' '));
+		cut.setAttribute('fill', PALETTE.gate);
 		vp.appendChild(cut);
 	}
 }
 
 function drawRoads(roads) {
-	if (!roads || !roads.arteries) return;
-	for (const road of roads.arteries) {
-		if (!road || road.length < 2) continue;
-		const d = polyPath(road);
-		const outline = document.createElementNS(SVGNS, 'path');
-		outline.setAttribute('d', d); outline.setAttribute('fill', 'none');
-		outline.setAttribute('stroke', PALETTE.road); outline.setAttribute('stroke-width', '2.4');
-		outline.setAttribute('stroke-linecap', 'round'); outline.setAttribute('stroke-linejoin', 'round');
-		vp.appendChild(outline);
-		const core = document.createElementNS(SVGNS, 'path');
-		core.setAttribute('d', d); core.setAttribute('fill', 'none');
-		core.setAttribute('stroke', PALETTE.roadCore); core.setAttribute('stroke-width', '1.2');
-		core.setAttribute('stroke-linecap', 'round'); core.setAttribute('stroke-linejoin', 'round');
-		vp.appendChild(core);
-	}
+	return;
 }
 
 function drawBridges(river) {
@@ -199,7 +197,7 @@ function drawBridges(river) {
 			const ny = dx / len * riverWidth * 0.8;
 			d = `M${bridge.x - nx},${bridge.y - ny} L${bridge.x + nx},${bridge.y + ny}`;
 		}
-		for (const [stroke, width] of [[PALETTE.road, 2.4], [PALETTE.roadCore, 1.2]]) {
+		for (const [stroke, width] of [[PALETTE.bridgeDockOutline, 3.2], [PALETTE.bridgeDock, 1.6]]) {
 			const path = document.createElementNS(SVGNS, 'path');
 			path.setAttribute('d', d); path.setAttribute('fill', 'none');
 			path.setAttribute('stroke', stroke); path.setAttribute('stroke-width', width);
@@ -212,10 +210,11 @@ function drawBridges(river) {
 function drawDocks(docks) {
 	if (!docks || docks.length === 0) return;
 	for (const dock of docks) {
+		const w = dock.large ? 2 : 1;
 		for (const pier of dock.piers || []) {
 			if (!pier.from || !pier.to) continue;
 			const d = `M${pier.from.x},${pier.from.y} L${pier.to.x},${pier.to.y}`;
-			for (const [stroke, width] of [[PALETTE.road, 2.4], [PALETTE.roadCore, 1.2]]) {
+			for (const [stroke, width] of [[PALETTE.bridgeDockOutline, 3.2 * w], [PALETTE.bridgeDock, 1.6 * w]]) {
 				const path = document.createElementNS(SVGNS, 'path');
 				path.setAttribute('d', d); path.setAttribute('fill', 'none');
 				path.setAttribute('stroke', stroke); path.setAttribute('stroke-width', width);
@@ -223,6 +222,38 @@ function drawDocks(docks) {
 				vp.appendChild(path);
 			}
 		}
+	}
+}
+
+function drawBlocks(blocks) {
+	if (!blocks || blocks.length === 0) return;
+	let d = '';
+	for (const b of blocks) {
+		if (!b || b.length < 3) continue;
+		d += 'M' + b.map((p) => p.x + ',' + p.y).join('L') + 'Z';
+	}
+	if (!d) return;
+	const el = document.createElementNS(SVGNS, 'path');
+	el.setAttribute('d', d);
+	el.setAttribute('fill', PALETTE.block);
+	el.setAttribute('stroke', 'none');
+	el.setAttribute('fill-rule', 'evenodd');
+	vp.appendChild(el);
+}
+
+function drawBuildings(buildings) {
+	if (!buildings || buildings.length === 0) return;
+	for (const b of buildings) {
+		const polygon = Array.isArray(b) ? b : b.polygon;
+		if (!polygon || polygon.length < 3) continue;
+		const isGarden = !Array.isArray(b) && b.class === 'garden';
+		const el = document.createElementNS(SVGNS, 'polygon');
+		el.setAttribute('points', polygon.map((p) => p.x + ',' + p.y).join(' '));
+		el.setAttribute('fill', isGarden ? PALETTE.garden : PALETTE.building);
+		el.setAttribute('stroke', isGarden ? PALETTE.gardenStroke : PALETTE.buildingStroke);
+		el.setAttribute('stroke-width', '0.18');
+		el.setAttribute('stroke-linejoin', 'round');
+		vp.appendChild(el);
 	}
 }
 
@@ -240,6 +271,8 @@ function render(d) {
 		el.setAttribute('vector-effect', 'non-scaling-stroke');
 		vp.appendChild(el);
 	}
+	drawBlocks(d.blocks);
+	drawBuildings(d.buildings);
 	drawRoads(d.roads);
 	if (d.river && d.river.course && d.river.course.length >= 2) {
 		const course = d.river.delta
@@ -256,26 +289,12 @@ function render(d) {
 		};
 
 		if (d.river.delta) {
-			const bank = previewDeltaFromPath(d.river.delta, visualCourse, d.river.width * RIVER_BANK_SCALE);
-			const bankFill = document.createElementNS(SVGNS, 'path');
-			bankFill.setAttribute('d', deltaPath(bank)); bankFill.setAttribute('fill', PALETTE.riverBank); bankFill.setAttribute('stroke', 'none');
-			vp.appendChild(bankFill);
-			vp.appendChild(mk(PALETTE.riverBank, d.river.width * RIVER_BANK_SCALE));
-
 			const dl = previewDeltaFromPath(d.river.delta, visualCourse, d.river.width + Math.max(0.8, d.river.width * 0.04));
 			const fill = document.createElementNS(SVGNS, 'path');
 			fill.setAttribute('d', deltaPath(dl)); fill.setAttribute('fill', PALETTE.river); fill.setAttribute('stroke', 'none');
 			vp.appendChild(fill);
 			vp.appendChild(mk(PALETTE.river, d.river.width));
-
-			let od = `M${dl.right.x},${dl.right.y} C${dl.rightCtrl1.x},${dl.rightCtrl1.y} ${dl.rightCtrl2.x},${dl.rightCtrl2.y} ${dl.prevShore.x},${dl.prevShore.y}`;
-			od += ` M${dl.left.x},${dl.left.y} C${dl.leftCtrl2.x},${dl.leftCtrl2.y} ${dl.leftCtrl1.x},${dl.leftCtrl1.y} ${dl.nextShore.x},${dl.nextShore.y}`;
-			const outline = document.createElementNS(SVGNS, 'path');
-			outline.setAttribute('d', od); outline.setAttribute('fill', 'none');
-			outline.setAttribute('stroke', PALETTE.riverBank); outline.setAttribute('stroke-width', '1');
-			vp.appendChild(outline);
 		} else {
-			vp.appendChild(mk(PALETTE.riverBank, d.river.width * RIVER_BANK_SCALE));
 			vp.appendChild(mk(PALETTE.river, d.river.width));
 		}
 		drawBridges(d.river);
@@ -303,7 +322,11 @@ function render(d) {
 	const outerCount = d.wards.filter((w) => !w.inner && !w.water).length;
 	const waterCount = d.wards.filter((w) => w.water).length;
 	const dockText = dockPierCount > 0 ? ` · ${dockPierCount} dock piers` : '';
-	statusEl.textContent = `seed ${d.seed} · size ${d.size} · ${d.wards.length} wards (${innerCount} city, ${outerCount} outer, ${waterCount} water)${gateText} · ${roadCount} arteries${dockText}`;
+	const bridgeCount = d.river && d.river.bridges ? d.river.bridges.length : 0;
+	const bridgeText = bridgeCount > 0 ? ` · ${bridgeCount} bridges` : '';
+	const blockCount = d.blocks ? d.blocks.length : 0;
+	const blockText = blockCount > 0 ? ` · ${blockCount} blocks` : '';
+	statusEl.textContent = `seed ${d.seed} · size ${d.size} · ${d.wards.length} wards (${innerCount} city, ${outerCount} outer, ${waterCount} water)${gateText} · ${roadCount} arteries${bridgeText}${dockText}${blockText}`;
 }
 
 function generate() {

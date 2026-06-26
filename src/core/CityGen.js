@@ -17,7 +17,8 @@ import { buildRiver, smoothShore } from './River.js';
 import { addObstacleCrossings, buildCityWall, suppressWallSegmentsOnRiver } from './Walls.js';
 import { buildStreets } from './Streets.js';
 import { buildDocks } from './Docks.js';
-import { amin } from './arrays.js';
+import { amin, remove } from './arrays.js';
+import { cathedralRate, createCommonWardGeometry, marketRate, OPEN_TYPES } from './wards.js';
 
 // reference constant: pc.LTOWER_RADIUS = 2.5 (used as the junction-merge floor 3*LTOWER_RADIUS)
 const LTOWER_RADIUS = 2.5;
@@ -49,6 +50,14 @@ function serializeDock(dock) {
 			from: serializePoint(pier.from),
 			to: serializePoint(pier.to),
 		})),
+		large: !!dock.large,
+	};
+}
+
+function serializeBuilding(building) {
+	return {
+		polygon: Array.from(building, (v) => ({ x: v.x, y: v.y })),
+		class: building.class || 'building',
 	};
 }
 
@@ -214,6 +223,239 @@ function collapse(vmap, v0, v1) {
 	vmap.delete(v1);
 }
 
+// ---- available build-area computation (step 1: inset each ward by edge type) ----
+
+const WALL_THICKNESS = 1.9; // pc.THICKNESS in reference
+const DEFAULT_BLOCK_INSET = 0.6;
+const ROAD_BLOCK_INSET = 1.0;
+const PASSAGE_MARGIN = 1.2;
+const RIVER_NODE_MARGIN = 1.6;
+const TOWER_CLEARANCE = 4.4;
+
+function addEdgeRef(map, a, b) {
+	let s = map.get(a);
+	if (!s) map.set(a, (s = new Set()));
+	s.add(b);
+}
+
+function hasEdgeRef(map, a, b) {
+	const s = map.get(a);
+	return !!(s && s.has(b));
+}
+
+function setMax(map, key, value) {
+	const current = map.get(key);
+	if (current == null || value > current) map.set(key, value);
+}
+
+function buildShoreEdges(cells) {
+	const waterEdges = new Map();
+	for (const cell of cells) {
+		if (!cell.water) continue;
+		cell.forEdge((v0, v1) => addEdgeRef(waterEdges, v0, v1));
+	}
+
+	const shoreEdges = new Map();
+	for (const cell of cells) {
+		if (cell.water) continue;
+		cell.forEdge((v0, v1) => {
+			if (hasEdgeRef(waterEdges, v1, v0)) {
+				addEdgeRef(shoreEdges, v0, v1);
+				addEdgeRef(shoreEdges, v1, v0);
+			}
+		});
+	}
+	return shoreEdges;
+}
+
+function isActiveWallEdge(ctx, v0, v1) {
+	if (!ctx.wallShape) return false;
+	for (let i = 0; i < ctx.wallShape.length; i++) {
+		const a = ctx.wallShape[i];
+		const b = ctx.wallShape[(i + 1) % ctx.wallShape.length];
+		if ((a === v0 && b === v1) || (a === v1 && b === v0)) return ctx.wallSegments == null || ctx.wallSegments[i] !== false;
+	}
+	return false;
+}
+
+function clippedCorner(poly, sourceShape, corner, clearance) {
+	if (!poly || poly.length < 3 || !(clearance > 0)) return poly;
+
+	const idx = sourceShape.indexOf(corner);
+	if (idx === -1) return poly;
+	const prev = sourceShape[(idx + sourceShape.length - 1) % sourceShape.length];
+	const next = sourceShape[(idx + 1) % sourceShape.length];
+	const prevLen = Point.distance(corner, prev);
+	const nextLen = Point.distance(corner, next);
+	if (prevLen < 1e-6 || nextLen < 1e-6) return poly;
+
+	const reach = Math.min(clearance, prevLen * 0.45, nextLen * 0.45);
+	if (!(reach > 1e-6)) return poly;
+
+	const a = corner.add(prev.subtract(corner).norm(reach));
+	const b = corner.add(next.subtract(corner).norm(reach));
+	const halves = poly.cut(a, b);
+	if (halves.length < 2) return poly;
+
+	let best = poly;
+	let bestDistance = -Infinity;
+	const minKeptArea = Math.abs(poly.square) * 0.55;
+	for (const half of halves) {
+		if (!half || half.length < 3 || Math.abs(half.square) < Math.max(1, minKeptArea)) continue;
+		const d = Point.distance(half.center, corner);
+		if (d > bestDistance) {
+			best = half;
+			bestDistance = d;
+		}
+	}
+	return best;
+}
+
+function clipObstacleCorners(poly, sourceShape, nodeClearance) {
+	let clipped = poly;
+	for (const v of sourceShape) {
+		const clearance = nodeClearance.get(v) || 0;
+		if (clearance > 0) clipped = clippedCorner(clipped, sourceShape, v, clearance);
+		if (!clipped || clipped.length < 3) return null;
+	}
+	return clipped;
+}
+
+function computeAvailableArea(cell, ctx) {
+	const edgeInsets = [];
+	cell.forEdge((v0, v1) => {
+		let inset = DEFAULT_BLOCK_INSET;
+		if (hasEdgeRef(ctx.riverEdges, v0, v1) || hasEdgeRef(ctx.riverEdges, v1, v0))
+			inset = Math.max(inset, ctx.riverWidth / 2 + PASSAGE_MARGIN);
+		if (hasEdgeRef(ctx.shoreEdges, v0, v1) || hasEdgeRef(ctx.shoreEdges, v1, v0))
+			inset = Math.max(inset, Math.max(ctx.riverWidth / 2 + PASSAGE_MARGIN, 1.8));
+		if (isActiveWallEdge(ctx, v0, v1)) inset = Math.max(inset, WALL_THICKNESS / 2 + PASSAGE_MARGIN);
+		for (const road of ctx.roads) {
+			if (road.includes(v0) && road.includes(v1)) {
+				inset = Math.max(inset, ROAD_BLOCK_INSET);
+				break;
+			}
+		}
+		if (ctx.plazaCell && ctx.plazaCell.findEdge(v1, v0) !== -1) inset = Math.max(inset, ROAD_BLOCK_INSET);
+		edgeInsets.push(inset);
+	});
+	try {
+		const base = cell.isConvex() ? cell.shrink(edgeInsets) : cell.buffer(edgeInsets);
+		return clipObstacleCorners(base, cell, ctx.nodeClearance);
+	} catch (e) { return null; }
+}
+
+function buildBuildings(cells, inner, center, wallData, streetData, riverData, plazaEnabled) {
+	if (!inner || inner.length === 0 || !center) return { blocks: [], buildings: [], wardTypes: new Map() };
+
+	// River edges map (shared Point identity)
+	const riverEdges = new Map();
+	const nodeClearance = new Map();
+	if (riverData && riverData.course) {
+		for (let i = 0; i < riverData.course.length - 1; i++) {
+			const a = riverData.course[i], b = riverData.course[i + 1];
+			addEdgeRef(riverEdges, a, b);
+			addEdgeRef(riverEdges, b, a);
+		}
+		for (const v of riverData.course) setMax(nodeClearance, v, riverData.width / 2 + RIVER_NODE_MARGIN);
+	}
+	if (wallData && wallData.towers) for (const t of wallData.towers) setMax(nodeClearance, t, TOWER_CLEARANCE);
+	const shoreEdges = buildShoreEdges(cells);
+
+	const plazaCell = plazaEnabled && inner.length > 0 ? inner[0] : null;
+	const arteries = (streetData && streetData.arteries) || [];
+
+	// Lightweight model adapter for cathedralRate / marketRate
+	const patchMap = new Map();
+	const patches = [];
+	for (const cell of cells) {
+		const p = { shape: cell, type: null, withinCity: !!cell.withinCity, isWater: !!cell.water };
+		patches.push(p);
+		patchMap.set(cell, p);
+	}
+	const innerPatches = inner.map((c) => patchMap.get(c));
+	const model = {
+		center, inner: innerPatches, patches,
+		plaza: plazaCell ? patchMap.get(plazaCell) : null,
+		arteries,
+		gates: wallData ? wallData.gates : [],
+		cityRadius: 1,
+		patchByVertex: (v) => patches.filter((p) => p.shape.contains(v)),
+		getNeighbours: (patch) => patches.filter((p) => p !== patch && p.shape.borders(patch.shape)),
+	};
+	model.getNeighbour = (patch, v) => {
+		const next = patch.shape.next(v);
+		return patches.find((p) => p !== patch && p.shape.findEdge(next, v) !== -1) || null;
+	};
+	model.isEnclosed = (patch) => patch.withinCity && model.getNeighbours(patch).every((p) => p.withinCity);
+
+	// --- assign ward types ---
+	if (model.plaza) model.plaza.type = 'plaza';
+	const unassigned = innerPatches.filter((p) => p !== model.plaza);
+
+	if (unassigned.length > 0) {
+		const pick = amin(unassigned, (p) => cathedralRate(model, p));
+		pick.type = 'cathedral';
+		remove(unassigned, pick);
+	}
+	let squares = 2;
+	while (squares-- > 0 && unassigned.length > 0) {
+		const pick = amin(unassigned, (p) => marketRate(model, p));
+		pick.type = 'market';
+		remove(unassigned, pick);
+	}
+	if (wallData) {
+		for (const gate of wallData.gates)
+			for (const p of patches)
+				if (p.withinCity && p.type == null && p.shape.contains(gate)) p.type = 'gate';
+	}
+	for (const p of unassigned) if (p.type == null) p.type = 'generic';
+	for (const p of patches) {
+		if (!p.withinCity && !p.isWater && p.type == null)
+			p.type = Random.bool(0.2) && p.shape.compactness >= 0.7 ? 'farm' : 'generic';
+		if (p.type == null) p.type = 'generic';
+	}
+	for (const p of innerPatches)
+		for (const v of p.shape)
+			model.cityRadius = Math.max(model.cityRadius, Point.distance(v, center));
+
+	// --- compute available build areas (one inset polygon per ward) ---
+	// Use pre-smoothed streets/roads for edge matching (shared Point identity);
+	// smoothed arteries have new Point objects that won't match cell vertices.
+	const rawRoads = [];
+	if (streetData) {
+		if (streetData.streets) rawRoads.push(...streetData.streets);
+		if (streetData.roads) rawRoads.push(...streetData.roads);
+	}
+
+	const ctx = {
+		riverEdges, riverWidth: riverData ? riverData.width : 0,
+		shoreEdges, nodeClearance,
+		roads: rawRoads, plazaCell,
+		wallShape: wallData ? wallData.shape : null,
+		wallSegments: wallData ? wallData.segments : null,
+	};
+
+	const blocks = [];
+	const buildings = [];
+	for (const p of patches) {
+		if (OPEN_TYPES.has(p.type) || p.isWater) continue;
+		const avail = computeAvailableArea(p.shape, ctx);
+		if (avail && avail.length >= 3) {
+			p.block = avail;
+			blocks.push(avail);
+			if ((p.type === 'generic' || p.type === 'gate') && p.withinCity) {
+				for (const b of createCommonWardGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.6 })) buildings.push(b);
+			}
+		}
+	}
+
+	const wardTypes = new Map();
+	for (const p of patches) wardTypes.set(p.shape, p.type);
+
+	return { blocks, buildings, wardTypes };
+}
+
 // ---- public entry ----
 export function generateWards(params = {}) {
 	let seed = params.seed;
@@ -260,11 +502,17 @@ export function generateWards(params = {}) {
 	}
 	if (result == null) throw new Error('ward generation failed');
 
+	const { blocks, buildings, wardTypes } = buildBuildings(
+		result.cells, result.inner, result.center,
+		result.wall, result.streets, result.river, plaza
+	);
+
 	const wards = result.cells.map((cell) => ({
 		polygon: cell.map((v) => ({ x: v.x, y: v.y })),
 		inner: !!cell.withinCity,
 		water: !!cell.water,
 		landing: !!cell.landing,
+		type: wardTypes.get(cell) || 'generic',
 	}));
 
 	let minX = Infinity;
@@ -315,5 +563,7 @@ export function generateWards(params = {}) {
 				}
 			: { streets: [], roads: [], arteries: [] },
 		docks: (result.docks || []).map(serializeDock),
+		blocks: blocks.map((b) => Array.from(b, (v) => ({ x: v.x, y: v.y }))),
+		buildings: buildings.map(serializeBuilding),
 	};
 }
