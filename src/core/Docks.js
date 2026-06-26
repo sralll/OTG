@@ -136,9 +136,8 @@ export function buildDocks(cells, inner, opts = {}) {
 		cell.landing = true;
 
 		const edge = edges.reduce((best, e) => (Point.distance(e.a, e.b) > Point.distance(best.a, best.b) ? e : best), edges[0]);
-		const useLarge = Random.float() < 0.3;
-		const piers = useLarge ? largePierSegments(edge) : pierSegments(edge);
-		if (piers.length > 0) docks.push({ cell, shore: { from: edge.a, to: edge.b }, piers, large: useLarge });
+		const piers = pierSegments(edge);
+		if (piers.length > 0) docks.push({ cell, shore: { from: edge.a, to: edge.b }, piers, large: false });
 	}
 
 	return docks;

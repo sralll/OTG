@@ -125,8 +125,12 @@ function markCoastSegments(wall, cells) {
 
 function rebuildTowers(wall) {
 	wall.towers = [];
+	// Place a tower if at least one adjacent segment is active (OR logic). Towers at
+	// water/river endpoints are offset inland by the renderer so they sit fully on land.
 	for (let i = 0; i < wall.shape.length; i++) {
-		if (!wall.gates.includes(wall.shape[i]) && (wall.segments[(i + wall.shape.length - 1) % wall.shape.length] || wall.segments[i])) wall.towers.push(wall.shape[i]);
+		const prev = wall.segments[(i + wall.shape.length - 1) % wall.shape.length];
+		const next = wall.segments[i];
+		if (!wall.gates.includes(wall.shape[i]) && (prev || next)) wall.towers.push(wall.shape[i]);
 	}
 }
 
@@ -137,6 +141,10 @@ export function suppressWallSegmentsOnRiver(wall, river) {
 		addEdge(edges, river.course[i], river.course[i + 1]);
 		addEdge(edges, river.course[i + 1], river.course[i]);
 	}
+	// Only suppress segments that ARE river edges (run along the river course). Segments
+	// that merely TOUCH a river node are kept — the renderer pulls their river-node
+	// endpoint back by half the river width so the wall extends toward the water but
+	// stops at the riverbank, not inside it.
 	for (let i = 0; i < wall.edges.length; i++) {
 		const a = wall.edges[i].origin;
 		const b = wall.edges[i].end;
@@ -182,6 +190,17 @@ function hasOppositeSideConnections(neighbours, v, prev, next) {
 	return !!crossingConnection(neighbours, v, prev, next);
 }
 
+function riverIndexAt(river, v) {
+	if (!river || !river.course) return -1;
+	return river.course.indexOf(v);
+}
+
+function bridgeAcrossRiverConnection(counts, river, v) {
+	const i = riverIndexAt(river, v);
+	if (i <= 0 || i >= river.course.length - 1) return null;
+	return crossingConnection(counts.get(v), v, river.course[i - 1], river.course[i + 1]);
+}
+
 export function addObstacleCrossings(cells, wall, river) {
 	const crossings = { bridges: [] };
 	const counts = connectionCounts(cells.filter((c) => !c.water));
@@ -192,9 +211,31 @@ export function addObstacleCrossings(cells, wall, river) {
 		wall.crossingGates = [];
 		for (let i = 0; i < wall.shape.length; i++) {
 			const v = wall.shape[i];
-			if (riverNodes.has(v)) continue;
 			const prev = wall.shape[(i + wall.shape.length - 1) % wall.shape.length];
 			const next = wall.shape[(i + 1) % wall.shape.length];
+			if (riverNodes.has(v)) {
+				// River treatment wins: don't place a gate or crossing-gate at a river node.
+				// Add a bridge across the river at the wall, suppress the wall's adjacent
+				// segments (so the wall pulls back to the riverbank), and remove the gate.
+				if (wall.gates.includes(v)) {
+					wall.gates = wall.gates.filter((g) => g !== v);
+					if (river && river.course) {
+						const connection = bridgeAcrossRiverConnection(counts, river, v);
+						crossings.bridges.push(
+							connection
+								? { point: v, from: connection.negative, to: connection.positive }
+								: { point: v }
+						);
+					}
+					// suppress both adjacent river-node segments so the renderer pulls the wall
+					// back to the riverbank and places towers (not a gate) at the endpoints.
+					if (wall.segments) {
+						wall.segments[(i + wall.shape.length - 1) % wall.shape.length] = false;
+						wall.segments[i] = false;
+					}
+				}
+				continue;
+			}
 			if (hasOppositeSideConnections(counts.get(v), v, prev, next)) {
 				if (!wall.gates.includes(v)) wall.gates.push(v);
 				if (!wall.crossingGates.includes(v)) wall.crossingGates.push(v);

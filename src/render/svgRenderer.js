@@ -23,11 +23,13 @@ const DEFAULT_PALETTE = {
 		generic: '#838f6e',
 		farm: '#94a263',
 	},
-	blockFill: '#d6d6d6',
-	building: '#888888',
+	blockFill: '#888888',
+	building: '#6c6c6c',
 	buildingStroke: '#000000',
-	garden: '#b9f05a',
+	garden: '#a6b93c',
 	gardenStroke: '#000000',
+	// Alleys drawn as the block color on top of buildings -> reads as a gap, not a road.
+	alley: '#c8c8c8',
 	water: '#9ec6dd',
 	waterStroke: '#5d829c',
 	bridgeDock: '#c8a46a',
@@ -39,6 +41,10 @@ const DEFAULT_PALETTE = {
 	gateDot: '#c0392b',
 	center: '#2266cc',
 	background: '#e9e4d4',
+	// Orienteering landmarks dropped into chamfered corner gaps (green tree / blue fountain).
+	featureTree: '#2f8f3e',
+	featureFountain: '#2b7fc4',
+	featureOutline: '#1c1c1c',
 };
 
 function ns(tag) {
@@ -119,26 +125,102 @@ function smoothPathD(pts) {
 	return d;
 }
 
-function makeSmoothPath(pts, { stroke, strokeWidth, opacity } = {}) {
+function makeSmoothPath(pts, { stroke, strokeWidth, opacity, linecap = 'round' } = {}) {
 	const el = ns('path');
 	el.setAttribute('d', smoothPathD(pts));
 	el.setAttribute('fill', 'none');
 	if (stroke != null) el.setAttribute('stroke', stroke);
 	if (strokeWidth != null) el.setAttribute('stroke-width', String(strokeWidth));
-	el.setAttribute('stroke-linecap', 'round');
+	el.setAttribute('stroke-linecap', linecap);
 	el.setAttribute('stroke-linejoin', 'round');
 	if (opacity != null) el.setAttribute('opacity', String(opacity));
 	return el;
 }
 
-function makePath(d, { stroke, strokeWidth } = {}) {
+// For a tower at a water/river endpoint (either adjacent segment suppressed or the tower
+// is a river node), offset it along the active wall segment to where the wall actually
+// ends (the pulled-back endpoint), so the tower sits on land, not in the water.
+function adjustedTowerPos(wall, tower, riverWidth, riverNodes, towerR) {
+	const n = wall.shape.length;
+	const segs = wall.segments;
+	if (!segs) return tower;
+	const idx = wall.shape.findIndex((v) => Math.abs(v.x - tower.x) < 1e-6 && Math.abs(v.y - tower.y) < 1e-6);
+	if (idx === -1) return tower;
+	const prevActive = segs[(idx + n - 1) % n] !== false;
+	const nextActive = segs[idx] !== false;
+	const isRiverNode = riverNodes && riverNodes.has(`${tower.x},${tower.y}`);
+	// Only offset if the tower is at a water boundary (a suppressed neighbor) or is a river node.
+	if (prevActive && nextActive && !isRiverNode) return tower;
+	// Pick the direction along the active (on-land) segment.
+	let dx = 0;
+	let dy = 0;
+	if (nextActive && !prevActive) {
+		const next = wall.shape[(idx + 1) % n];
+		dx = next.x - tower.x; dy = next.y - tower.y;
+	} else if (prevActive && !nextActive) {
+		const prev = wall.shape[(idx + n - 1) % n];
+		dx = prev.x - tower.x; dy = prev.y - tower.y;
+	} else if (isRiverNode) {
+		// Both segments may be suppressed (river node at a shore); offset along whichever
+		// neighbor is farther inland (longer edge = more on land).
+		const prev = wall.shape[(idx + n - 1) % n];
+		const next = wall.shape[(idx + 1) % n];
+		const pLen = Math.hypot(prev.x - tower.x, prev.y - tower.y);
+		const nLen = Math.hypot(next.x - tower.x, next.y - tower.y);
+		if (nLen >= pLen) { dx = next.x - tower.x; dy = next.y - tower.y; }
+		else { dx = prev.x - tower.x; dy = prev.y - tower.y; }
+	} else {
+		return tower; // both suppressed, not a river node — leave as-is
+	}
+	const len = Math.hypot(dx, dy) || 1;
+	// Place the tower center where the wall ends (pulled back by halfRiver from the node),
+	// plus the tower radius so the tower is fully clear of the water.
+	const halfRiver = (riverWidth || 0) / 2;
+	const offset = halfRiver + towerR;
+	return { x: tower.x + dx / len * offset, y: tower.y + dy / len * offset };
+}
+
+// Build the wall as individual active segments (skip suppressed = water/coast segments).
+// For segment endpoints that are river nodes OR adjacent to a suppressed segment, pull the
+// endpoint back by half the river width so the wall extends toward the water but stops at
+// the riverbank, not inside it.
+function wallSegmentsPath(wall, riverWidth, riverNodes) {
+	const shape = wall.shape;
+	const segs = wall.segments;
+	const n = shape.length;
+	if (!segs || segs.length < n) return null;
+	const halfRiver = (riverWidth || 0) / 2;
+	let d = '';
+	for (let i = 0; i < n; i++) {
+		if (!segs[i]) continue;
+		const a = shape[i];
+		const b = shape[(i + 1) % n];
+		let ax = a.x;
+		let ay = a.y;
+		let bx = b.x;
+		let by = b.y;
+		if (halfRiver > 0) {
+			const dx = bx - ax;
+			const dy = by - ay;
+			const len = Math.hypot(dx, dy) || 1;
+			// pull back at `a` if the previous segment is suppressed OR `a` is a river node
+			if (!segs[(i + n - 1) % n] || (riverNodes && riverNodes.has(`${a.x},${a.y}`))) { ax += dx / len * halfRiver; ay += dy / len * halfRiver; }
+			// pull back at `b` if the next segment is suppressed OR `b` is a river node
+			if (!segs[(i + 1) % n] || (riverNodes && riverNodes.has(`${b.x},${b.y}`))) { bx -= dx / len * halfRiver; by -= dy / len * halfRiver; }
+		}
+		d += `M${ax},${ay} L${bx},${by} `;
+	}
+	return d || null;
+}
+
+function makePath(d, { stroke, strokeWidth, linecap = 'butt', linejoin = 'round' } = {}) {
 	const el = ns('path');
 	el.setAttribute('d', d);
 	el.setAttribute('fill', 'none');
 	if (stroke != null) el.setAttribute('stroke', stroke);
 	if (strokeWidth != null) el.setAttribute('stroke-width', String(strokeWidth));
-	el.setAttribute('stroke-linecap', 'round');
-	el.setAttribute('stroke-linejoin', 'round');
+	el.setAttribute('stroke-linecap', linecap);
+	el.setAttribute('stroke-linejoin', linejoin);
 	return el;
 }
 
@@ -186,7 +268,7 @@ export function renderCity(groupEl, cityData, options = {}) {
 	const showMarkers = !!options.showMarkers;
 	// cityData itself has no streetWidths field (Model.toData() doesn't echo the config),
 	// so callers should pass it via options; fall back to sensible defaults otherwise.
-	const widths = options.streetWidths || (cityData && cityData.streetWidths) || { main: 2.0, regular: 1.0, alley: 0.6 };
+	const widths = options.streetWidths || (cityData && cityData.streetWidths) || { main: 2.0, regular: 1.0, alley: 0.8 };
 
 	while (groupEl.firstChild) groupEl.removeChild(groupEl.firstChild);
 
@@ -198,6 +280,8 @@ export function renderCity(groupEl, cityData, options = {}) {
 	layerBlocks.setAttribute('id', 'layer-blocks');
 	const layerBuildings = ns('g');
 	layerBuildings.setAttribute('id', 'layer-buildings');
+	const layerAlleys = ns('g');
+	layerAlleys.setAttribute('id', 'layer-alleys');
 	const layerRiver = ns('g');
 	layerRiver.setAttribute('id', 'layer-river');
 	const layerArteries = ns('g');
@@ -213,6 +297,7 @@ export function renderCity(groupEl, cityData, options = {}) {
 	groupEl.appendChild(layerPatches);
 	groupEl.appendChild(layerBlocks);
 	groupEl.appendChild(layerBuildings);
+	groupEl.appendChild(layerAlleys);
 	groupEl.appendChild(layerRiver);
 	groupEl.appendChild(layerArteries);
 	groupEl.appendChild(layerWalls);
@@ -261,30 +346,40 @@ export function renderCity(groupEl, cityData, options = {}) {
 		}));
 	}
 
-	// 2c. River: drawn as a thick rounded stroke along its cell-edge path (over the buildings it
-	// cuts through). A stroked polyline avoids the self-intersection a single offset band can get
-	// at sharp bends, and the width scales with the map since it's a real width.
+	// 2c. Alleys: hidden for now.
+	// for (const alley of cityData.alleys || []) {
+	// 	if (!alley || alley.length < 2) continue;
+	// 	layerAlleys.appendChild(makePolyline(alley, { stroke: palette.alley, strokeWidth: 0.8 }));
+	// }
+
+	// 2c. River: drawn as a thick stroke along its cell-edge path (over the buildings it
+	// cuts through). Butt linecap so the stroke ends cleanly at the coast (no round bump).
 	if (cityData.water && cityData.water.riverPath && cityData.water.riverPath.length >= 2) {
 		const w = cityData.water.riverWidth || 1;
-		// darker bank underneath, water on top -> thin defining rim (smooth curve)
-		layerRiver.appendChild(makeSmoothPath(cityData.water.riverPath, { stroke: palette.waterStroke, strokeWidth: w * 1.18 }));
-		layerRiver.appendChild(makeSmoothPath(cityData.water.riverPath, { stroke: palette.water, strokeWidth: w }));
+		layerRiver.appendChild(makeSmoothPath(cityData.water.riverPath, { stroke: palette.waterStroke, strokeWidth: w * 1.18, linecap: 'butt' }));
+		layerRiver.appendChild(makeSmoothPath(cityData.water.riverPath, { stroke: palette.water, strokeWidth: w, linecap: 'butt' }));
 	}
 
 	if (cityData.river && cityData.river.bridges) {
 		const riverWidth = Number.isFinite(cityData.river.width) ? cityData.river.width : 5;
+		const halfSpan = riverWidth * 0.6;
 		for (const bridge of cityData.river.bridges) {
 			let d = '';
+			const along = (edgePoint) => {
+				const dx = edgePoint.x - bridge.x, dy = edgePoint.y - bridge.y;
+				const len = Math.hypot(dx, dy) || 1;
+				const dist = Math.min(len * 0.85, halfSpan);
+				return { x: bridge.x + dx / len * dist, y: bridge.y + dy / len * dist };
+			};
 			if (bridge.from && bridge.to) {
-				const a = bridge.from;
-				const b = bridge.to;
+				const a = along(bridge.from);
+				const b = along(bridge.to);
 				d = `M${a.x},${a.y} Q${bridge.x},${bridge.y} ${b.x},${b.y}`;
 			} else {
-				const r = riverWidth * 0.8;
-				d = `M${bridge.x - r},${bridge.y} L${bridge.x + r},${bridge.y}`;
+				d = `M${bridge.x - halfSpan},${bridge.y} L${bridge.x + halfSpan},${bridge.y}`;
 			}
-			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDockOutline, strokeWidth: 3.0 }));
-			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDock, strokeWidth: 1.5 }));
+			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDockOutline, strokeWidth: 1.5, linecap: 'butt' }));
+			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDock, strokeWidth: 0.75, linecap: 'butt' }));
 		}
 	}
 
@@ -293,39 +388,67 @@ export function renderCity(groupEl, cityData, options = {}) {
 		for (const pier of dock.piers || []) {
 			if (!pier.from || !pier.to) continue;
 			const d = `M${pier.from.x},${pier.from.y} L${pier.to.x},${pier.to.y}`;
-			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDockOutline, strokeWidth: 3.0 * scale }));
-			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDock, strokeWidth: 1.5 * scale }));
+			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDockOutline, strokeWidth: 3.0 * scale, linecap: 'butt' }));
+			layerArteries.appendChild(makePath(d, { stroke: palette.bridgeDock, strokeWidth: 1.5 * scale, linecap: 'butt' }));
 		}
 	}
 
 	// 3. Roads are intentionally not drawn; their geometry still creates building-zone insets.
 	const mainWidth = widths.main || 2.0;
 
-	// 4. Walls: stroked polygon (no fill), thicker if castle wall. Towers as small filled
-	// circles, gates as small contrasting dots.
+	// 4. Walls: drawn as individual segments (skip suppressed = river/coast segments).
+	// Towers as small filled circles, gates as small contrasting dots.
+	const riverWidth = (cityData.water && cityData.water.riverWidth) || 0;
+	// Build a Set of river-node coordinate keys for endpoint pullback (walls extend toward
+	// the river but stop at the riverbank). Uses a string key because toData() produces
+	// fresh plain objects — reference equality wouldn't match.
+	const riverNodes = new Set();
+	if (cityData.water && cityData.water.riverPath) {
+		for (const v of cityData.water.riverPath) riverNodes.add(`${v.x},${v.y}`);
+	}
 	for (const wall of cityData.walls || []) {
 		if (!wall.shape || wall.shape.length < 3) continue;
 		const isCastle = !!wall.isCastle;
 		const strokeColor = isCastle ? palette.castleWall : palette.wall;
-		const strokeWidth = isCastle ? mainWidth * 0.9 : mainWidth * 0.6;
-		const outline = makePolygon(wall.shape, { fill: 'none', stroke: palette.wallOutline, strokeWidth: strokeWidth + 0.45 });
-		outline.setAttribute('stroke-linejoin', 'round');
-		layerWalls.appendChild(outline);
-		const el = makePolygon(wall.shape, { fill: 'none', stroke: strokeColor, strokeWidth });
-		el.setAttribute('stroke-linejoin', 'round');
-		layerWalls.appendChild(el);
+		const strokeWidth = isCastle ? mainWidth * 0.45 : mainWidth * 0.3;
+		const segPath = wallSegmentsPath(wall, riverWidth, riverNodes);
+		if (segPath) {
+			layerWalls.appendChild(makePath(segPath, { stroke: palette.wallOutline, strokeWidth: strokeWidth + 0.45 }));
+			layerWalls.appendChild(makePath(segPath, { stroke: strokeColor, strokeWidth }));
+		} else {
+			const outline = makePolygon(wall.shape, { fill: 'none', stroke: palette.wallOutline, strokeWidth: strokeWidth + 0.45 });
+			outline.setAttribute('stroke-linejoin', 'round');
+			layerWalls.appendChild(outline);
+			const el = makePolygon(wall.shape, { fill: 'none', stroke: strokeColor, strokeWidth });
+			el.setAttribute('stroke-linejoin', 'round');
+			layerWalls.appendChild(el);
+		}
 
-		const towerR = Math.max(mainWidth * 0.55, 0.6);
+		const towerR = Math.max(mainWidth * 1.5, 0.6);
 		for (const t of wall.towers || []) {
-			layerWalls.appendChild(makeCircle(t, towerR, { fill: palette.tower, stroke: palette.wallOutline, strokeWidth: 0.22 }));
+			const pos = adjustedTowerPos(wall, t, riverWidth, riverNodes, towerR);
+			layerWalls.appendChild(makeCircle(pos, towerR, { fill: palette.tower, stroke: palette.wallOutline, strokeWidth: 0.225}));
 		}
 
 		for (const g of wall.gates || []) {
+			// Skip gates at river nodes — those are bridges with towers, not gates.
+			if (riverNodes.has(`${g.x},${g.y}`)) continue;
 			layerWalls.appendChild(makeGateSquare(g, wall, strokeWidth, { fill: palette.gateDot, stroke: '#fff', strokeWidth: 0.2 }));
 		}
 	}
 
-	// 5. Debug markers (optional): city center + all gates.
+	// 5. Chamfer features: small green (tree) / blue (fountain) circles where a corner
+	// triangle was cut off a buildable area or building lot. Kept small so each fits its gap.
+	for (const f of cityData.features || []) {
+		if (!Number.isFinite(f.x) || !Number.isFinite(f.y)) continue;
+		layerMarkers.appendChild(makeCircle(f, 0.45, {
+			fill: f.kind === 'fountain' ? palette.featureFountain : palette.featureTree,
+			stroke: palette.featureOutline,
+			strokeWidth: 0.12,
+		}));
+	}
+
+	// 6. Debug markers (optional): city center + all gates.
 	if (showMarkers) {
 		if (cityData.center) {
 			const c = makeCircle(cityData.center, 1.5, {

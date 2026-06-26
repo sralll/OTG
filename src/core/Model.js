@@ -14,11 +14,12 @@ import { Random } from './Random.js';
 import { MathUtils } from './MathUtils.js';
 import { amin, remove } from './arrays.js';
 import { getCityBlock, cathedralRate, marketRate, buildWardGeometry, OPEN_TYPES } from './wards.js';
+import { clearFeatures, takeFeatures } from './features.js';
 
 const N = 2147483647;
 
 const DEFAULT_FEATURES = { walls: true, plaza: true, citadel: true, cathedral: true, extraSquares: 2 };
-const DEFAULT_WIDTHS = { main: 2.0, regular: 1.0, alley: 0.6 };
+const DEFAULT_WIDTHS = { main: 2.0, regular: 1.0, alley: 0.8 };
 // Water params are in multiples of the characteristic city radius (Rc). `sea:false` or
 // `river.enabled:false` disable those features. `sea.angle:null` -> random direction per seed.
 const DEFAULT_WATER = {
@@ -418,6 +419,10 @@ export class Model {
 		if (this.wallsNeeded) {
 			this.wall = this.border;
 			this.wall.buildTowers();
+			// Suppress wall segments that cross water (river edges, coast) and remove
+			// towers at those junctions — the wall should border the river, not plunge into it.
+			this.wall.suppressWaterSegments(this);
+			this.wall.buildTowers();
 		}
 
 		// (cells were already cropped to the seed disk in buildPatches, like the reference)
@@ -426,6 +431,7 @@ export class Model {
 		if (this.citadel != null) {
 			const reservedCastle = this.citadel.shape.filter((v) => this.patchByVertex(v).some((p) => !p.withinCity));
 			this.citadelWall = new CurtainWall(true, this, [this.citadel], reservedCastle);
+			this.citadelWall.suppressWaterSegments(this);
 			this.citadelWall.buildTowers();
 			this.citadel.type = 'castle';
 
@@ -564,6 +570,9 @@ export class Model {
 
 	// --- step 5: shrink each patch into a block, leaving room for roads ---
 	buildBlocks() {
+		// Chamfer "features" (trees/fountains in cut-off corner gaps) are collected from
+		// buildBlocks + buildGeometry; reset the shared sink before the run.
+		clearFeatures();
 		for (const patch of this.patches) {
 			if (OPEN_TYPES.has(patch.type)) {
 				patch.block = null;
@@ -590,6 +599,7 @@ export class Model {
 				/* skip */
 			}
 		}
+		this.features = takeFeatures();
 	}
 
 	toData() {
@@ -625,21 +635,17 @@ export class Model {
 			}
 		}
 
-		const walls = [];
-		if (this.wall != null)
-			walls.push({
-				shape: poly(this.wall.shape),
-				gates: this.wall.gates.map(pt),
-				towers: this.wall.towers.map(pt),
-				isCastle: false,
-			});
-		if (this.citadelWall != null)
-			walls.push({
-				shape: poly(this.citadelWall.shape),
-				gates: this.citadelWall.gates.map(pt),
-				towers: this.citadelWall.towers.map(pt),
-				isCastle: true,
-			});
+	const serializeWall = (w, isCastle) => ({
+		shape: poly(w.shape),
+		gates: w.gates.map(pt),
+		towers: w.towers.map(pt),
+		isCastle,
+		segments: w.segments ? w.segments.slice() : null,
+	});
+
+	const walls = [];
+	if (this.wall != null) walls.push(serializeWall(this.wall, false));
+	if (this.citadelWall != null) walls.push(serializeWall(this.citadelWall, true));
 
 		const water = this.water
 			? {
@@ -659,6 +665,7 @@ export class Model {
 			bounds: { minX, minY, maxX, maxY },
 			patches,
 			buildings: this.buildings.map(building),
+			features: (this.features || []).map((f) => ({ x: f.x, y: f.y, kind: f.kind })),
 			arteries: this.arteries.map(poly),
 			streets: this.streets.map(poly),
 			roads: this.roads.map(poly),

@@ -272,31 +272,29 @@ function buildDelta(course, shore, mouthIdx, width) {
 
 	const dx = next.x - mouth.x;
 	const dy = next.y - mouth.y;
-	const halfDir = { x: dx * 0.5, y: dy * 0.5 };
 
-	// midpoint of last course edge
-	const midPt = mid(mouth, next);
-
-	// perpendicular, normalised to half width
-	const len = Math.hypot(halfDir.x, halfDir.y) || 1;
+	// perpendicular at the MOUTH (not midpoint) — the delta's narrow base must connect
+	// to the river stroke's endpoint for a seamless join (no visible step).
+	const len = Math.hypot(dx, dy) || 1;
 	const hw = width / 2;
-	const nx = (-halfDir.y / len) * hw;
-	const ny = (halfDir.x / len) * hw;
+	const nx = (-dy / len) * hw;
+	const ny = (dx / len) * hw;
 
-	const right = { x: midPt.x + nx, y: midPt.y + ny };
-	const left = { x: midPt.x - nx, y: midPt.y - ny };
+	const right = { x: mouth.x + nx, y: mouth.y + ny };
+	const left = { x: mouth.x - nx, y: mouth.y - ny };
 
 	// adjacent shore points, lerped toward mouth (reference: qa.lerp(shore[h±1], mouth))
 	const sLen = shore.length;
 	const prevShore = mid(shore[(mouthIdx + sLen - 1) % sLen], mouth);
 	const nextShore = mid(shore[(mouthIdx + 1) % sLen], mouth);
 
-	// Bézier control points (reference: drawMouth)
-	const rightCtrl1 = { x: right.x - halfDir.x, y: right.y - halfDir.y };
+	// Bézier control points — handles extend back along the river direction so the delta's
+	// narrow end blends into the river stroke (reference: drawMouth).
+	const rightCtrl1 = { x: right.x - dx, y: right.y - dy };
 	const rightCtrl2 = mid(prevShore, mouth); // 3/4 toward mouth
 
 	const leftCtrl1 = mid(nextShore, mouth);
-	const leftCtrl2 = { x: left.x - halfDir.x, y: left.y - halfDir.y };
+	const leftCtrl2 = { x: left.x - dx, y: left.y - dy };
 
 	// convexity at mouth (reference: kf.isConvexVertexi)
 	const v0 = shore[(mouthIdx + sLen - 1) % sLen];

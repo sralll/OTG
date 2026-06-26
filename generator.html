@@ -21,13 +21,13 @@
 <div id="bar">
 	<label>seed <input id="seed" type="number" min="1" step="1" value="42" /></label>
 	<button id="rnd" class="sec">random</button>
-	<label>size <input id="size" type="range" min="6" max="40" step="1" value="15" /><span id="sizeval">15</span></label>
+	<label>size <input id="size" type="range" min="6" max="40" step="1" value="30" /><span id="sizeval">30</span></label>
 	<label><input id="plaza" type="checkbox" checked /> plaza</label>
 	<label><input id="coast" type="checkbox" checked /> coast</label>
 	<label><input id="river" type="checkbox" checked /> river</label>
 	<label><input id="walls" type="checkbox" checked /> walls</label>
 	<label><input id="streets" type="checkbox" checked /> streets</label>
-	<label>outer ratio <input id="outerratio" type="range" min="4" max="8" step="0.5" value="8" /><span id="outerratioval">4x</span></label>
+	<label>outer ratio <input id="outerratio" type="range" min="3" max="8" step="0.5" value="4" /><span id="outerratioval">4x</span></label>
 	<label>road density <input id="roaddens" type="range" min="0" max="5" step="0.25" value="5" /><span id="roaddensval">5</span></label>
 	<label>gates <input id="gates" type="number" min="-1" max="16" step="1" value="-1" /></label>
 	<label><input id="seeds" type="checkbox" /> seeds</label>
@@ -38,7 +38,7 @@
 <svg id="map" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
 
 <script type="module">
-import { generateWards } from './src/core/CityGen.js';
+import { generateWards } from './src/core/CityGen.js?v=19';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const svg = document.getElementById('map');
@@ -54,9 +54,12 @@ const PALETTE = {
 	wall: '#888888', wallOutline: '#000000', gate: '#efe9d8',
 	bridgeDock: '#c8a46a', bridgeDockOutline: '#000000',
 	seed: '#c0392b',
-	block: '#d6d6d6',
+	block: '#888888',
 	building: '#888888', buildingStroke: '#000000',
 	garden: '#b9f05a', gardenStroke: '#000000',
+	alley: '#a99d77',
+	// Orienteering landmarks dropped into chamfered corner gaps.
+	featureTree: '#2f8f3e', featureFountain: '#2b7fc4', featureOutline: '#1c1c1c',
 };
 const RIVER_BANK_SCALE = 1.3;
 
@@ -120,30 +123,70 @@ function deltaPath(dl) {
 	return d + ' Z';
 }
 
-function drawWall(wall) {
+function drawWall(wall, riverWidth, riverNodes) {
 	if (!wall || !wall.shape || wall.shape.length < 2) return;
-	const thickness = 3.2;
-	for (let i = 0; i < wall.shape.length; i++) {
-		if (wall.segments && wall.segments[i] === false) continue;
-		const a = wall.shape[i];
-		const b = wall.shape[(i + 1) % wall.shape.length];
+	const thickness = 1.6;
+	const n = wall.shape.length;
+	const segs = wall.segments;
+	const halfRiver = (riverWidth || 0) / 2;
+	for (let i = 0; i < n; i++) {
+		if (segs && segs[i] === false) continue;
+		let a = wall.shape[i];
+		let b = wall.shape[(i + 1) % n];
+		// Pull back an endpoint if the adjacent segment is suppressed OR the endpoint is a
+		// river node — the wall extends toward the water but stops at the riverbank.
+		if (halfRiver > 0 && segs) {
+			const dx = b.x - a.x, dy = b.y - a.y;
+			const len = Math.hypot(dx, dy) || 1;
+			const ux = dx / len, uy = dy / len;
+			let ax = a.x, ay = a.y, bx = b.x, by = b.y;
+			if (segs[(i + n - 1) % n] === false || (riverNodes && riverNodes.has(a))) { ax = a.x + ux * halfRiver; ay = a.y + uy * halfRiver; }
+			if (segs[(i + 1) % n] === false || (riverNodes && riverNodes.has(b))) { bx = b.x - ux * halfRiver; by = b.y - uy * halfRiver; }
+			a = { x: ax, y: ay }; b = { x: bx, y: by };
+		}
 		for (const [stroke, width] of [[PALETTE.wallOutline, thickness + 0.8], [PALETTE.wall, thickness]]) {
 			const seg = document.createElementNS(SVGNS, 'line');
 			seg.setAttribute('x1', a.x); seg.setAttribute('y1', a.y);
 			seg.setAttribute('x2', b.x); seg.setAttribute('y2', b.y);
 			seg.setAttribute('stroke', stroke); seg.setAttribute('stroke-width', width);
-			seg.setAttribute('stroke-linecap', 'round'); seg.setAttribute('stroke-linejoin', 'round');
+			seg.setAttribute('stroke-linecap', 'butt'); seg.setAttribute('stroke-linejoin', 'round');
 			vp.appendChild(seg);
 		}
 	}
+	// Offset towers at water/river endpoints to where the wall actually ends (pulled back
+	// from the water), so they sit on land, not in the river/shore.
+	const towerR = thickness * 1.5;
 	for (const t of wall.towers || []) {
+		let pos = t;
+		if (segs) {
+			const ti = wall.shape.findIndex((p) => Math.abs(p.x - t.x) < 1e-6 && Math.abs(p.y - t.y) < 1e-6);
+			if (ti !== -1) {
+				const prevA = segs[(ti + n - 1) % n] !== false;
+				const nextA = segs[ti] !== false;
+				const isRiv = riverNodes && riverNodes.has(t);
+				if (!prevA || !nextA || isRiv) {
+					let dx = 0, dy = 0;
+					if (nextA && !prevA) { dx = wall.shape[(ti+1)%n].x - t.x; dy = wall.shape[(ti+1)%n].y - t.y; }
+					else if (prevA && !nextA) { dx = wall.shape[(ti+n-1)%n].x - t.x; dy = wall.shape[(ti+n-1)%n].y - t.y; }
+					else if (isRiv) {
+						const p = wall.shape[(ti+n-1)%n], q = wall.shape[(ti+1)%n];
+						if (Math.hypot(q.x-t.x, q.y-t.y) >= Math.hypot(p.x-t.x, p.y-t.y)) { dx = q.x-t.x; dy = q.y-t.y; }
+						else { dx = p.x-t.x; dy = p.y-t.y; }
+					}
+					const l = Math.hypot(dx, dy) || 1;
+					pos = { x: t.x + dx/l * (halfRiver + towerR), y: t.y + dy/l * (halfRiver + towerR) };
+				}
+			}
+		}
 		const tower = document.createElementNS(SVGNS, 'circle');
-		tower.setAttribute('cx', t.x); tower.setAttribute('cy', t.y);
-		tower.setAttribute('r', thickness * 1.15); tower.setAttribute('fill', PALETTE.wall);
-		tower.setAttribute('stroke', PALETTE.wallOutline); tower.setAttribute('stroke-width', '0.7');
+		tower.setAttribute('cx', pos.x); tower.setAttribute('cy', pos.y);
+		tower.setAttribute('r', towerR); tower.setAttribute('fill', PALETTE.wall);
+		tower.setAttribute('stroke', PALETTE.wallOutline); tower.setAttribute('stroke-width', '0.8');
 		vp.appendChild(tower);
 	}
 	for (const gate of wall.gates || []) {
+		// Skip gates at river nodes — those are bridges with towers, not gates.
+		if (riverNodes && riverNodes.has(gate)) continue;
 		const idx = wall.shape.findIndex((p) => Math.abs(p.x - gate.x) < 1e-6 && Math.abs(p.y - gate.y) < 1e-6);
 		if (idx === -1) continue;
 		const prev = wall.shape[(idx + wall.shape.length - 1) % wall.shape.length];
@@ -177,7 +220,7 @@ function drawBridges(river) {
 	const endpointAlongEdge = (bridge, edgePoint) => {
 		const dx = edgePoint.x - bridge.x, dy = edgePoint.y - bridge.y;
 		const len = Math.hypot(dx, dy) || 1;
-		const distance = Math.min(len * 0.85, Math.max(riverWidth * 0.95, 4.5));
+		const distance = Math.min(len * 0.85, riverWidth * 0.6);
 		return { x: bridge.x + dx / len * distance, y: bridge.y + dy / len * distance };
 	};
 	for (const bridge of river.bridges) {
@@ -193,15 +236,15 @@ function drawBridges(river) {
 			const prev = river.course[i - 1], next = river.course[i + 1];
 			const dx = next.x - prev.x, dy = next.y - prev.y;
 			const len = Math.hypot(dx, dy) || 1;
-			const nx = -dy / len * riverWidth * 0.8;
-			const ny = dx / len * riverWidth * 0.8;
+			const nx = -dy / len * riverWidth * 0.6;
+			const ny = dx / len * riverWidth * 0.6;
 			d = `M${bridge.x - nx},${bridge.y - ny} L${bridge.x + nx},${bridge.y + ny}`;
 		}
-		for (const [stroke, width] of [[PALETTE.bridgeDockOutline, 3.2], [PALETTE.bridgeDock, 1.6]]) {
+		for (const [stroke, width] of [[PALETTE.bridgeDockOutline, 1.6], [PALETTE.bridgeDock, 0.8]]) {
 			const path = document.createElementNS(SVGNS, 'path');
 			path.setAttribute('d', d); path.setAttribute('fill', 'none');
 			path.setAttribute('stroke', stroke); path.setAttribute('stroke-width', width);
-			path.setAttribute('stroke-linecap', 'round'); path.setAttribute('stroke-linejoin', 'round');
+			path.setAttribute('stroke-linecap', 'butt'); path.setAttribute('stroke-linejoin', 'round');
 			vp.appendChild(path);
 		}
 	}
@@ -218,7 +261,7 @@ function drawDocks(docks) {
 				const path = document.createElementNS(SVGNS, 'path');
 				path.setAttribute('d', d); path.setAttribute('fill', 'none');
 				path.setAttribute('stroke', stroke); path.setAttribute('stroke-width', width);
-				path.setAttribute('stroke-linecap', 'round'); path.setAttribute('stroke-linejoin', 'round');
+				path.setAttribute('stroke-linecap', 'butt'); path.setAttribute('stroke-linejoin', 'round');
 				vp.appendChild(path);
 			}
 		}
@@ -235,8 +278,10 @@ function drawBlocks(blocks) {
 	if (!d) return;
 	const el = document.createElementNS(SVGNS, 'path');
 	el.setAttribute('d', d);
-	el.setAttribute('fill', PALETTE.block);
-	el.setAttribute('stroke', 'none');
+	el.setAttribute('fill', 'none');
+	el.setAttribute('stroke', PALETTE.block);
+	el.setAttribute('stroke-width', '0.12');
+	el.setAttribute('stroke-linejoin', 'round');
 	el.setAttribute('fill-rule', 'evenodd');
 	vp.appendChild(el);
 }
@@ -252,6 +297,38 @@ function drawBuildings(buildings) {
 		el.setAttribute('fill', isGarden ? PALETTE.garden : PALETTE.building);
 		el.setAttribute('stroke', isGarden ? PALETTE.gardenStroke : PALETTE.buildingStroke);
 		el.setAttribute('stroke-width', '0.18');
+		el.setAttribute('stroke-linejoin', 'round');
+		vp.appendChild(el);
+	}
+}
+
+// Small green (tree) / blue (fountain) circles marking where a chamfer cut a corner
+// triangle off a buildable area or building lot. Radius is kept small so each fits inside
+// its gap; drawn on top so they stay visible over buildings.
+function drawFeatures(features) {
+	if (!features || features.length === 0) return;
+	const r = 0.45;
+	for (const f of features) {
+		if (!Number.isFinite(f.x) || !Number.isFinite(f.y)) continue;
+		const c = document.createElementNS(SVGNS, 'circle');
+		c.setAttribute('cx', f.x); c.setAttribute('cy', f.y); c.setAttribute('r', r);
+		c.setAttribute('fill', f.kind === 'fountain' ? PALETTE.featureFountain : PALETTE.featureTree);
+		c.setAttribute('stroke', PALETTE.featureOutline);
+		c.setAttribute('stroke-width', '0.12');
+		vp.appendChild(c);
+	}
+}
+
+function drawAlleys(alleys) {
+	if (!alleys || alleys.length === 0) return;
+	for (const alley of alleys) {
+		if (!alley || alley.length < 2) continue;
+		const el = document.createElementNS(SVGNS, 'polyline');
+		el.setAttribute('points', alley.map((p) => p.x + ',' + p.y).join(' '));
+		el.setAttribute('fill', 'none');
+		el.setAttribute('stroke', PALETTE.alley);
+		el.setAttribute('stroke-width', '0.8');
+		el.setAttribute('stroke-linecap', 'round');
 		el.setAttribute('stroke-linejoin', 'round');
 		vp.appendChild(el);
 	}
@@ -289,7 +366,10 @@ function render(d) {
 		};
 
 		if (d.river.delta) {
-			const dl = previewDeltaFromPath(d.river.delta, visualCourse, d.river.width + Math.max(0.8, d.river.width * 0.04));
+			// Delta base width must match the river stroke EXACTLY so there's no visible step
+			// between the fan mouth and the river. Add a tiny +0.2 overlap so the delta fill
+			// slides under the stroke (prevents anti-aliasing hairline).
+			const dl = previewDeltaFromPath(d.river.delta, visualCourse, d.river.width + 0.2);
 			const fill = document.createElementNS(SVGNS, 'path');
 			fill.setAttribute('d', deltaPath(dl)); fill.setAttribute('fill', PALETTE.river); fill.setAttribute('stroke', 'none');
 			vp.appendChild(fill);
@@ -300,7 +380,11 @@ function render(d) {
 		drawBridges(d.river);
 	}
 	drawDocks(d.docks);
-	drawWall(d.wall);
+	// Build a Set of river-node coordinates for wall endpoint pullback.
+	const riverNodeSet = new Set();
+	if (d.river && d.river.course) for (const v of d.river.course) riverNodeSet.add(v);
+	drawWall(d.wall, d.river && d.river.width, riverNodeSet);
+	drawFeatures(d.features);
 	if ($('seeds').checked) {
 		// approximate seed markers at ward centroids (the real seeds aren't kept in output)
 		for (const w of d.wards) {

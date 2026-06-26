@@ -10,6 +10,8 @@ import { GeomUtils } from './GeomUtils.js';
 import { Random } from './Random.js';
 import { Cutter } from './Cutter.js';
 import { amin } from './arrays.js';
+import { sliceWardEdgeElbows } from './AlleySlicer.js';
+import { recordRemovedTriangle } from './features.js';
 
 // Open patch types are kept as open space (no shrunken block). 'water' included so water
 // cells are never shrunk into blocks.
@@ -29,14 +31,38 @@ function isShoreEdge(model, v0, v1) {
 	return edgePatches.some((p) => p.isWater) && edgePatches.some((p) => !p.isWater);
 }
 
+function isShoreVertex(model, v) {
+	if (!model.patchByVertex) return false;
+	const patches = model.patchByVertex(v);
+	return patches.some((p) => p.isWater) && patches.some((p) => !p.isWater);
+}
+
+// A ward corner that lands on the wall ring, where the wall is actually built (at least
+// one adjacent segment active — same condition as tower placement in rebuildTowers). Plain
+// wall vertices need a corner chamfer too, not just the edge-level wall clipping; otherwise a
+// sharp ward tip pokes through the wall cap where no single ward edge runs along the wall.
+function isBuiltWallVertex(wall, v) {
+	if (!wall || !wall.shape) return false;
+	const i = wall.shape.indexOf(v);
+	if (i === -1) return false;
+	const len = wall.shape.length;
+	if (!wall.segments) return true;
+	return wall.segments[i] || wall.segments[(i + len - 1) % len];
+}
+
 function nodeClearance(model, v, widths) {
+	const clearances = obstacleClearances(model, widths);
 	let clearance = 0;
 	if (model.water && model.water.riverPath && model.water.riverPath.includes(v))
-		clearance = Math.max(clearance, (model.riverWidth || 0) / 2 + widths.main * 0.6);
+		clearance = Math.max(clearance, clearances.river);
+	if (isShoreVertex(model, v))
+		clearance = Math.max(clearance, clearances.shore);
 	if (model.wall && model.wall.towers && model.wall.towers.includes(v))
-		clearance = Math.max(clearance, widths.main * 1.1);
+		clearance = Math.max(clearance, clearances.tower);
 	if (model.citadelWall && model.citadelWall.towers && model.citadelWall.towers.includes(v))
-		clearance = Math.max(clearance, widths.main * 1.1);
+		clearance = Math.max(clearance, clearances.tower);
+	if (isBuiltWallVertex(model.wall, v) || isBuiltWallVertex(model.citadelWall, v))
+		clearance = Math.max(clearance, clearances.wall);
 	return clearance;
 }
 
@@ -45,13 +71,26 @@ function clippedCorner(poly, sourceShape, corner, clearance) {
 
 	const idx = sourceShape.indexOf(corner);
 	if (idx === -1) return poly;
+	const dir = sourceShape.centroid.subtract(corner);
+	if (dir.length > 1e-6) {
+		dir.normalize(1);
+		const n = new Point(-dir.y, dir.x);
+		const cutCenter = corner.add(dir.scale(clearance));
+		const capped = clipToOffsetSide(poly, cutCenter.subtract(n), cutCenter.add(n), -1, 0);
+		if (capped && capped.length >= 3 && Math.abs(capped.square) >= Math.abs(poly.square) * 0.01)
+			return capped;
+	}
+
 	const prev = sourceShape[(idx + sourceShape.length - 1) % sourceShape.length];
 	const next = sourceShape[(idx + 1) % sourceShape.length];
 	const prevLen = Point.distance(corner, prev);
 	const nextLen = Point.distance(corner, next);
 	if (prevLen < 1e-6 || nextLen < 1e-6) return poly;
 
-	const reach = Math.min(clearance, prevLen * 0.45, nextLen * 0.45);
+	// Point obstacles (river nodes, shore corners, towers) need more than a token
+	// chamfer, because the rendered river/wall cap can occupy the corner even when no
+	// whole ward edge faces it.
+	const reach = Math.min(clearance, prevLen * 0.65, nextLen * 0.65);
 	if (!(reach > 1e-6)) return poly;
 
 	const a = corner.add(prev.subtract(corner).norm(reach));
@@ -61,9 +100,9 @@ function clippedCorner(poly, sourceShape, corner, clearance) {
 
 	let best = poly;
 	let bestDistance = -Infinity;
-	const minKeptArea = Math.abs(poly.square) * 0.55;
+	const minKeptArea = Math.abs(poly.square) * 0.35;
 	for (const half of halves) {
-		if (!half || half.length < 3 || Math.abs(half.square) < Math.max(1, minKeptArea)) continue;
+		if (!half || half.length < 3 || Math.abs(half.square) < minKeptArea) continue;
 		const d = Point.distance(half.center, corner);
 		if (d > bestDistance) {
 			best = half;
@@ -78,42 +117,324 @@ function clipObstacleCorners(poly, sourceShape, model, widths) {
 	for (const v of sourceShape) {
 		const clearance = nodeClearance(model, v, widths);
 		if (clearance > 0) clipped = clippedCorner(clipped, sourceShape, v, clearance);
-		if (!clipped || clipped.length < 3) return null;
+		if (!clipped || clipped.length < 3) return poly; // fall back to the un-clipped block
+	}
+	return clipped || poly;
+}
+
+function passageMargin(widths) {
+	return Math.max(widths.regular || 0, (widths.main || 0) * 0.6, 0.8);
+}
+
+function obstacleClearances(model, widths) {
+	const passage = passageMargin(widths);
+	return {
+		river: (model.riverWidth || 0) * 0.59 + passage,
+		// Shore is one-sided: roads get their width from two blocks each inset by
+		// regular/2, so the coast needs one full regular width for the same path.
+		shore: Math.max(widths.regular || 0, 0.6),
+		wall: Math.max((widths.main || 0) * 0.45, 0.6) + passage,
+		tower: Math.max((widths.main || 0) * 0.4, 0.4) + passage,
+	};
+}
+
+function lineSignedDistance(a, b, p) {
+	const dx = b.x - a.x;
+	const dy = b.y - a.y;
+	const len = Math.hypot(dx, dy);
+	if (!(len > 1e-6)) return 0;
+	return ((dx * (p.y - a.y)) - (dy * (p.x - a.x))) / len;
+}
+
+function sideForShape(shape, a, b) {
+	let side = lineSignedDistance(a, b, shape.centroid);
+	if (Math.abs(side) < 1e-6) {
+		for (const v of shape) {
+			const d = lineSignedDistance(a, b, v);
+			if (Math.abs(d) > Math.abs(side)) side = d;
+		}
+	}
+	return side >= 0 ? 1 : -1;
+}
+
+function clipToOffsetSide(poly, a, b, side, clearance) {
+	if (!poly || poly.length < 3 || clearance == null || clearance < 0) return poly;
+	if (Point.distance(a, b) < 1e-6) return poly;
+
+	const out = [];
+	let prev = poly[poly.length - 1];
+	let prevD = side * lineSignedDistance(a, b, prev);
+	let prevInside = prevD >= clearance - 1e-6;
+
+	for (const cur of poly) {
+		const curD = side * lineSignedDistance(a, b, cur);
+		const curInside = curD >= clearance - 1e-6;
+		if (curInside !== prevInside) {
+			const denom = curD - prevD;
+			if (Math.abs(denom) > 1e-9) {
+				const t = (clearance - prevD) / denom;
+				out.push(new Point(prev.x + (cur.x - prev.x) * t, prev.y + (cur.y - prev.y) * t));
+			}
+		}
+		if (curInside) out.push(cur);
+		prev = cur;
+		prevD = curD;
+		prevInside = curInside;
+	}
+
+	const clipped = new Polygon(out);
+	return clipped.length >= 3 && Math.abs(clipped.square) > 1e-6 ? clipped : null;
+}
+
+function cutAwayFromSegment(poly, sourceShape, a, b, clearance) {
+	const clipped = clipToOffsetSide(poly, a, b, sideForShape(sourceShape, a, b), clearance);
+	if (!clipped || clipped.length < 3) return poly;
+	if (Math.abs(clipped.square) < Math.abs(poly.square) * 0.01) return poly;
+	return clipped;
+}
+
+function cutAwayFromPoint(poly, sourceShape, point, clearance) {
+	const dir = sourceShape.centroid.subtract(point);
+	if (!poly || poly.length < 3 || !(clearance > 0) || dir.length < 1e-6) return poly;
+	dir.normalize(1);
+	const n = new Point(-dir.y, dir.x);
+	const cutCenter = point.add(dir.scale(clearance));
+	const clipped = clipToOffsetSide(poly, cutCenter.subtract(n), cutCenter.add(n), -1, 0);
+	if (!clipped || clipped.length < 3) return poly;
+	if (Math.abs(clipped.square) < Math.abs(poly.square) * 0.01) return poly;
+	return clipped;
+}
+
+function norm(x, y) {
+	const l = Math.hypot(x, y) || 1;
+	return { x: x / l, y: y / l };
+}
+
+function cubicPoint(a, c1, c2, b, t) {
+	const mt = 1 - t;
+	const mt2 = mt * mt;
+	const t2 = t * t;
+	return new Point(
+		a.x * mt2 * mt + 3 * c1.x * mt2 * t + 3 * c2.x * mt * t2 + b.x * t2 * t,
+		a.y * mt2 * mt + 3 * c1.y * mt2 * t + 3 * c2.y * mt * t2 + b.y * t2 * t
+	);
+}
+
+function smoothPathSegments(pts, samplesPerSegment = 16) {
+	if (!pts || pts.length < 2) return [];
+	if (pts.length === 2) return [{ from: pts[0], to: pts[1], samples: [pts[0], pts[1]] }];
+
+	const extrap = (a, b, c) => {
+		const ax = b.x - a.x;
+		const ay = b.y - a.y;
+		const bx = c.x - b.x;
+		const by = c.y - b.y;
+		const d = Math.hypot(ax, ay) * Math.hypot(bx, by) || 1;
+		const sin = (ax * by - ay * bx) / d;
+		const cos = (ax * bx + ay * by) / d;
+		return new Point(c.x + (bx * cos - by * sin), c.y + (by * cos + bx * sin));
+	};
+
+	const a = [extrap(pts[2], pts[1], pts[0]), ...pts, extrap(pts[pts.length - 3], pts[pts.length - 2], pts[pts.length - 1])];
+	const segments = [];
+	for (let k = 1; k < a.length - 2; k++) {
+		const g = a[k];
+		const m = a[k + 1];
+		const p = a[k + 2];
+		const inD = norm(g.x - a[k - 1].x, g.y - a[k - 1].y);
+		const segD = norm(m.x - g.x, m.y - g.y);
+		const outD = norm(p.x - m.x, p.y - m.y);
+		const tN = norm(inD.x + segD.x, inD.y + segD.y);
+		const tP = norm(segD.x + outD.x, segD.y + outD.y);
+		const len = Point.distance(g, m);
+		let w = 1 / (1 + (tN.x * segD.x + tN.y * segD.y) + (tP.x * segD.x + tP.y * segD.y));
+		if (!isFinite(w) || w < 0) w = 1 / 3;
+		const q = len * Math.min(w, 1);
+		const c1 = new Point(g.x + tN.x * q, g.y + tN.y * q);
+		const c2 = new Point(m.x - tP.x * q, m.y - tP.y * q);
+		const samples = [];
+		for (let i = 0; i <= samplesPerSegment; i++) samples.push(cubicPoint(g, c1, c2, m, i / samplesPerSegment));
+		segments.push({ from: g, to: m, samples });
+	}
+	return segments;
+}
+
+function pointInPolygon(point, poly) {
+	let inside = false;
+	for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+		const a = poly[i];
+		const b = poly[j];
+		const crosses = (a.y > point.y) !== (b.y > point.y);
+		if (crosses) {
+			const x = ((b.x - a.x) * (point.y - a.y)) / ((b.y - a.y) || 1e-12) + a.x;
+			if (point.x < x) inside = !inside;
+		}
+	}
+	return inside;
+}
+
+function pointPolygonDistance(point, poly) {
+	let best = Infinity;
+	poly.forEdge((a, b) => {
+		best = Math.min(best, pointSegmentDistance(point, a, b));
+	});
+	return best;
+}
+
+function pathSamplesTouchShape(samples, shape, clearance) {
+	for (const p of samples)
+		if (pointInPolygon(p, shape) || pointPolygonDistance(p, shape) <= clearance)
+			return true;
+	return false;
+}
+
+function clipFromPathObstacle(poly, sourceShape, path, clearance) {
+	let clipped = poly;
+	let touched = false;
+	const sampledPath = [];
+	for (const seg of smoothPathSegments(path)) {
+		if (!pathSamplesTouchShape(seg.samples, sourceShape, clearance)) continue;
+		touched = true;
+		if (sampledPath.length === 0) sampledPath.push(seg.samples[0]);
+		for (let i = 1; i < seg.samples.length; i++) sampledPath.push(seg.samples[i]);
+		for (const p of seg.samples) clipped = cutAwayFromPoint(clipped, sourceShape, p, clearance);
+		for (let i = 0; i < seg.samples.length - 1; i++)
+			clipped = cutAwayFromSegment(clipped, sourceShape, seg.samples[i], seg.samples[i + 1], clearance);
+	}
+	if (touched && minDistanceToPolyline(clipped, sampledPath) < clearance * 0.9) return null;
+	return clipped;
+}
+
+function pointSegmentDistance(p, a, b) {
+	const dx = b.x - a.x;
+	const dy = b.y - a.y;
+	const l2 = dx * dx + dy * dy || 1;
+	let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2;
+	t = Math.max(0, Math.min(1, t));
+	return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t));
+}
+
+function minDistanceToPolyline(poly, path) {
+	if (!poly || poly.length < 3 || !path || path.length < 2) return Infinity;
+	let best = Infinity;
+	for (const v of poly)
+		for (let i = 0; i < path.length - 1; i++)
+			best = Math.min(best, pointSegmentDistance(v, path[i], path[i + 1]));
+	return best;
+}
+
+function activeWallEdges(wall) {
+	const out = [];
+	if (!wall || !wall.shape) return out;
+	for (let i = 0; i < wall.shape.length; i++) {
+		if (wall.segments && wall.segments[i] === false) continue;
+		out.push([wall.shape[i], wall.shape[(i + 1) % wall.shape.length]]);
+	}
+	return out;
+}
+
+function clipFromWallObstacle(poly, sourceShape, patch, wall, clearance) {
+	if (!wall || !wall.shape) return poly;
+	let clipped = poly;
+	for (const [a, b] of activeWallEdges(wall)) {
+		const bordersPatch =
+			patch != null && typeof wall.bordersBy === 'function'
+				? wall.bordersBy(patch, a, b) || wall.bordersBy(patch, b, a)
+				: sourceShape.findEdge(a, b) !== -1 || sourceShape.findEdge(b, a) !== -1;
+		if (bordersPatch) clipped = cutAwayFromSegment(clipped, sourceShape, a, b, clearance);
 	}
 	return clipped;
 }
 
-// Port of Ward.getCityBlock (Ward.hx). `widths` = { main, regular, alley } (= MAIN/REGULAR/ALLEY).
-// Edges on a main artery (or against a wall) inset by main/2; otherwise regular/2 (inner) or
-// alley/2 (outskirts). The gap between two neighbouring blocks becomes the road width.
-// Inset an arbitrary polygon edge-by-edge for street widths (used for single wards AND merged
-// districts). Edges on a river/artery/wall inset more (main road); otherwise regular/alley.
-export function insetShape(model, shape, widths, withinWalls, patch = null) {
-	const { main, regular, alley } = widths;
-	const insetDist = [];
-	const innerPatch = model.wall == null || withinWalls;
-
-	shape.forEdge((v0, v1) => {
-		let inset = (innerPatch ? regular : alley) / 2;
-		// Keep blocks clear of the river (so the city visibly grows around it).
-		if (hasRiverEdge(model, v0, v1)) inset = Math.max(inset, (model.riverWidth + main) / 2);
-		if (isShoreEdge(model, v0, v1)) inset = Math.max(inset, (Math.max(model.riverWidth || 0, main) + regular) / 2);
-		if (patch != null && model.wall != null && model.wall.bordersBy(patch, v0, v1)) {
-			inset = Math.max(inset, main / 2); // not too close to the wall
-		}
-		let onStreet = innerPatch && model.plaza != null && model.plaza.shape.findEdge(v1, v0) !== -1;
-		if (!onStreet)
-			for (const street of model.arteries)
-				if (street.contains(v0) && street.contains(v1)) {
-					onStreet = true;
-					break;
-				}
-		if (onStreet) inset = Math.max(inset, main / 2);
-		insetDist.push(inset);
+function clipFromShoreObstacle(poly, sourceShape, model, clearance) {
+	if (!model || typeof model.patchByVertex !== 'function') return poly;
+	let clipped = poly;
+	sourceShape.forEdge((v0, v1) => {
+		if (isShoreEdge(model, v0, v1)) clipped = cutAwayFromSegment(clipped, sourceShape, v0, v1, clearance);
 	});
+	return clipped;
+}
+
+function clipObstacleEdges(poly, sourceShape, model, widths, patch) {
+	const clearance = obstacleClearances(model, widths);
+	let clipped = poly;
+	if (model.water && model.water.riverPath)
+		clipped = clipFromPathObstacle(clipped, sourceShape, model.water.riverPath, clearance.river);
+	if (!clipped || clipped.length < 3) return null;
+	clipped = clipFromShoreObstacle(clipped, sourceShape, model, clearance.shore);
+	clipped = clipFromWallObstacle(clipped, sourceShape, patch, model.wall, clearance.wall);
+	clipped = clipFromWallObstacle(clipped, sourceShape, patch, model.citadelWall, clearance.wall);
+	return clipped;
+}
+
+function triangleHeight(a, b, c) {
+	const base = Point.distance(a, c);
+	if (base < 1e-6) return 0;
+	return Math.abs((c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x)) / base;
+}
+
+function cornerCos(a, b, c) {
+	const ux = a.x - b.x;
+	const uy = a.y - b.y;
+	const vx = c.x - b.x;
+	const vy = c.y - b.y;
+	const ul = Math.hypot(ux, uy);
+	const vl = Math.hypot(vx, vy);
+	if (ul < 1e-6 || vl < 1e-6) return -1;
+	return (ux * vx + uy * vy) / (ul * vl);
+}
+
+function cleanupBuildablePolygon(poly, widths) {
+	if (!poly || poly.length < 3) return null;
+	let cleaned = new Polygon(poly);
+	const minEdge = Math.max((widths.alley || 0) * 0.6, 0.35);
+	const maxTipHeight = Math.max((widths.regular || 0) * 0.45, 0.35);
+	const acuteCos = Math.cos(Math.PI / 9); // 20 degrees
+
+	for (let pass = 0; pass < 8 && cleaned.length > 3; pass++) {
+		let removed = false;
+		for (let i = 0; i < cleaned.length; i++) {
+			const a = cleaned[(i + cleaned.length - 1) % cleaned.length];
+			const b = cleaned[i];
+			const c = cleaned[(i + 1) % cleaned.length];
+			const prevLen = Point.distance(a, b);
+			const nextLen = Point.distance(b, c);
+			const height = triangleHeight(a, b, c);
+			const sharp = cornerCos(a, b, c) > acuteCos;
+			if ((sharp && height < maxTipHeight * 2.5) || Math.min(prevLen, nextLen) < minEdge || height < maxTipHeight) {
+				cleaned.splice(i, 1);
+				removed = true;
+				break;
+			}
+		}
+		if (!removed) break;
+	}
+
+	const area = Math.abs(cleaned.square);
+	const minArea = Math.max(1, (widths.regular || 1) * (widths.regular || 1) * 2);
+	if (cleaned.length < 3 || area < minArea) return null;
+	if (cleaned.length === 3) {
+		let minHeight = Infinity;
+		for (let i = 0; i < 3; i++)
+			minHeight = Math.min(minHeight, triangleHeight(cleaned[(i + 2) % 3], cleaned[i], cleaned[(i + 1) % 3]));
+		if (minHeight < maxTipHeight || cleaned.compactness < 0.08) return null;
+	}
+	return cleaned;
+}
+
+// Port of Ward.getCityBlock (Ward.hx), adapted for obstacle-aware buildable areas.
+// Every ward edge gets one fixed inset; rivers, shores, walls, towers, and occupied obstacle
+// nodes then cut into that base block with their own clearance.
+export function insetShape(model, shape, widths, withinWalls, patch = null) {
+	const { regular, alley } = widths;
+	const innerPatch = model.wall == null || withinWalls;
+	const fixedInset = (innerPatch ? regular : alley) / 2;
+	const insetDist = shape.map(() => fixedInset);
 
 	const base = shape.isConvex() ? shape.shrink(insetDist) : shape.buffer(insetDist);
-	return clipObstacleCorners(base, shape, model, widths);
+	const edgeClipped = clipObstacleEdges(base, shape, model, widths, patch);
+	if (!edgeClipped || edgeClipped.length < 3) return null;
+	return cleanupBuildablePolygon(clipObstacleCorners(edgeClipped, shape, model, widths), widths);
 }
 
 // Port of Ward.getCityBlock (Ward.hx): inset a single ward's shape.
@@ -273,6 +594,7 @@ function indentFronts(lots, block) {
 	if (!block || block.length < 3) return lots;
 	const blockCenter = block.centroid;
 	return lots.map((lot) => {
+		if (Random.float() >= 0.1) return lot;
 		const area = Math.abs(lot.square);
 		let inset = Math.min(Math.sqrt(area) / 3, 1.2) * Random.float();
 		if (inset < 0.5) return lot;
@@ -326,7 +648,10 @@ function classifyGardenLots(lots) {
 }
 
 function commonWardParams(model, patch) {
-	return [28, 0.58, 0.45, patch.type === 'gate' ? 0.03 : 0.04];
+	// [minSq, gridChaos, sizeChaos, emptyProb, blockSize]
+	// minSq: minimum lot area. blockSize: bisector recursion threshold (minArea = minSq*blockSize).
+	// gridChaos: area-balance tolerance (variance = 16*gridChaos). sizeChaos: lot size jitter.
+	return [80, 0.5, 0.45, 0, 16];
 }
 
 function modelIsEnclosed(model, patch) {
@@ -378,7 +703,7 @@ function filterOutskirts(model, patch, geometry) {
 		return touched.length > 0 && touched.every((p) => p.withinCity) ? 2 * Random.float() : 0;
 	});
 
-	return geometry.filter((building) => {
+		return geometry.filter((building) => {
 		let minDist = 1.0;
 		for (const edge of populatedEdges) {
 			for (const v of building) {
@@ -394,16 +719,105 @@ function filterOutskirts(model, patch, geometry) {
 		if (p <= 1e-6) return false;
 		minDist /= p;
 
-		return Random.fuzzy(1) > minDist;
+		// Relaxed: keep buildings unless they're well beyond the populated edge threshold.
+		// Random.fuzzy(1) averages ~0.5; requiring it > minDist means lots near the edge
+		// (minDist small) are almost always kept, and only far-flung outliers are dropped.
+		return Random.fuzzy(1) > minDist * 1.4;
 	});
 }
 
 export function createCommonWardGeometry(model, patch, widths) {
 	const block = patch.block;
 	if (!block || block.length < 3) return [];
-	const [minSq, gridChaos, sizeChaos, emptyProb] = commonWardParams(model, patch);
-	const geometry = indentFronts(createAlleys(block, minSq, gridChaos, sizeChaos, emptyProb, true, widths.alley), block);
-	return classifyGardenLots(filterOutskirts(model, patch, geometry));
+
+	const angleOf = (poly, i) => {
+		const a = poly[(i + poly.length - 1) % poly.length];
+		const b = poly[i];
+		const c = poly[(i + 1) % poly.length];
+		const u = a.subtract(b);
+		const v = c.subtract(b);
+		if (u.length < 1e-6 || v.length < 1e-6) return 0;
+		return Math.acos(Math.max(-1, Math.min(1, u.dot(v) / (u.length * v.length))));
+	};
+	const minPolyAngle = (poly) => {
+		let min = Infinity;
+		for (let i = 0; i < poly.length; i++) min = Math.min(min, angleOf(poly, i));
+		return min;
+	};
+	const roundedAcuteCorners = (poly, minAngle, depth = 0) => {
+		if (!poly || poly.length < 3 || depth > 12) return poly;
+		let worst = -1;
+		let worstAngle = minAngle;
+		for (let i = 0; i < poly.length; i++) {
+			const a = angleOf(poly, i);
+			if (a < worstAngle) {
+				worstAngle = a;
+				worst = i;
+			}
+		}
+		if (worst === -1) return poly;
+		const prev = poly[(worst + poly.length - 1) % poly.length];
+		const corner = poly[worst];
+		const next = poly[(worst + 1) % poly.length];
+		const prevLen = Point.distance(corner, prev);
+		const nextLen = Point.distance(corner, next);
+		if (prevLen < 1e-6 || nextLen < 1e-6) return poly;
+		const reach = Math.min(prevLen, nextLen) * 0.22;
+		if (!(reach > 1e-6)) return poly;
+		const a = corner.add(prev.subtract(corner).norm(reach));
+		const b = corner.add(next.subtract(corner).norm(reach));
+		const out = new Polygon();
+		for (let i = 0; i < poly.length; i++) {
+			if (i === worst) {
+				out.push(a);
+				out.push(b);
+			} else {
+				out.push(poly[i]);
+			}
+		}
+		if (out.length < 3 || Math.abs(out.square) < Math.abs(poly.square) * 0.5) return poly;
+		// The acute tip (corner, a, b) was beveled away — leave a tree/fountain behind.
+		recordRemovedTriangle(corner, a, b);
+		return roundedAcuteCorners(out, minAngle, depth + 1);
+	};
+
+	const axis = principalAxis(block);
+	const radial = block.centroid.subtract(model.center || block.center);
+	if (radial.length > 1e-6 && Math.abs(axis.dot(radial.norm(1))) > 0.92) {
+		axis.set(new Point(-axis.y, axis.x));
+	}
+	if (Random.bool(0.35)) axis.set(new Point(-axis.y, axis.x));
+
+	const area = Math.abs(block.square);
+	const scale = Math.sqrt(area);
+	const dense = patch.type === 'gate' || Point.distance(block.centroid, model.center || block.center) < (model.cityRadius || scale) * 0.55;
+	const params = {
+		minSq: dense ? 70 : 95,
+		blockSize: dense ? 10 : 14,
+		gridChaos: 0.45 + Random.float() * 0.25,
+		sizeChaos: 0.35,
+		gap: widths.alley || 0.8,
+		emptyProb: 0,
+		primaryDir: axis,
+		directionJitter: 0.28 + Random.float() * 0.18,
+		elbowAngleMin: Math.PI / 9,
+		elbowAngleMax: Math.PI / 2,
+		schedule: ['elbow', 'straight', 'elbow'],
+		maxFailedInRow: 3,
+		attempts: 18,
+		minLotArea: Math.max(45, widths.main * widths.main * 12),
+		minLotAngle: Math.PI / 4,
+	};
+
+	// Very small blocks are already navigation-relevant as courtyards; don't shred them.
+	const preparedBlock = roundedAcuteCorners(block, params.minLotAngle);
+	if (area < params.minSq * 2.5 || scale < widths.main * 5) return [preparedBlock];
+
+	const { lots, alleys } = sliceWardEdgeElbows(preparedBlock, params);
+	patch.alleys = alleys || [];
+	let geometry = (lots && lots.length > 0 ? lots : [preparedBlock]).map((lot) => roundedAcuteCorners(lot, params.minLotAngle));
+	geometry = geometry.filter((lot) => lot && lot.length >= 3);
+	return classifyGardenLots(geometry);
 }
 
 // Dominant orientation (long axis) of a point cloud, via 2x2 covariance eigenvector.
@@ -517,11 +931,11 @@ export function buildWardGeometry(model, patch, widths) {
 
 		case 'farm':
 			if (!block || block.length < 3) return [];
-			return createAlleys(block, 60 + 40 * Random.float(), 0.3, 0.5, 0.7, true, widths.alley);
+			return createAlleys(block, 60 + 40 * Random.float(), 0.3, 0.5, 0.0, true, widths.alley);
 
 		default: {
-			if (patch.type !== 'generic' && patch.type !== 'gate') return [];
-			if (!patch.withinCity && patch.type !== 'gate') return [];
+			if (patch.type !== 'generic' && patch.type !== 'gate' && patch.type !== 'farm') return [];
+			// All lots built up — including outskirts (no withinCity gate).
 			return createCommonWardGeometry(model, patch, widths);
 		}
 	}

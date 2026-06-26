@@ -8,6 +8,13 @@ import { Patch } from './Patch.js';
 import { Random } from './Random.js';
 import { count, replace, amax } from './arrays.js';
 
+// A boundary edge between a land and a water cell (biotope in the reference).
+function isShoreEdge(model, v0, v1) {
+	if (!model.patchByVertex) return false;
+	const edgePatches = model.patchByVertex(v0).filter((p) => p.shape.findEdge(v0, v1) !== -1 || p.shape.findEdge(v1, v0) !== -1);
+	return edgePatches.some((p) => p.isWater) && edgePatches.some((p) => !p.isWater);
+}
+
 // Outer boundary polygon of a group of patches (Model.findCircumference).
 export function findCircumference(wards) {
 	if (wards.length === 0) return new Polygon();
@@ -64,6 +71,7 @@ export class CurtainWall {
 		}
 
 		this.segments = this.shape.map(() => true);
+		this.edges = this.shape.map((origin, i) => ({ origin, end: this.shape[(i + 1) % this.shape.length] }));
 
 		this.buildGates(real, model, reserved);
 	}
@@ -131,8 +139,38 @@ export class CurtainWall {
 			const len = this.shape.length;
 			for (let i = 0; i < len; i++) {
 				const t = this.shape[i];
-				if (this.gates.indexOf(t) === -1 && (this.segments[(i + len - 1) % len] || this.segments[i]))
+				// Place a tower if at least one adjacent segment is active (OR logic).
+				// Towers at water/river endpoints are offset inland by the renderer so
+				// they sit fully on land, not in the water.
+				if (this.gates.indexOf(t) === -1 && (this.segments[i] || this.segments[(i + len - 1) % len]))
 					this.towers.push(t);
+			}
+		}
+	}
+
+	bothSegments(i) {
+		const len = this.shape.length;
+		return this.segments[i] && this.segments[(i + len - 1) % len];
+	}
+
+	// Mark wall segments that run over water (river edges + coast) as inactive. Only
+	// segments that ARE river edges or shore edges are suppressed — segments merely
+	// touching a river node are kept and pulled back by the renderer to the riverbank.
+	suppressWaterSegments(model) {
+		if (!this.real) return;
+		const len = this.shape.length;
+		const isWaterVertex = (v) => {
+			const patches = model.patchByVertex ? model.patchByVertex(v) : [];
+			return patches.length > 0 && patches.some((p) => p.isWater);
+		};
+		const isRiverEdge = (a, b) =>
+			!!(model.riverEdges && ((model.riverEdges.get(a) && model.riverEdges.get(a).has(b)) || (model.riverEdges.get(b) && model.riverEdges.get(b).has(a))));
+
+		for (let i = 0; i < len; i++) {
+			const a = this.shape[i];
+			const b = this.shape[(i + 1) % len];
+			if (isRiverEdge(a, b) || isShoreEdge(model, a, b) || isWaterVertex(a) || isWaterVertex(b)) {
+				this.segments[i] = false;
 			}
 		}
 	}

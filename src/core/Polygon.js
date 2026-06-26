@@ -346,6 +346,120 @@ export class Polygon extends Array {
 		return this.shrink(this.map(() => d));
 	}
 
+	// Robust uniform inset: shift every edge inward by d, compute new vertices as
+	// intersections of adjacent offset lines, then resolve any self-intersections
+	// (which arise at concave vertices). Works for both convex and concave polygons.
+	shrinkRobust(d) {
+		const n = this.length;
+		if (n < 3 || !(d > 0)) return new Polygon(this.map(v => v.clone()));
+
+		const area = this.square;
+		if (Math.abs(area) < 1e-10) return null;
+		const s = area > 0 ? 1 : -1;
+
+		const edges = [];
+		for (let i = 0; i < n; i++) {
+			const a = this[i];
+			const b = this[(i + 1) % n];
+			const dx = b.x - a.x;
+			const dy = b.y - a.y;
+			const len = Math.sqrt(dx * dx + dy * dy);
+			if (len < 1e-10) {
+				edges.push(null);
+			} else {
+				edges.push({
+					dx, dy,
+					nx: (-dy / len) * d * s,
+					ny: (dx / len) * d * s
+				});
+			}
+		}
+		for (let i = 0; i < n; i++) {
+			if (!edges[i]) edges[i] = edges[(i + 1) % n] || edges[(i + n - 1) % n];
+		}
+		if (!edges[0]) return null;
+
+		const q = [];
+		for (let i = 0; i < n; i++) {
+			const prev = (i + n - 1) % n;
+			const e0 = edges[prev];
+			const e1 = edges[i];
+			const ox0 = this[prev].x + e0.nx;
+			const oy0 = this[prev].y + e0.ny;
+			const ox1 = this[i].x + e1.nx;
+			const oy1 = this[i].y + e1.ny;
+
+			const t = GeomUtils.intersectLines(ox0, oy0, e0.dx, e0.dy, ox1, oy1, e1.dx, e1.dy);
+			if (!t || Math.abs(t.x) > 1e8) {
+				q.push(new Point((ox0 + ox1) / 2, (oy0 + oy1) / 2));
+			} else {
+				q.push(new Point(ox0 + e0.dx * t.x, oy0 + e0.dy * t.x));
+			}
+		}
+
+		let wasCut;
+		let lastEdge = 0;
+		do {
+			wasCut = false;
+			const m = q.length;
+			for (let i = lastEdge; i < m - 2; i++) {
+				lastEdge = i;
+				const p11 = q[i];
+				const p12 = q[i + 1];
+				const x1 = p11.x, y1 = p11.y;
+				const dx1 = p12.x - x1, dy1 = p12.y - y1;
+				const jmax = i > 0 ? m : m - 1;
+				for (let j = i + 2; j < jmax; j++) {
+					const p21 = q[j];
+					const p22 = j < m - 1 ? q[j + 1] : q[0];
+					const x2 = p21.x, y2 = p21.y;
+					const dx2 = p22.x - x2, dy2 = p22.y - y2;
+					const int = GeomUtils.intersectLines(x1, y1, dx1, dy1, x2, y2, dx2, dy2);
+					if (int != null && int.x > DELTA && int.x < 1 - DELTA && int.y > DELTA && int.y < 1 - DELTA) {
+						const pn = new Point(x1 + dx1 * int.x, y1 + dy1 * int.x);
+						q.splice(j + 1, 0, pn);
+						q.splice(i + 1, 0, pn);
+						wasCut = true;
+						break;
+					}
+				}
+				if (wasCut) break;
+			}
+		} while (wasCut);
+
+		if (q.length === n) return new Polygon(q);
+
+		const regular = [];
+		for (let i = 0; i < q.length; i++) regular.push(i);
+
+		let bestPart = null;
+		let bestPartSq = 0;
+
+		while (regular.length > 0) {
+			const indices = [];
+			const start = regular[0];
+			let k = start;
+			do {
+				indices.push(k);
+				arrRemove(regular, k);
+				const next = (k + 1) % q.length;
+				const v = q[next];
+				let next1 = q.indexOf(v);
+				if (next1 === next) next1 = q.lastIndexOf(v);
+				k = next1 === -1 ? next : next1;
+			} while (k !== start);
+
+			const p = new Polygon(indices.map(ix => q[ix]));
+			const sq = Math.abs(p.square);
+			if (sq > bestPartSq) {
+				bestPart = p;
+				bestPartSq = sq;
+			}
+		}
+
+		return bestPart;
+	}
+
 	// Cuts a peel along one edge (inset of a single edge via cut).
 	peel(v1, d) {
 		const i1 = this.indexOf(v1);

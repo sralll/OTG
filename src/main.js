@@ -54,7 +54,7 @@ function readParams() {
 		streetWidths: {
 			main: parseFloat(els.widthMain.value) || 2.0,
 			regular: parseFloat(els.widthRegular.value) || 1.0,
-			alley: parseFloat(els.widthAlley.value) || 0.6,
+			alley: parseFloat(els.widthAlley.value) || 0.8,
 		},
 		water: readWaterParams(),
 		meshSmoothing: { enabled: els.curvedWards.checked },
