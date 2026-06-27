@@ -18,8 +18,8 @@ import { addObstacleCrossings, buildCityWall, suppressWallSegmentsOnRiver } from
 import { buildStreets } from './Streets.js';
 import { buildDocks } from './Docks.js';
 import { amin, remove } from './arrays.js';
-import { cathedralRate, createCommonWardGeometry, marketRate, OPEN_TYPES } from './wards.js';
-import { clearFeatures, takeFeatures } from './features.js';
+import { cathedralRate, createCathedralGeometry, createCommonWardGeometry, createParkGeometry, marketRate, OPEN_TYPES } from './wards.js';
+import { clearFeatures, recordFeature, takeFeatures } from './features.js';
 
 // reference constant: pc.LTOWER_RADIUS = 2.5 (used as the junction-merge floor 3*LTOWER_RADIUS)
 const LTOWER_RADIUS = 2.5;
@@ -232,6 +232,7 @@ const ROAD_BLOCK_INSET = 1.0;
 const SHORE_PATH_INSET = ROAD_BLOCK_INSET * 2;
 const RIVER_CLEARANCE_EPS = 0.25;
 const PASSAGE_MARGIN = 1.2;
+const PLAZA_RIVER_TREE_MARGIN = 1.0;
 // Halved from 4.4 (was eating ~half of small blocks near towers). Matches the
 // generator's tower-radius (~1.9) + a small passage margin, not a full turret.
 const TOWER_CLEARANCE = 2.1;
@@ -451,6 +452,14 @@ function minDistanceToPolyline(poly, path) {
 	return best;
 }
 
+function pointDistanceToPolyline(point, path) {
+	if (!point || !path || path.length < 2) return Infinity;
+	let best = Infinity;
+	for (let i = 0; i < path.length - 1; i++)
+		best = Math.min(best, pointSegmentDistance(point, path[i], path[i + 1]));
+	return best;
+}
+
 function nearestVertexToPolyline(poly, path) {
 	let best = { distance: Infinity, segment: -1 };
 	if (!poly || poly.length < 3 || !path || path.length < 2) return best;
@@ -551,8 +560,89 @@ function computeAvailableArea(cell, ctx) {
 	} catch (e) { return null; }
 }
 
+function randomEdgeIndexes(poly, count) {
+	const indexes = poly.map((_, i) => i);
+	for (let i = indexes.length - 1; i > 0; i--) {
+		const j = Random.int(0, i + 1);
+		const t = indexes[i];
+		indexes[i] = indexes[j];
+		indexes[j] = t;
+	}
+	return indexes.slice(0, Math.min(count, indexes.length));
+}
+
+function clipPlazaFromRiver(poly, cell, river) {
+	const path = sampledRiverCourse(river);
+	if (!poly || poly.length < 3 || path.length < 2) return poly;
+
+	const clearance = (river.width || 0) / 2 + PLAZA_RIVER_TREE_MARGIN;
+	if (!pathTouchesCell(path, cell, clearance) && !pathTouchesCell(path, poly, clearance)) return poly;
+
+	let clipped = poly;
+	for (let pass = 0; pass < 12; pass++) {
+		const nearest = nearestVertexToPolyline(clipped, path);
+		if (nearest.distance >= clearance - 1e-6 || nearest.segment < 0) return clipped;
+		const before = Math.abs(clipped.square);
+		const next = cutAwayFromSegment(clipped, cell, path[nearest.segment], path[nearest.segment + 1], clearance);
+		if (!next || next.length < 3) return null;
+		if (Math.abs(before - Math.abs(next.square)) < 1e-6) break;
+		clipped = next;
+	}
+
+	return minDistanceToPolyline(clipped, path) < clearance * 0.9 ? null : clipped;
+}
+
+function addPlazaTreeRings(plaza, riverData) {
+	if (!plaza || !plaza.shape || plaza.shape.length < 3) return;
+	const saved = Random.getSeed();
+	const area = Math.abs(plaza.shape.square);
+	const scale = Math.sqrt(area);
+	const inset = Math.max(1.4, Math.min(3.0, scale * 0.08));
+	const frameBase = plaza.shape.shrinkRobust(inset) || plaza.shape.shrinkEq(inset);
+	const frame = clipPlazaFromRiver(frameBase, plaza.shape, riverData);
+	const riverPath = sampledRiverCourse(riverData);
+	const riverClearance = riverPath.length >= 2 ? (riverData.width || 0) / 2 + PLAZA_RIVER_TREE_MARGIN : 0;
+	if (!frame || frame.length < 3 || Math.abs(frame.square) < area * 0.25) {
+		Random.reset(saved);
+		return;
+	}
+
+	const edges = [];
+	for (let i = 0; i < frame.length; i++) {
+		const a = frame[i];
+		const b = frame[(i + 1) % frame.length];
+		const length = Point.distance(a, b);
+		if (length >= 3.0) edges.push(i);
+	}
+	if (edges.length === 0) {
+		Random.reset(saved);
+		return;
+	}
+
+	const picked = randomEdgeIndexes(edges, 3);
+	const spacing = Math.max(2.6, Math.min(3.8, scale * (0.17 + Random.float() * 0.03)));
+	for (const i of picked) {
+		const a = frame[i];
+		const b = frame[(i + 1) % frame.length];
+		const dx = b.x - a.x;
+		const dy = b.y - a.y;
+		const length = Math.hypot(dx, dy);
+		if (!(length > 1e-6)) continue;
+		const margin = Math.min(spacing * 0.55, length * 0.32);
+		const usable = Math.max(0, length - margin * 2);
+		const count = Math.max(1, Math.floor(usable / spacing) + 1);
+		for (let k = 0; k < count; k++) {
+			const t = count === 1 ? 0.5 : (margin + (usable * k) / (count - 1)) / length;
+			const point = new Point(a.x + dx * t, a.y + dy * t);
+			if (riverClearance > 0 && pointDistanceToPolyline(point, riverPath) < riverClearance) continue;
+			recordFeature(point.x, point.y, 'tree');
+		}
+	}
+	Random.reset(saved);
+}
+
 function buildBuildings(cells, inner, center, wallData, streetData, riverData, plazaEnabled) {
-	if (!inner || inner.length === 0 || !center) return { blocks: [], buildings: [], alleys: [], wardTypes: new Map() };
+	if (!inner || inner.length === 0 || !center) return { blocks: [], buildings: [], alleys: [], hedges: [], wardTypes: new Map() };
 
 	// River edges map (shared Point identity)
 	const riverEdges = new Map();
@@ -604,10 +694,12 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 		pick.type = 'cathedral';
 		remove(unassigned, pick);
 	}
+	// The old "market squares" are now parks: open green wards filled with green patches and
+	// split by bezier-spline walkways (see createParkGeometry / the geometry loop below).
 	let squares = 2;
 	while (squares-- > 0 && unassigned.length > 0) {
 		const pick = amin(unassigned, (p) => marketRate(model, p));
-		pick.type = 'market';
+		pick.type = 'park';
 		remove(unassigned, pick);
 	}
 	if (wallData) {
@@ -624,6 +716,8 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 	for (const p of innerPatches)
 		for (const v of p.shape)
 			model.cityRadius = Math.max(model.cityRadius, Point.distance(v, center));
+
+	addPlazaTreeRings(model.plaza, riverData);
 
 	// --- compute available build areas (one inset polygon per ward) ---
 	// Use pre-smoothed streets/roads for edge matching (shared Point identity);
@@ -646,15 +740,23 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 	const blocks = [];
 	const buildings = [];
 	const alleys = [];
+	const hedges = [];
+	const cathedralHedges = [];
 	for (const p of patches) {
 		if (OPEN_TYPES.has(p.type) || p.isWater) continue;
 		const avail = computeAvailableArea(p.shape, ctx);
 		if (avail && avail.length >= 3) {
 			p.block = avail;
 			blocks.push(avail);
-			if ((p.type === 'generic' || p.type === 'gate') && p.withinCity) {
-				for (const b of createCommonWardGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
-				if (p.alleys) alleys.push(...p.alleys);
+		if ((p.type === 'generic' || p.type === 'gate') && p.withinCity) {
+			for (const b of createCommonWardGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+			if (p.alleys) alleys.push(...p.alleys);
+		} else if (p.type === 'cathedral' && p.withinCity) {
+			for (const b of createCathedralGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+			if (p.cathedralHedges) cathedralHedges.push(...p.cathedralHedges);
+		} else if (p.type === 'park' && p.withinCity) {
+				for (const b of createParkGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				if (p.hedges) hedges.push(...p.hedges);
 			}
 		}
 	}
@@ -662,7 +764,7 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 	const wardTypes = new Map();
 	for (const p of patches) wardTypes.set(p.shape, p.type);
 
-	return { blocks, buildings, alleys, wardTypes };
+	return { blocks, buildings, alleys, hedges, cathedralHedges, wardTypes };
 }
 
 // ---- public entry ----
@@ -714,7 +816,7 @@ export function generateWards(params = {}) {
 	// Collect chamfer "features" (trees/fountains dropped where corner triangles are cut
 	// off) only from the surviving generation, not from any discarded retries above.
 	clearFeatures();
-	const { blocks, buildings, alleys, wardTypes } = buildBuildings(
+	const { blocks, buildings, alleys, hedges, cathedralHedges, wardTypes } = buildBuildings(
 		result.cells, result.inner, result.center,
 		result.wall, result.streets, result.river, plaza
 	);
@@ -765,6 +867,7 @@ export function generateWards(params = {}) {
 					gates: result.wall.gates.map((v) => ({ x: v.x, y: v.y })),
 					crossingGates: (result.wall.crossingGates || []).map((v) => ({ x: v.x, y: v.y })),
 					towers: result.wall.towers.map((v) => ({ x: v.x, y: v.y })),
+					gateTowers: (result.wall.gateTowers || []).map((v) => ({ x: v.x, y: v.y })),
 					segments: result.wall.segments.slice(),
 				}
 			: null,
@@ -779,6 +882,8 @@ export function generateWards(params = {}) {
 		blocks: blocks.map((b) => Array.from(b, (v) => ({ x: v.x, y: v.y }))),
 		buildings: buildings.map(serializeBuilding),
 		alleys: alleys.map((a) => Array.from(a, (v) => ({ x: v.x, y: v.y }))),
+		hedges: hedges.map((h) => h.map((v) => ({ x: v.x, y: v.y }))),
+		cathedralHedges: cathedralHedges.map((h) => h.map((v) => ({ x: v.x, y: v.y }))),
 		features,
 	};
 }

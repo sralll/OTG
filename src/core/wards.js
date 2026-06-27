@@ -10,12 +10,13 @@ import { GeomUtils } from './GeomUtils.js';
 import { Random } from './Random.js';
 import { Cutter } from './Cutter.js';
 import { amin } from './arrays.js';
-import { sliceWardEdgeElbows } from './AlleySlicer.js';
-import { recordRemovedTriangle } from './features.js';
+import { sliceWardEdgeElbows, sliceWard, minNeckWidth } from './AlleySlicer.js';
+import { recordFeature, recordRemovedTriangle } from './features.js';
 
 // Open patch types are kept as open space (no shrunken block). 'water' included so water
-// cells are never shrunk into blocks.
-export const OPEN_TYPES = new Set(['plaza', 'market', 'park', 'water']);
+// cells are never shrunk into blocks. 'park' is NOT open: it is filled with green patches
+// (see createParkGeometry), so it gets a block and subdivision like a buildable ward.
+export const OPEN_TYPES = new Set(['plaza', 'market', 'water']);
 
 function hasRiverEdge(model, v0, v1) {
 	const riverEdges = model.riverEdges;
@@ -448,10 +449,11 @@ export function cathedralRate(model, patch) {
 	return patch.shape.distance(model.plaza != null ? model.plaza.shape.center : model.center) * patch.shape.square;
 }
 
-// Port of Market.rateLocation: no two markets adjacent; size relative to plaza, else distance to center.
+// Port of Market.rateLocation, repurposed to place park squares: no two parks adjacent; size
+// relative to plaza, else distance to center.
 export function marketRate(model, patch) {
 	for (const p of model.inner)
-		if (p.type === 'market' && p.shape.borders(patch.shape)) return Number.POSITIVE_INFINITY;
+		if (p.type === 'park' && p.shape.borders(patch.shape)) return Number.POSITIVE_INFINITY;
 	return model.plaza != null ? patch.shape.square / model.plaza.shape.square : patch.shape.distance(model.center);
 }
 
@@ -611,42 +613,6 @@ function indentFronts(lots, block) {
 	});
 }
 
-function classifyGardenLots(lots) {
-	if (!lots || lots.length < 6 || !Random.bool(0.55)) return lots;
-
-	const touches = (a, b) => {
-		for (let i = 0; i < a.length; i++) {
-			const a0 = a[i];
-			const a1 = a[(i + 1) % a.length];
-			for (let j = 0; j < b.length; j++) {
-				const b0 = b[j];
-				const b1 = b[(j + 1) % b.length];
-				if ((Point.distance(a0, b1) < 1e-5 && Point.distance(a1, b0) < 1e-5) ||
-					(Point.distance(a0, b0) < 1e-5 && Point.distance(a1, b1) < 1e-5)) return true;
-			}
-		}
-		return false;
-	};
-
-	const garden = new Set();
-	const target = Math.max(1, Math.min(4, Math.round(lots.length * (0.05 + Random.float() * 0.04))));
-	const order = lots.map((_, i) => i).sort(() => Random.float() - 0.5);
-	for (const i of order) {
-		if (garden.size >= target) break;
-		let adjacentGarden = false;
-		for (const g of garden) {
-			if (touches(lots[i], lots[g])) {
-				adjacentGarden = true;
-				break;
-			}
-		}
-		if (!adjacentGarden) garden.add(i);
-	}
-
-	for (const i of garden) lots[i].class = 'garden';
-	return lots;
-}
-
 function commonWardParams(model, patch) {
 	// [minSq, gridChaos, sizeChaos, emptyProb, blockSize]
 	// minSq: minimum lot area. blockSize: bisector recursion threshold (minArea = minSq*blockSize).
@@ -802,22 +768,330 @@ export function createCommonWardGeometry(model, patch, widths) {
 		directionJitter: 0.28 + Random.float() * 0.18,
 		elbowAngleMin: Math.PI / 9,
 		elbowAngleMax: Math.PI / 2,
+		// Fraction of elbow cuts aligned to a block edge — normal (perpendicular) or parallel to
+		// a previous slice — vs a random angle. TUNE HERE: raise toward 1 for more grid-aligned
+		// lots, lower for more variety.
+		elbowAlignProb: 0.7,
+		// Minimum building "waist": no lot may pinch thinner than this. Bounds the worst neck
+		// in the ward. TUNE HERE (× widths.alley) — higher = thicker, chunkier buildings.
+		minLotNeck: widths.alley * 1.7,
 		schedule: ['elbow', 'straight', 'elbow'],
-		maxFailedInRow: 3,
+		maxFailedInRow: 4, // one extra retry to recover the stricter thin-neck rejections
 		attempts: 18,
 		minLotArea: Math.max(45, widths.main * widths.main * 12),
 		minLotAngle: Math.PI / 4,
 	};
 
-	// Very small blocks are already navigation-relevant as courtyards; don't shred them.
+	// Very small blocks are already navigation-relevant as courtyards; don't shred them — but a
+	// thin block should still become a final lot instead of creating an empty patch.
 	const preparedBlock = roundedAcuteCorners(block, params.minLotAngle);
-	if (area < params.minSq * 2.5 || scale < widths.main * 5) return [preparedBlock];
+	if (area < params.minSq * 2.5 || scale < widths.main * 5) {
+		return [preparedBlock];
+	}
 
 	const { lots, alleys } = sliceWardEdgeElbows(preparedBlock, params);
 	patch.alleys = alleys || [];
 	let geometry = (lots && lots.length > 0 ? lots : [preparedBlock]).map((lot) => roundedAcuteCorners(lot, params.minLotAngle));
 	geometry = geometry.filter((lot) => lot && lot.length >= 3);
-	return classifyGardenLots(geometry);
+	// Final guard: drop any lot that pinches below minLotNeck — both lots left waisted by the
+	// corner rounding above and whole-ward blocks the slicer couldn't cut (returned as one lot).
+	// This is what actually bounds the ward's worst neck; a thin sliver becomes open space.
+	return geometry;
+}
+
+function parkFeatureHash(x, y, salt = 0) {
+	const h = (
+		Math.imul(Math.round(x * 16) + salt * 101, 73856093) ^
+		Math.imul(Math.round(y * 16) - salt * 127, 19349663)
+	) >>> 0;
+	return h / 0x100000000;
+}
+
+function recordParkPathTrees(alleys, block, gap) {
+	if (!alleys || alleys.length === 0 || !block || block.length < 3) return;
+	const spacing = Math.max(2.4, gap * 3);
+	const offset = Math.max(1.2, gap * 1.45);
+	const boundaryClearance = offset * 1.15;
+	for (let ai = 0; ai < alleys.length; ai++) {
+		const path = alleys[ai];
+		if (!path || path.length < 2) continue;
+		for (let i = 0; i < path.length - 1; i++) {
+			const a = path[i];
+			const b = path[i + 1];
+			const dx = b.x - a.x;
+			const dy = b.y - a.y;
+			const len = Math.hypot(dx, dy);
+			if (!(len > spacing * 0.8)) continue;
+			const nx = -dy / len;
+			const ny = dx / len;
+			const count = Math.max(1, Math.floor(len / spacing));
+			for (let k = 0; k < count; k++) {
+				const t = (k + 0.5) / count;
+				const base = new Point(a.x + dx * t, a.y + dy * t);
+				for (const side of [-1, 1]) {
+					if (parkFeatureHash(base.x, base.y, ai * 17 + k * 3 + (side > 0 ? 1 : 2)) > 0.62) continue;
+					const p = new Point(base.x + nx * offset * side, base.y + ny * offset * side);
+					if (pointInPolygon(p, block) && pointPolygonDistance(p, block) >= boundaryClearance)
+						recordFeature(p.x, p.y, 'tree');
+				}
+			}
+		}
+	}
+}
+
+function recordParkPatchRings(lots) {
+	if (!lots || lots.length === 0) return;
+	for (let i = 0; i < lots.length; i++) {
+		const lot = lots[i];
+		if (!lot || lot.length < 3 || Math.abs(lot.square) < 10) continue;
+		const c = lot.centroid;
+		if (parkFeatureHash(c.x, c.y, i + 41) > 0.45) continue;
+		recordFeature(c.x, c.y, parkFeatureHash(c.x, c.y, i + 83) < 0.5 ? 'fountain' : 'object');
+	}
+}
+
+function pathLength(path) {
+	if (!path || path.length < 2) return 0;
+	let length = 0;
+	for (let i = 0; i < path.length - 1; i++) length += Point.distance(path[i], path[i + 1]);
+	return length;
+}
+
+function pathMidpoint(path) {
+	if (!path || path.length === 0) return new Point(0, 0);
+	if (path.length === 1) return path[0];
+	const half = pathLength(path) / 2;
+	let travelled = 0;
+	for (let i = 0; i < path.length - 1; i++) {
+		const a = path[i];
+		const b = path[i + 1];
+		const len = Point.distance(a, b);
+		if (travelled + len >= half && len > 1e-6) {
+			const t = (half - travelled) / len;
+			return new Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+		}
+		travelled += len;
+	}
+	return path[path.length - 1];
+}
+
+function conceptualParkEdges(lot) {
+	if (!lot || lot.length < 3) return [];
+	const breaks = [];
+	const maxSmoothTurn = Math.PI / 4;
+	const n = lot.length;
+	for (let i = 0; i < n; i++) {
+		const prev = lot[(i + n - 1) % n];
+		const curr = lot[i];
+		const next = lot[(i + 1) % n];
+		const incoming = curr.subtract(prev);
+		const outgoing = next.subtract(curr);
+		if (incoming.length < 1e-6 || outgoing.length < 1e-6) {
+			breaks.push(i);
+			continue;
+		}
+		const cos = Math.max(-1, Math.min(1, incoming.dot(outgoing) / (incoming.length * outgoing.length)));
+		if (Math.acos(cos) > maxSmoothTurn) breaks.push(i);
+	}
+	if (breaks.length === 0) return [Array.from(lot).concat([lot[0]])];
+
+	const edges = [];
+	for (let bi = 0; bi < breaks.length; bi++) {
+		const start = breaks[bi];
+		const end = breaks[(bi + 1) % breaks.length];
+		const path = [lot[start]];
+		let i = start;
+		do {
+			i = (i + 1) % n;
+			path.push(lot[i]);
+		} while (i !== end);
+		edges.push(path);
+	}
+	return edges;
+}
+
+function createParkHedges(lots) {
+	const hedges = [];
+	if (!lots || lots.length === 0) return hedges;
+	for (let li = 0; li < lots.length; li++) {
+		const lot = lots[li];
+		if (!lot || lot.length < 3) continue;
+		const edges = conceptualParkEdges(lot);
+		for (let i = 0; i < edges.length; i++) {
+			const edge = edges[i];
+			if (pathLength(edge) < 1.2) continue;
+			const mid = pathMidpoint(edge);
+			if (parkFeatureHash(mid.x, mid.y, li * 31 + i) < 0.2) hedges.push(edge);
+		}
+	}
+	return hedges;
+}
+
+// Park subdivision: fill the park block with green ('park'-class) patches using the same
+// inset-block + slicer machinery as a buildable ward, but cut by true bezier-spline walkways
+// (sliceWard with bezierCuts) instead of the elbow cuts used for building lots. The patches are
+// the green lawn areas; the gaps the slicer leaves between them are the walkways.
+export function createParkGeometry(model, patch, widths) {
+	const block = patch.block;
+	if (!block || block.length < 3) return [];
+	const tagPark = (lot) => { if (lot) lot.class = 'park'; return lot; };
+
+	const area = Math.abs(block.square);
+	const scale = Math.sqrt(area);
+
+	// One dominant orientation for the walkways, like a buildable ward's lot grid.
+	const axis = principalAxis(block);
+	if (Random.bool(0.5)) axis.set(new Point(-axis.y, axis.x));
+
+	const alley = widths.alley || 0.8;
+	const params = {
+		// Smaller target patches than a building ward so even a modest park gets cut by at least
+		// one walkway rather than rendering as a single undivided lawn.
+		minSq: 45,
+		blockSize: 8,
+		gridChaos: 0.65 + Random.float() * 0.25,
+		sizeChaos: 0.4,
+		// Gap between patches = walkway width. A touch wider than a building alley so the paths read.
+		gap: Math.max(alley, 0.9),
+		emptyProb: 0,
+		// Walkways are true bezier splines, not elbow/arc cuts.
+		bezierCuts: true,
+		primaryDir: axis,
+		directionJitter: 0.45,
+		minLotArea: Math.max(24, (widths.main || 2) * (widths.main || 2) * 5),
+		minLotAngle: Math.PI / 7,
+		minLotNeck: alley * 1.1,
+	};
+
+	// Only a park too small to hold a single patch + walkway stays one undivided lawn.
+	if (area < params.minSq * 2 || scale < (widths.main || 2) * 3) {
+		const geometry = [tagPark(new Polygon(block))];
+		recordParkPatchRings(geometry);
+		patch.hedges = createParkHedges(geometry);
+		return geometry;
+	}
+
+	const { lots, alleys } = sliceWard(block, params);
+	const geometry = (lots && lots.length > 0 ? lots : [new Polygon(block)]).filter((l) => l && l.length >= 3);
+	recordParkPathTrees(alleys, block, params.gap);
+	recordParkPatchRings(geometry);
+	patch.hedges = createParkHedges(geometry);
+	return geometry.map(tagPark);
+}
+
+// Cathedral ward: fill the whole block with the cathedral colour, then draw a closed ring of
+// medium-thickness black wall lines around the precinct. The two openings are placed on the
+// longest and shortest ward edges; each opening leaves a fixed small gap in the middle of the
+// edge while the wall still runs right up to either side of it.
+function findLongestAndShortestEdges(block) {
+	const n = block.length;
+	let longest = 0;
+	let shortest = 0;
+	let longestLen = -Infinity;
+	let shortestLen = Infinity;
+	for (let i = 0; i < n; i++) {
+		const len = Point.distance(block[i], block[(i + 1) % n]);
+		if (len > longestLen) {
+			longestLen = len;
+			longest = i;
+		}
+		if (len < shortestLen) {
+			shortestLen = len;
+			shortest = i;
+		}
+	}
+	const gaps = new Set();
+	gaps.add(longest);
+	if (shortest !== longest) {
+		gaps.add(shortest);
+	} else if (n > 2) {
+		// All edges are the same length: pick the edge farthest around the perimeter so the
+		// two openings are still distinct.
+		let best = -1;
+		let bestDist = -Infinity;
+		for (let i = 0; i < n; i++) {
+			if (i === longest) continue;
+			const dist = Math.min((i - longest + n) % n, (longest - i + n) % n);
+			if (dist > bestDist) {
+				bestDist = dist;
+				best = i;
+			}
+		}
+		if (best !== -1) gaps.add(best);
+	}
+	return gaps;
+}
+
+function createWallSegments(block, gapEdges, gapWidth = 1.2) {
+	const n = block.length;
+	if (n < 3) return [];
+	if (gapEdges.size === 0) {
+		const closed = Array.from(block, (v) => new Point(v.x, v.y));
+		closed.push(new Point(block[0].x, block[0].y));
+		return [new Polygon(closed)];
+	}
+
+	const subSegments = [];
+	for (let i = 0; i < n; i++) {
+		const v0 = block[i];
+		const v1 = block[(i + 1) % n];
+		if (gapEdges.has(i)) {
+			const len = Point.distance(v0, v1);
+			if (len > gapWidth + 1e-6) {
+				const dx = v1.x - v0.x;
+				const dy = v1.y - v0.y;
+				const along = (len - gapWidth) / 2;
+				const p1 = new Point(v0.x + dx * (along / len), v0.y + dy * (along / len));
+				const p2 = new Point(v0.x + dx * ((len - along) / len), v0.y + dy * ((len - along) / len));
+				subSegments.push([new Point(v0.x, v0.y), p1]);
+				subSegments.push([p2, new Point(v1.x, v1.y)]);
+			}
+			// Edges too short for the gap are left completely open.
+		} else {
+			subSegments.push([new Point(v0.x, v0.y), new Point(v1.x, v1.y)]);
+		}
+	}
+
+	if (subSegments.length === 0) return [];
+
+	const merged = [];
+	for (const seg of subSegments) {
+		if (merged.length === 0) {
+			merged.push(seg);
+		} else {
+			const last = merged[merged.length - 1];
+			if (Point.distance(last[last.length - 1], seg[0]) < 1e-9) {
+				merged[merged.length - 1] = last.concat(seg.slice(1));
+			} else {
+				merged.push(seg);
+			}
+		}
+	}
+
+	// Wrap-around: join the last segment to the first if they meet at a non-gap edge.
+	if (merged.length > 1) {
+		const first = merged[0];
+		const last = merged[merged.length - 1];
+		if (Point.distance(last[last.length - 1], first[0]) < 1e-9) {
+			merged[0] = last.concat(first.slice(1));
+			merged.pop();
+		}
+	}
+
+	return merged.filter((s) => s.length >= 2).map((s) => new Polygon(s));
+}
+
+export function createCathedralGeometry(model, patch, widths) {
+	const block = patch.block;
+	if (!block || block.length < 3) return [];
+
+	const fill = new Polygon(Array.from(block, (v) => new Point(v.x, v.y)));
+	fill.class = 'cathedral';
+
+	const gapEdges = findLongestAndShortestEdges(block);
+	patch.cathedralHedges = createWallSegments(block, gapEdges, 1.2);
+
+	return [fill];
 }
 
 // Dominant orientation (long axis) of a point cloud, via 2x2 covariance eigenvector.
@@ -915,7 +1189,7 @@ export function buildWardGeometry(model, patch, widths) {
 
 		case 'cathedral':
 			if (!block || block.length < 3) return [];
-			return Random.bool(0.4) ? Cutter.ring(block, 2 + Random.float() * 4) : createOrthoBuilding(block, 50, 0.8);
+			return createCathedralGeometry(model, patch, widths);
 
 		case 'castle': {
 			const b = patch.shape.shrinkEq(widths.main * 2);

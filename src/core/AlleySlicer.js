@@ -248,6 +248,32 @@ function semiSmooth(tri, minFront) {
 	return tri;
 }
 
+// Replace the elbow [b, c, d] with a quadratic Bezier curve from entry b to exit d that
+// bulges toward the bend c, sampled into a smooth polyline. This is the "walkway" cut used by
+// parks: a true bezier spline alternative to semiSmooth's tangent circular arc.
+function bezierSmooth(tri, minSeg) {
+	const b = tri[0];
+	const c = tri[1];
+	const d = tri[2];
+	const chord = Point.distance(b, d);
+	if (chord < 1e-10) return [b, d];
+	const approxLen = Point.distance(b, c) + Point.distance(c, d);
+	const step = Math.max(minSeg * 0.4, 1e-3);
+	let count = Math.round(approxLen / step);
+	if (count < 4) count = 4;
+	if (count > 24) count = 24;
+	const pts = [];
+	for (let i = 0; i < count; i++) {
+		const t = i / (count - 1);
+		const mt = 1 - t;
+		pts.push(new Point(
+			mt * mt * b.x + 2 * mt * t * c.x + t * t * d.x,
+			mt * mt * b.y + 2 * mt * t * c.y + t * t * d.y
+		));
+	}
+	return pts;
+}
+
 // ji.detectStraight: default processCut — straighten a nearly-flat elbow.
 function detectStraight(tri, minTurnOffset) {
 	if (minTurnOffset > 0) {
@@ -570,7 +596,10 @@ export function sliceWard(block, params) {
 	const minFront = Math.sqrt(minSq);
 
 	const bisector = new Bisector(block, minArea, variance);
-	bisector.processCut = (tri) => params.elbowOnly ? tri : semiSmooth(tri, minFront);
+	bisector.processCut = (tri) =>
+		params.bezierCuts ? bezierSmooth(tri, minFront)
+			: params.elbowOnly ? tri
+				: semiSmooth(tri, minFront);
 	bisector.getGap = null;
 	if (params.primaryDir) {
 		bisector.primaryDir = params.primaryDir;
@@ -584,7 +613,7 @@ export function sliceWard(block, params) {
 	// Reject/remove lots that pinch to a thin neck (a waist OBB min-width can't see). The
 	// cutter validates full-size lots, which lose ~gap of neck to the later shrink(gap/2),
 	// so it uses the larger budget `neckFloor + gap`; `neckFloor` is the post-shrink floor.
-	const neckFloor = params.minLotNeck != null ? params.minLotNeck : (gap > 0 ? gap * 0.6 : 0);
+	const neckFloor = params.minLotNeck != null ? params.minLotNeck : (gap > 0 ? gap * 1.2 : 0);
 	const cutNeck = neckFloor > 0 ? neckFloor + gap : 0;
 	if (params.minLotArea != null || minLotWidth > 0 || cutNeck > 0 || params.minLotAngle != null) {
 		bisector.validateCut = (source, halves, ranges) => {
@@ -615,8 +644,9 @@ export function sliceWard(block, params) {
 		});
 	}
 
-	// Safety net: drop lots that shrink(gap/2) pinched into a hairline-joined waist.
-	if (neckFloor > 0) lots = lots.filter((lot) => lot && lot.length >= 3 && minNeckWidth(lot) >= neckFloor);
+	// TEMP: keep lots even when the variable one-sided setback makes a thin neck. Re-enable once
+	// setback-aware validation can distinguish ugly geometry from whole missing buildings.
+	// if (neckFloor > 0) lots = lots.filter((lot) => lot && lot.length >= 3 && minNeckWidth(lot) >= neckFloor);
 
 	// Post-process: chamfer corners sharper than chamferAngle (default 30°). Sharp slivers
 	// fall out of the arc cuts; bevel them so buildings don't end in needle points.
@@ -754,6 +784,25 @@ function chamferLots(lots, minAngle, size, edgeFrac) {
 	});
 }
 
+// In ~`prob` of lots, set back ONE side deeper than the rest: peel a single random edge by an
+// extra normal-random amount, scaled to up to double the usual gap/2 inset (mean ~the usual,
+// ranging 0..~gap). Gives some buildings a larger yard/setback on one side instead of a uniform
+// alley gap all around. Applied AFTER the uniform shrink; the neckFloor safety net downstream
+// drops any lot the deeper peel pinches into a hairline waist.
+function shrinkOneSideDeeper(lot, gap, prob) {
+	if (!lot || lot.length < 3 || !(gap > 0) || !(prob > 0)) return lot;
+	if (!Random.bool(prob)) return lot;
+	const idx = Random.int(0, lot.length);
+	const extra = Random.normal() * gap; // mean ~gap/2 (the usual distance), up to ~gap (double)
+	if (!(extra > 1e-6)) return lot;
+	const area0 = Math.abs(lot.square);
+	try {
+		const peeled = lot.peel(lot[idx], extra);
+		if (peeled && peeled.length >= 3 && Math.abs(peeled.square) > area0 * 0.2) return peeled;
+	} catch (e) { /* keep the uniformly-shrunk lot */ }
+	return lot;
+}
+
 // Distance from point p to segment [a, b].
 function pointSegmentDistance(p, a, b) {
 	const dx = b.x - a.x;
@@ -800,6 +849,45 @@ function validElbowLots(halves, ranges, gap, minLotArea, minLotAngle, minLotWidt
 	return lots;
 }
 
+// Two random exit directions for the elbow's second leg (the legacy behaviour): a random
+// turn off `inward` to each side, within [angleMin, angleMax].
+function randomTurnDirs(inward, angleMin, angleMax) {
+	const signs = Random.bool() ? [1, -1] : [-1, 1];
+	const out = [];
+	for (const s of signs) out.push(rotateDir(inward, s * (angleMin + Random.float() * (angleMax - angleMin))));
+	return out;
+}
+
+// Exit directions that ALIGN the elbow's second leg to the block geometry instead of turning
+// by a random amount. For each block edge we take both:
+//   - its NORMAL  → a cut perpendicular to that edge (meets the boundary squarely), and
+//   - its TANGENT → a cut parallel to that edge, i.e. parallel to a previous slice (earlier
+//                   cuts become block edges), so adjacent lots line up into a grid.
+// Only directions whose turn off `inward` is a sensible elbow angle ([angleMin, angleMax]) are
+// kept; the list is shuffled so we don't bias toward edge 0.
+function wardEdgeAlignedDirs(poly, entryEdge, inward, angleMin, angleMax) {
+	const out = [];
+	const n = poly.length;
+	for (let i = 0; i < n; i++) {
+		if (i === entryEdge) continue;
+		const edge = poly[(i + 1) % n].subtract(poly[i]);
+		if (edge.length < 1e-6) continue;
+		const nrm = inwardNormal(poly, i);
+		const tan = edge.norm(1);
+		for (const dir of [nrm, nrm.scale(-1), tan, tan.scale(-1)]) {
+			if (dir.length < 1e-6) continue;
+			const dot = Math.max(-1, Math.min(1, inward.x * dir.x + inward.y * dir.y));
+			const turn = Math.acos(dot);
+			if (turn >= angleMin && turn <= angleMax) out.push(dir);
+		}
+	}
+	for (let i = out.length - 1; i > 0; i--) {
+		const j = Math.floor(Random.float() * (i + 1));
+		const t = out[i]; out[i] = out[j]; out[j] = t;
+	}
+	return out;
+}
+
 function makeEdgeElbowCut(poly, params) {
 	if (!poly || poly.length < 4) return null;
 	const minLotArea = params.minLotArea || 40;
@@ -809,6 +897,10 @@ function makeEdgeElbowCut(poly, params) {
 	const minLotNeck = params.minLotNeck || 0;
 	const angleMin = params.elbowAngleMin || Math.PI / 9;
 	const angleMax = params.elbowAngleMax || Math.PI / 2;
+	// Probability the elbow's second leg is aligned to a block edge — normal (perpendicular) OR
+	// tangent (parallel to a previous slice) — vs a random turn. TUNE THIS RATIO via
+	// params.elbowAlignProb — wards.js sets it (see createCommonWardGeometry).
+	const elbowAlignProb = params.elbowAlignProb != null ? params.elbowAlignProb : 0.7;
 	const edgeIndex = longestEdgeIndex(poly);
 	const a = poly[edgeIndex];
 	const b = poly[(edgeIndex + 1) % poly.length];
@@ -832,10 +924,12 @@ function makeEdgeElbowCut(poly, params) {
 		const elbow = new Point(entry.x + inward.x * firstLen, entry.y + inward.y * firstLen);
 		if (!containsPoint(poly, elbow)) continue;
 
-		const signs = Random.bool() ? [1, -1] : [-1, 1];
-		for (const sign of signs) {
-			const turn = angleMin + Random.float() * (angleMax - angleMin);
-			const dir = rotateDir(inward, sign * turn);
+		// 70% (default): align the second leg to a block edge — perpendicular (normal) OR
+		// parallel to a previous slice (tangent) — so lots line up into a grid; 30%: a random
+		// turn as before. Fall back to random if no block edge yields a usable elbow angle.
+		let dirs = Random.bool(elbowAlignProb) ? wardEdgeAlignedDirs(poly, edgeIndex, inward, angleMin, angleMax) : [];
+		if (dirs.length === 0) dirs = randomTurnDirs(inward, angleMin, angleMax);
+		for (const dir of dirs) {
 			const exit = rayExit(poly, elbow, dir, edgeIndex);
 			if (!exit || exit.edge === edgeIndex || exit.t < Math.sqrt(minLotArea)) continue;
 			const cut = [entry, elbow, exit.point];
@@ -881,7 +975,7 @@ export function sliceWardEdgeElbows(block, params = {}) {
 	// Reject/remove lots that pinch to a thin neck. `neckFloor` is the final (post-shrink)
 	// minimum; the cutter validates full-size lots, which lose ~gap of neck to the later
 	// shrink(gap/2) on both facing edges, so it gets the larger budget `neckFloor + gap`.
-	const neckFloor = params.minLotNeck != null ? params.minLotNeck : (gap > 0 ? gap * 0.6 : 0);
+	const neckFloor = params.minLotNeck != null ? params.minLotNeck : (gap > 0 ? gap * 1.2 : 0);
 	const cutParams = gap > 0
 		? { ...params, gap: 0, minLotWidth: 2 * gap, minLotNeck: neckFloor + gap }
 		: { ...params, minLotNeck: neckFloor };
@@ -916,21 +1010,22 @@ export function sliceWardEdgeElbows(block, params = {}) {
 	}
 
 	if (gap > 0) {
+		const oneSideProb = params.oneSideSetbackProb != null ? params.oneSideSetbackProb : 0.5;
 		lots = lots.map((lot) => {
 			if (!lot || lot.length < 3) return lot;
 			const area0 = Math.abs(lot.square);
+			let shrunkLot = lot;
 			try {
 				const shrunk = lot.shrinkRobust(gap / 2);
-				if (shrunk && shrunk.length >= 3 && Math.abs(shrunk.square) > area0 * 0.15) return shrunk;
+				if (shrunk && shrunk.length >= 3 && Math.abs(shrunk.square) > area0 * 0.15) shrunkLot = shrunk;
 			} catch (e) { /* fall back to full-size lot */ }
-			return lot;
+			return shrinkOneSideDeeper(shrunkLot, gap, oneSideProb);
 		});
 	}
 
-	// Safety net: shrink(gap/2) can pinch an otherwise-valid lot into a hairline-joined waist
-	// (the inset lines cross and shrinkRobust keeps the larger sub-loop). Drop any lot whose
-	// neck collapsed below neckFloor — better an empty spot than a building joined by a thread.
-	if (neckFloor > 0) lots = lots.filter((lot) => lot && lot.length >= 3 && minNeckWidth(lot) >= neckFloor);
+	// TEMP: keep lots even when the variable one-sided setback makes a thin neck. Re-enable once
+	// setback-aware validation can distinguish ugly geometry from whole missing buildings.
+	// if (neckFloor > 0) lots = lots.filter((lot) => lot && lot.length >= 3 && minNeckWidth(lot) >= neckFloor);
 
 	// Post-process: chamfer corners sharper than chamferAngle (default 30°).
 	if (params.chamfer !== false) {
@@ -944,4 +1039,4 @@ export function sliceWardEdgeElbows(block, params = {}) {
 	return { lots, alleys };
 }
 
-export { semiSmooth, detectStraight, getCircle, getArc, obb, aabb, convexHull, containsPoint };
+export { semiSmooth, bezierSmooth, detectStraight, getCircle, getArc, obb, aabb, convexHull, containsPoint, minNeckWidth };

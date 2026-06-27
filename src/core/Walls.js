@@ -124,6 +124,7 @@ function markCoastSegments(wall, cells) {
 }
 
 function rebuildTowers(wall) {
+	wall.gateTowers = wall.gates.slice();
 	wall.towers = [];
 	// Place a tower if at least one adjacent segment is active (OR logic). Towers at
 	// water/river endpoints are offset inland by the renderer so they sit fully on land.
@@ -215,8 +216,7 @@ export function addObstacleCrossings(cells, wall, river) {
 			const next = wall.shape[(i + 1) % wall.shape.length];
 			if (riverNodes.has(v)) {
 				// River treatment wins: don't place a gate or crossing-gate at a river node.
-				// Add a bridge across the river at the wall, suppress the wall's adjacent
-				// segments (so the wall pulls back to the riverbank), and remove the gate.
+				// If the node was a gate, turn it into a bridge across the river and drop the gate.
 				if (wall.gates.includes(v)) {
 					wall.gates = wall.gates.filter((g) => g !== v);
 					if (river && river.course) {
@@ -227,12 +227,14 @@ export function addObstacleCrossings(cells, wall, river) {
 								: { point: v }
 						);
 					}
-					// suppress both adjacent river-node segments so the renderer pulls the wall
-					// back to the riverbank and places towers (not a gate) at the endpoints.
-					if (wall.segments) {
-						wall.segments[(i + wall.shape.length - 1) % wall.shape.length] = false;
-						wall.segments[i] = false;
-					}
+				}
+				// Always split the wall at a river crossing — gate or not. Suppressing both
+				// adjacent segments stops the wall at the riverbank on each side, so the renderer
+				// places two towers at the riverbank ends instead of running a single tower out
+				// into the water.
+				if (wall.segments) {
+					wall.segments[(i + wall.shape.length - 1) % wall.shape.length] = false;
+					wall.segments[i] = false;
 				}
 				continue;
 			}

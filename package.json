@@ -6,11 +6,6 @@
   "private": true,
   "scripts": {
     "test": "node test/smoke.mjs",
-    "build": "esbuild src/main.js --bundle --format=iife --outfile=dist/app.js",
-    "watch": "esbuild src/main.js --bundle --format=iife --outfile=dist/app.js --watch",
     "serve": "python -m http.server 8000"
-  },
-  "devDependencies": {
-    "esbuild": "^0.28.1"
   }
 }

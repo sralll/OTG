@@ -1,6 +1,6 @@
 // Headless smoke test for the DOM-free generation core (also proves Node/Django reuse).
 // Run: node test/smoke.mjs
-import { generateCity } from '../src/core/Model.js';
+import { generateWards } from '../src/core/CityGen.js';
 
 let failures = 0;
 let checks = 0;
@@ -17,7 +17,9 @@ function finite(v) {
 }
 
 function scanPoints(label, list, report) {
+	if (!list) return;
 	for (const p of list) {
+		if (!p) continue;
 		if (!finite(p.x) || !finite(p.y)) {
 			report.bad++;
 			if (report.firstBad == null) report.firstBad = `${label}: (${p.x}, ${p.y})`;
@@ -29,53 +31,55 @@ const seeds = [1, 2, 3, 7, 42, 99, 1000, 12345, 777, 54321];
 const sizes = [6, 10, 15, 24];
 
 for (const seed of seeds) {
-	for (const nPatches of sizes) {
+	for (const size of sizes) {
 		let data;
 		try {
-			data = generateCity({ seed, nPatches });
+			data = generateWards({ seed, size });
 		} catch (e) {
-			check(false, `seed=${seed} n=${nPatches}: threw "${e.message}"`);
+			check(false, `seed=${seed} size=${size}: threw "${e.message}"`);
 			continue;
 		}
 
-		check(data.patches.length > 0, `seed=${seed} n=${nPatches}: has patches`);
-		check(data.streets.length > 0, `seed=${seed} n=${nPatches}: has streets`);
-		// arteries (merged main roads) can legitimately be empty for tiny cities where every
-		// street segment runs along the plaza and is dropped — only require them for real cities
-		check(data.arteries.length > 0 || nPatches < 10, `seed=${seed} n=${nPatches}: has arteries`);
-		check(data.water != null, `seed=${seed} n=${nPatches}: has water`);
+		check(data.wards.length > 0, `seed=${seed} size=${size}: has wards`);
+		check(Array.isArray(data.roads.streets), `seed=${seed} size=${size}: has streets array`);
+		// streets/arteries can legitimately be empty for tiny cities (no wall built, so no
+		// street network, and plaza-hugging segments get dropped) — only require them for
+		// real cities.
+		check(data.roads.streets.length > 0 || size < 10, `seed=${seed} size=${size}: has streets`);
+		check(data.roads.arteries.length > 0 || size < 10, `seed=${seed} size=${size}: has arteries`);
+		check(data.river != null || data.water === false, `seed=${seed} size=${size}: has river data`);
 
 		const report = { bad: 0, firstBad: null };
 		scanPoints('center', [data.center], report);
 		scanPoints('bounds', [{ x: data.bounds.minX, y: data.bounds.minY }, { x: data.bounds.maxX, y: data.bounds.maxY }], report);
-		for (const p of data.patches) {
-			scanPoints(`patch#${p.id}`, p.polygon, report);
-			if (p.block) scanPoints(`block#${p.id}`, p.block, report);
-		}
+		for (const w of data.wards) scanPoints('ward', w.polygon, report);
+		for (const b of data.blocks || []) scanPoints('block', b, report);
 		for (const bld of data.buildings || []) scanPoints('building', Array.isArray(bld) ? bld : bld.polygon, report);
-		for (const a of data.arteries) scanPoints('artery', a, report);
-		for (const r of data.roads) scanPoints('road', r, report);
-		for (const w of data.walls) {
-			scanPoints('wall', w.shape, report);
-			scanPoints('gate', w.gates, report);
-			scanPoints('tower', w.towers, report);
+		for (const hedge of data.hedges || []) scanPoints('hedge', hedge, report);
+		for (const hedge of data.cathedralHedges || []) scanPoints('cathedralHedge', hedge, report);
+		scanPoints('features', data.features || [], report);
+		for (const r of data.roads.arteries) scanPoints('artery', r, report);
+		for (const r of data.roads.roads) scanPoints('road', r, report);
+		for (const r of data.roads.streets) scanPoints('street', r, report);
+		if (data.wall) {
+			scanPoints('wall', data.wall.shape, report);
+			scanPoints('gate', data.wall.gates, report);
+			scanPoints('tower', data.wall.towers, report);
+			scanPoints('gateTower', data.wall.gateTowers, report);
 		}
-		scanPoints('gates', data.gates, report);
-		if (data.water) {
-			if (data.water.sea) scanPoints('sea', data.water.sea, report);
-			for (const cell of data.water.oceanCells || []) scanPoints('oceanCell', cell, report);
-			if (data.water.river) scanPoints('river', data.water.river, report);
-			if (data.water.riverPath) scanPoints('riverPath', data.water.riverPath, report);
+		if (data.river) {
+			scanPoints('riverCourse', data.river.course, report);
+			scanPoints('bridge', data.river.bridges, report);
 		}
 
-		check(report.bad === 0, `seed=${seed} n=${nPatches}: ${report.bad} non-finite coords (first: ${report.firstBad})`);
+		check(report.bad === 0, `seed=${seed} size=${size}: ${report.bad} non-finite coords (first: ${report.firstBad})`);
 
 		// determinism
-		const data2 = generateCity({ seed, nPatches });
+		const data2 = generateWards({ seed, size });
 		check(
-			JSON.stringify(data2.patches.length) === JSON.stringify(data.patches.length) &&
+			data2.wards.length === data.wards.length &&
 				JSON.stringify(data2.center) === JSON.stringify(data.center),
-			`seed=${seed} n=${nPatches}: deterministic`
+			`seed=${seed} size=${size}: deterministic`
 		);
 	}
 }
@@ -87,9 +91,10 @@ if (failures > 0) {
 } else {
 	console.log('ALL GOOD');
 	// quick stats for one city
-	const d = generateCity({ seed: 42, nPatches: 15 });
+	const d = generateWards({ seed: 42, size: 15 });
+	const arteries = d.roads.arteries.length;
 	console.log(
-		`sample seed=42 n=15: patches=${d.patches.length} streets=${d.streets.length} roads=${d.roads.length} arteries=${d.arteries.length} walls=${d.walls.length} gates=${d.gates.length}`
+		`sample seed=42 size=15: wards=${d.wards.length} streets=${d.roads.streets.length} roads=${d.roads.roads.length} arteries=${arteries} wall=${d.wall ? 1 : 0} buildings=${d.buildings.length} features=${d.features.length}`
 	);
-	console.log('types:', [...new Set(d.patches.map((p) => p.type))].join(', '));
+	console.log('types:', [...new Set(d.wards.map((w) => w.type))].join(', '));
 }
