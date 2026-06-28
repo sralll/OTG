@@ -27,6 +27,18 @@ function scanPoints(label, list, report) {
 	}
 }
 
+function samePoint(a, b) {
+	return Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.y - b.y) < 1e-6;
+}
+
+function builtWallSegmentCount(wall, point) {
+	const i = wall.shape.findIndex((p) => samePoint(p, point));
+	if (i === -1) return 0;
+	const prev = wall.segments[(i + wall.shape.length - 1) % wall.shape.length];
+	const next = wall.segments[i];
+	return (prev ? 1 : 0) + (next ? 1 : 0);
+}
+
 const seeds = [1, 2, 3, 7, 42, 99, 1000, 12345, 777, 54321];
 const sizes = [6, 10, 15, 24];
 
@@ -66,6 +78,7 @@ for (const seed of seeds) {
 			scanPoints('gate', data.wall.gates, report);
 			scanPoints('tower', data.wall.towers, report);
 			scanPoints('gateTower', data.wall.gateTowers, report);
+			for (const gate of data.wall.gates) check(builtWallSegmentCount(data.wall, gate) === 2, `seed=${seed} size=${size}: gate is not on wall end`);
 		}
 		if (data.river) {
 			scanPoints('riverCourse', data.river.course, report);

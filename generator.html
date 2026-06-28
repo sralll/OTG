@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Ward generator (port of MFCG, part 1)</title>
+<title>SOCG</title>
 <style>
 	html, body { margin: 0; height: 100%; overflow: hidden; background: #efe9d8; font-family: -apple-system, "Segoe UI", sans-serif; }
 	#map { width: 100vw; height: 100vh; display: block; touch-action: none; cursor: grab; }
@@ -31,6 +31,9 @@
 	<label>road density <input id="roaddens" type="range" min="0" max="5" step="0.25" value="5" /><span id="roaddensval">5</span></label>
 	<label>gates <input id="gates" type="number" min="-1" max="16" step="1" value="-1" /></label>
 	<label><input id="seeds" type="checkbox" /> seeds</label>
+	<label><input id="obstacles" type="checkbox" /> obstacles</label>
+	<label><input id="routemode" type="checkbox" /> route</label>
+	<button id="clearroute" class="sec">clear route</button>
 	<button id="gen">Generate</button>
 	<button id="fit" class="sec">Fit</button>
 	<span id="status">…</span>
@@ -38,7 +41,11 @@
 <svg id="map" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
 
 <script type="module">
-import { generateWards } from './src/core/CityGen.js?v=24';
+import { generateWards } from './src/core/CityGen.js?v=26';
+import { extractObstacles, thickenPolyline } from './src/core/Obstacles.js?v=5';
+import { buildVisibilityGraph, dilatePolygon } from './src/core/VisibilityGraph.js?v=7';
+
+let visibilityGraph = null;
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const svg = document.getElementById('map');
@@ -56,9 +63,12 @@ const PALETTE = {
 	seed: '#c0392b',
 	block: '#000000',
 	building: '#888888', buildingStroke: '#000000',
-	garden: '#b9f05a', gardenStroke: '#000000',
+	plazaBuilding: '#888888',
+	outerGarden: '#a6b93c',
+	cathedralGround: '#fdc01d',
 	park: '#fdc01d', parkStroke: '#000000',
-	cathedral: '#fdc01d', cathedralStroke: '#000000',
+	largestLotInset: '#c8c8c8',
+	cathedral: '#888888', cathedralStroke: '#000000',
 	cathedralWall: '#000000',
 	hedge: '#009218',
 	alley: '#a99d77',
@@ -523,14 +533,27 @@ function drawBuildings(buildings) {
 		if (!polygon || polygon.length < 3) continue;
 		const cls = Array.isArray(b) ? null : b.class;
 		let fill = PALETTE.building, stroke = PALETTE.buildingStroke;
-		if (cls === 'garden') { fill = PALETTE.garden; stroke = PALETTE.gardenStroke; }
-		else if (cls === 'park') { fill = PALETTE.park; stroke = PALETTE.parkStroke; }
+		if (cls === 'park' || cls === 'outerHighrisePark') { fill = PALETTE.park; stroke = PALETTE.parkStroke; }
+		else if (cls === 'largestLotInset' || cls === 'housingEntranceFill') { fill = PALETTE.largestLotInset; stroke = PALETTE.buildingStroke; }
+		else if (cls === 'outerHighrisePath') { fill = PALETTE.alley; stroke = 'none'; }
+		else if (cls === 'outerGarden') { fill = PALETTE.outerGarden; stroke = PALETTE.outerGarden; }
+		else if (cls === 'outerGardenOutline') { fill = 'none'; stroke = PALETTE.buildingStroke; }
+		else if (cls === 'cathedralGround') { fill = PALETTE.cathedralGround; stroke = PALETTE.parkStroke; }
 		else if (cls === 'cathedral') { fill = PALETTE.cathedral; stroke = PALETTE.cathedralStroke; }
+		else if (cls === 'plazaBuilding') { fill = PALETTE.plazaBuilding; stroke = PALETTE.buildingStroke; }
 		const el = document.createElementNS(SVGNS, 'polygon');
 		el.setAttribute('points', polygon.map((p) => p.x + ',' + p.y).join(' '));
 		el.setAttribute('fill', fill);
 		el.setAttribute('stroke', stroke);
-		if (cls === 'cathedral' || cls === 'park') {
+		if (cls === 'outerGarden') {
+			el.setAttribute('stroke-width', '0');
+		} else if (cls === 'outerHighrisePath') {
+			el.setAttribute('stroke-width', '0');
+		} else if (cls === 'outerGardenOutline') {
+			el.setAttribute('stroke-width', BUILDING_OUTLINE_WIDTH);
+		} else if (cls === 'largestLotInset' || cls === 'housingEntranceFill') {
+			el.setAttribute('stroke-width', BUILDING_OUTLINE_WIDTH / 2);
+		} else if (cls === 'cathedral' || cls === 'cathedralGround' || cls === 'park' || cls === 'outerHighrisePark') {
 			el.setAttribute('stroke-width', BUILDING_OUTLINE_WIDTH/2);
 		} else {
 			el.setAttribute('stroke-width', BUILDING_OUTLINE_WIDTH);
@@ -588,18 +611,55 @@ function drawFeatures(features) {
 	}
 }
 
-function drawAlleys(alleys) {
-	if (!alleys || alleys.length === 0) return;
-	for (const alley of alleys) {
-		if (!alley || alley.length < 2) continue;
-		const el = document.createElementNS(SVGNS, 'polyline');
-		el.setAttribute('points', alley.map((p) => p.x + ',' + p.y).join(' '));
-		el.setAttribute('fill', 'none');
-		el.setAttribute('stroke', PALETTE.alley);
-		el.setAttribute('stroke-width', '0.8');
-		el.setAttribute('stroke-linecap', 'round');
-		el.setAttribute('stroke-linejoin', 'round');
+// Visual-debug overlay of impassable shapes (water, river strip, buildings,
+// gardens, city walls, hedges). Semi-transparent red with a dark outline so it
+// reads on top of the normal symbol render without obscuring layout context.
+function drawObstacles(d) {
+	const { polygons, lines, portals } = extractObstacles(d);
+	const fill = 'rgba(220, 38, 38, 0.45)';
+	const stroke = '#7f1d1d';
+	const sw = 0.18;
+	const drawPoly = (pts, kind) => {
+		const el = document.createElementNS(SVGNS, 'polygon');
+		el.setAttribute('points', pts.map((p) => p.x + ',' + p.y).join(' '));
+		el.setAttribute('fill', fill);
+		el.setAttribute('stroke', stroke);
+		el.setAttribute('stroke-width', sw);
+		el.setAttribute('data-obstacle', kind);
 		vp.appendChild(el);
+	};
+	for (const o of polygons) {
+		if (o.polygon && o.polygon.length >= 3) drawPoly(o.polygon, o.kind);
+	}
+	for (const ln of lines) {
+		const strip = thickenPolyline(ln.polyline, ln.thickness);
+		if (strip && strip.length >= 3) drawPoly(strip, ln.kind);
+	}
+	// Portals: green so it's obvious which crossings stay passable through the
+	// red obstacle overlay. Bridges / docks are drawn as the connecting segment
+	// from shore to shore; gate towers are drawn as a hollow ring.
+	const portalStroke = '#15803d';
+	const portalFill = 'rgba(34, 197, 94, 0.55)';
+	for (const p of portals) {
+		if (p.kind === 'gate') {
+			const el = document.createElementNS(SVGNS, 'circle');
+			el.setAttribute('cx', p.center.x);
+			el.setAttribute('cy', p.center.y);
+			el.setAttribute('r', p.radius);
+			el.setAttribute('fill', portalFill);
+			el.setAttribute('stroke', portalStroke);
+			el.setAttribute('stroke-width', 0.25);
+			el.setAttribute('data-portal', p.kind);
+			vp.appendChild(el);
+		} else if (p.polygon && p.polygon.length >= 3) {
+			const el = document.createElementNS(SVGNS, 'polygon');
+			el.setAttribute('points', p.polygon.map((q) => q.x + ',' + q.y).join(' '));
+			el.setAttribute('fill', portalFill);
+			el.setAttribute('stroke', portalStroke);
+			el.setAttribute('stroke-width', 0.25);
+			el.setAttribute('data-portal', p.kind);
+			vp.appendChild(el);
+		}
 	}
 }
 
@@ -662,6 +722,7 @@ function render(d) {
 	if (d.river && d.river.course) for (const v of d.river.course) riverNodeSet.add(v);
 	drawWall(d.wall, d.river && d.river.width, riverNodeSet);
 	drawFeatures(d.features);
+	if ($('obstacles').checked) drawObstacles(d);
 	if ($('seeds').checked) {
 		// approximate seed markers at ward centroids (the real seeds aren't kept in output)
 		for (const w of d.wards) {
@@ -710,6 +771,20 @@ function generate() {
 		render(data);
 		statusEl.textContent += ` · ${(performance.now() - t0).toFixed(0)}ms`;
 	} catch (e) { statusEl.textContent = 'error: ' + e.message; }
+	routeEndpoints = [];
+	// Build the visibility graph scaffolding from the obstacle map (separate
+	// timer from the ward-generation timer above). Edges are computed lazily
+	// at query time, so this measures ONLY the upfront scaffolding cost (node
+	// flattening + spatial indices + LOS oracle).
+	const vgStart = performance.now();
+	try {
+		const obstacles = extractObstacles(data);
+		visibilityGraph = buildVisibilityGraph(obstacles, { clearance: 0.2 });
+		console.log(`Visibility graph scaffolding built in ${(performance.now() - vgStart).toFixed(1)} ms · ${visibilityGraph.nodeCount} nodes · ${visibilityGraph.blockerCount} blocker edges · edges computed lazily (${visibilityGraph.neighborRing}-cell ring)`);
+	} catch (e) {
+		visibilityGraph = null;
+		console.error('Visibility graph build failed:', e);
+	}
 	const endTime = performance.now();
 	console.log(`Generation took ${endTime - startTime} milliseconds`);
 }
@@ -745,6 +820,90 @@ const up = (e) => { pts.delete(e.pointerId); reset(); if (pts.size === 0) svg.st
 svg.addEventListener('pointerup', up); svg.addEventListener('pointercancel', up);
 svg.addEventListener('wheel', (e) => { e.preventDefault(); const r = svg.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top, f = e.deltaY < 0 ? 1.1 : 1 / 1.1; tx = sx - (sx - tx) * f; ty = sy - (sy - ty) * f; scale *= f; apply(); }, { passive: false });
 
+// ---- Route placement (when #routemode is checked) ----
+// Click on the SVG places start (1st click) then goal (2nd click); the fastest
+// route between them is drawn via the visibility graph. Double-click clears all.
+let routeEndpoints = [];
+function screenToWorld(clientX, clientY) {
+	const r = svg.getBoundingClientRect();
+	const sx = clientX - r.left, sy = clientY - r.top;
+	return { x: (sx - tx) / scale, y: (sy - ty) / scale };
+}
+function drawRouteLayer() {
+	const layer = document.getElementById('routeLayer');
+	if (layer) layer.remove();
+	if (routeEndpoints.length === 0) return;
+	const g = document.createElementNS(SVGNS, 'g');
+	g.id = 'routeLayer';
+	g.setAttribute('pointer-events', 'none');
+	const STROKE = '#d12b2b', MARK = '#d12b2b';
+	for (const p of routeEndpoints) {
+		const c = document.createElementNS(SVGNS, 'circle');
+		c.setAttribute('cx', p.x); c.setAttribute('cy', p.y);
+		c.setAttribute('r', 0.6); c.setAttribute('fill', MARK);
+		c.setAttribute('stroke', '#000'); c.setAttribute('stroke-width', 0.1);
+		g.appendChild(c);
+	}
+	if (routeEndpoints.length === 2 && visibilityGraph) {
+		const t0 = performance.now();
+		const result = visibilityGraph.astar(routeEndpoints[0], routeEndpoints[1]);
+		const dt = performance.now() - t0;
+		if (result && result.path.length >= 2) {
+			const pts = result.path.map(p => `${p.x},${p.y}`).join(' ');
+			const poly = document.createElementNS(SVGNS, 'polyline');
+			poly.setAttribute('points', pts);
+			poly.setAttribute('fill', 'none');
+			poly.setAttribute('stroke', STROKE);
+			poly.setAttribute('stroke-width', 0.3);
+			poly.setAttribute('stroke-linejoin', 'round');
+			poly.setAttribute('stroke-linecap', 'round');
+			g.appendChild(poly);
+			const len = result.path.reduce((a, p, i, arr) => i ? a + Math.hypot(p.x - arr[i - 1].x, p.y - arr[i - 1].y) : 0, 0);
+			console.log(`route: ${result.path.length} hops · len=${len.toFixed(2)} · ${result.iterations} iters · ${dt.toFixed(2)}ms`);
+		} else {
+			console.log(`route: no path found · ${dt.toFixed(2)}ms`);
+		}
+	}
+	vp.appendChild(g);
+}
+svg.addEventListener('click', (e) => {
+	if (!$('routemode').checked) return;
+	if (e.detail > 2) return; // triple+ clicks: ignore
+	const w = screenToWorld(e.clientX, e.clientY);
+	if (routeEndpoints.length >= 2) routeEndpoints = [];
+	routeEndpoints.push(w);
+	const label = routeEndpoints.length === 1 ? 'start' : 'goal';
+	console.log(`route ${label}: x=${w.x.toFixed(6)}, y=${w.y.toFixed(6)}`, { x: w.x, y: w.y });
+	if (routeEndpoints.length === 2) {
+		console.log('route example:', {
+			seed: $('seed').value,
+			size: parseFloat($('size').value) || 15,
+			options: {
+				coast: $('coast').checked,
+				river: $('river').checked,
+				walls: $('walls').checked,
+				streets: $('streets').checked,
+				outerRatio: parseFloat($('outerratio').value) || 8,
+				roadDensity: parseFloat($('roaddens').value) || 0,
+				gates: parseInt($('gates').value, 10),
+			},
+			start: routeEndpoints[0],
+			goal: routeEndpoints[1],
+		});
+	}
+	drawRouteLayer();
+});
+svg.addEventListener('dblclick', () => {
+	if (!$('routemode').checked) return;
+	routeEndpoints = [];
+	drawRouteLayer();
+});
+$('routemode').onchange = () => {
+	svg.style.cursor = $('routemode').checked ? 'crosshair' : 'grab';
+	if (!$('routemode').checked) { routeEndpoints = []; drawRouteLayer(); }
+};
+$('clearroute').onclick = () => { routeEndpoints = []; drawRouteLayer(); };
+
 $('gen').onclick = generate;
 $('fit').onclick = () => fit();
 $('rnd').onclick = () => { $('seed').value = Math.floor(Math.random() * 2147483646) + 1; generate(); };
@@ -758,7 +917,8 @@ $('walls').onchange = generate;
 $('streets').onchange = generate;
 $('gates').onchange = generate;
 $('gates').oninput = generate;
-$('seeds').onchange = () => { if (data) render(data); };
+$('seeds').onchange = () => { if (data) render(data); drawRouteLayer(); };
+$('obstacles').onchange = () => { if (data) render(data); drawRouteLayer(); };
 generate();
 </script>
 </body>

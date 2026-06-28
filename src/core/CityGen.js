@@ -14,11 +14,20 @@ import { Polygon } from './Polygon.js';
 import { Voronoi } from './Voronoi.js';
 import { makeFractal } from './Noise.js';
 import { buildRiver, smoothShore } from './River.js';
-import { addObstacleCrossings, buildCityWall, suppressWallSegmentsOnRiver } from './Walls.js';
+import { addObstacleCrossings, buildCityWall, displaceWallTowers, suppressWallSegmentsOnRiver } from './Walls.js?v=2';
 import { buildStreets } from './Streets.js';
 import { buildDocks } from './Docks.js';
 import { amin, remove } from './arrays.js';
-import { cathedralRate, createCathedralGeometry, createCommonWardGeometry, createParkGeometry, marketRate, OPEN_TYPES } from './wards.js';
+import {
+	cathedralRate,
+	createCathedralGeometry,
+	createCommonWardGeometry,
+	createOuterGardenGeometry,
+	createOuterHighriseGeometry,
+	createParkGeometry,
+	marketRate,
+	OPEN_TYPES,
+} from './wards.js';
 import { clearFeatures, recordFeature, takeFeatures } from './features.js';
 
 // reference constant: pc.LTOWER_RADIUS = 2.5 (used as the junction-merge floor 3*LTOWER_RADIUS)
@@ -412,6 +421,64 @@ function pointPolygonDistance(point, poly) {
 	return best;
 }
 
+function pointOnSegment(a, b, t) {
+	return new Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+}
+
+function polygonFitsInside(poly, candidate, step = 0.7, clearance = 0) {
+	if (!poly || !candidate || candidate.length < 3) return false;
+	const pointFits = (p) => pointInPolygon(p, poly) && (!(clearance > 0) || pointPolygonDistance(p, poly) >= clearance);
+	for (const p of candidate) if (!pointFits(p)) return false;
+	for (let i = 0; i < candidate.length; i++) {
+		const a = candidate[i];
+		const b = candidate[(i + 1) % candidate.length];
+		const len = Point.distance(a, b);
+		const samples = Math.max(1, Math.ceil(len / step));
+		for (let j = 1; j < samples; j++) {
+			if (!pointFits(pointOnSegment(a, b, j / samples))) return false;
+		}
+	}
+	return true;
+}
+
+function orientedRect(center, axis, halfLen, halfWid) {
+	const perp = new Point(-axis.y, axis.x);
+	return new Polygon([
+		new Point(center.x - axis.x * halfLen - perp.x * halfWid, center.y - axis.y * halfLen - perp.y * halfWid),
+		new Point(center.x + axis.x * halfLen - perp.x * halfWid, center.y + axis.y * halfLen - perp.y * halfWid),
+		new Point(center.x + axis.x * halfLen + perp.x * halfWid, center.y + axis.y * halfLen + perp.y * halfWid),
+		new Point(center.x - axis.x * halfLen + perp.x * halfWid, center.y - axis.y * halfLen + perp.y * halfWid),
+	]);
+}
+
+function projectionExtents(poly, center, dir) {
+	let min = Infinity;
+	let max = -Infinity;
+	for (const p of poly) {
+		const t = (p.x - center.x) * dir.x + (p.y - center.y) * dir.y;
+		if (t < min) min = t;
+		if (t > max) max = t;
+	}
+	return { min, max };
+}
+
+function longestEdgeAxis(poly) {
+	let best = null;
+	let bestLen = -Infinity;
+	for (let i = 0; i < poly.length; i++) {
+		const a = poly[i];
+		const b = poly[(i + 1) % poly.length];
+		const dx = b.x - a.x;
+		const dy = b.y - a.y;
+		const len = Math.hypot(dx, dy);
+		if (len > bestLen) {
+			bestLen = len;
+			best = len > 1e-6 ? new Point(dx / len, dy / len) : null;
+		}
+	}
+	return best;
+}
+
 function chaikinSmooth(pts, iterations) {
 	if (!pts || pts.length < 3) return pts || [];
 	let a = pts;
@@ -641,6 +708,55 @@ function addPlazaTreeRings(plaza, riverData) {
 	Random.reset(saved);
 }
 
+function createPlazaBuilding(plaza, riverData) {
+	if (!plaza || !plaza.shape || plaza.shape.length < 3) return null;
+	const area = Math.abs(plaza.shape.square);
+	if (!(area > 0)) return null;
+
+	const axis = longestEdgeAxis(plaza.shape);
+	if (!axis) return null;
+
+	const scale = Math.sqrt(area);
+	const inset = Math.max(2.0, Math.min(4.0, scale * 0.13));
+	const base = plaza.shape.shrinkRobust(inset) || plaza.shape.shrinkEq(inset);
+	const plazaCenter = plaza.shape.centroid;
+	const riverClipped = clipPlazaFromRiver(base, plaza.shape, riverData);
+	const candidates = [];
+	if (riverClipped && pointInPolygon(plazaCenter, riverClipped)) candidates.push(riverClipped);
+	if (base) candidates.push(base);
+
+	for (const usable of candidates) {
+		if (!usable || usable.length < 3 || Math.abs(usable.square) < area * 0.08) continue;
+
+		let center = plazaCenter;
+		if (!pointInPolygon(center, usable)) center = usable.centroid;
+		if (!pointInPolygon(center, usable)) center = usable.center;
+		if (!pointInPolygon(center, usable)) continue;
+
+		const perp = new Point(-axis.y, axis.x);
+		const along = projectionExtents(usable, center, axis);
+		const across = projectionExtents(usable, center, perp);
+		const halfAlong = Math.min(along.max, -along.min);
+		const halfAcross = Math.min(across.max, -across.min);
+		if (!(halfAlong > 0.9 && halfAcross > 0.45)) continue;
+
+		let halfLen = Math.min(halfAlong * 0.42, scale * 0.17);
+		let halfWid = Math.min(halfAcross * 0.38, scale * 0.065, halfLen * 0.42);
+		for (let attempt = 0; attempt < 6; attempt++) {
+			if (halfLen < 0.9 || halfWid < 0.38) break;
+			const footprint = orientedRect(center, axis, halfLen, halfWid);
+			if (polygonFitsInside(usable, footprint, 0.45)) {
+				footprint.class = 'plazaBuilding';
+				return footprint;
+			}
+			halfLen *= 0.86;
+			halfWid *= 0.86;
+		}
+	}
+
+	return null;
+}
+
 function buildBuildings(cells, inner, center, wallData, streetData, riverData, plazaEnabled) {
 	if (!inner || inner.length === 0 || !center) return { blocks: [], buildings: [], alleys: [], hedges: [], wardTypes: new Map() };
 
@@ -710,7 +826,7 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 	for (const p of unassigned) if (p.type == null) p.type = 'generic';
 	for (const p of patches) {
 		if (!p.withinCity && !p.isWater && p.type == null)
-			p.type = Random.bool(0.2) && p.shape.compactness >= 0.7 ? 'farm' : 'generic';
+			p.type = p.shape.centroid.y < center.y ? 'outerGarden' : 'outerHighrise';
 		if (p.type == null) p.type = 'generic';
 	}
 	for (const p of innerPatches)
@@ -743,19 +859,32 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 	const hedges = [];
 	const cathedralHedges = [];
 	for (const p of patches) {
+		if (p.type === 'plaza' && p.withinCity) {
+			const plazaBuilding = createPlazaBuilding(p, riverData);
+			if (plazaBuilding) buildings.push(plazaBuilding);
+		}
 		if (OPEN_TYPES.has(p.type) || p.isWater) continue;
 		const avail = computeAvailableArea(p.shape, ctx);
 		if (avail && avail.length >= 3) {
 			p.block = avail;
 			blocks.push(avail);
-		if ((p.type === 'generic' || p.type === 'gate') && p.withinCity) {
-			for (const b of createCommonWardGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
-			if (p.alleys) alleys.push(...p.alleys);
-		} else if (p.type === 'cathedral' && p.withinCity) {
-			for (const b of createCathedralGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
-			if (p.cathedralHedges) cathedralHedges.push(...p.cathedralHedges);
-		} else if (p.type === 'park' && p.withinCity) {
+			if ((p.type === 'generic' || p.type === 'gate') && p.withinCity) {
+				for (const b of createCommonWardGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				if (p.alleys) alleys.push(...p.alleys);
+			} else if (p.type === 'cathedral' && p.withinCity) {
+				for (const b of createCathedralGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				if (p.alleys) alleys.push(...p.alleys);
+				if (p.cathedralHedges) cathedralHedges.push(...p.cathedralHedges);
+			} else if (p.type === 'park' && p.withinCity) {
 				for (const b of createParkGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				if (p.hedges) hedges.push(...p.hedges);
+			} else if (p.type === 'outerGarden' && !p.withinCity) {
+				for (const b of createOuterGardenGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				if (p.hedges) hedges.push(...p.hedges);
+				if (p.cathedralHedges) cathedralHedges.push(...p.cathedralHedges);
+			} else if (p.type === 'outerHighrise' && !p.withinCity) {
+				for (const b of createOuterHighriseGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				if (p.alleys) alleys.push(...p.alleys);
 				if (p.hedges) hedges.push(...p.hedges);
 			}
 		}
@@ -805,6 +934,7 @@ export function generateWards(params = {}) {
 			const riverData = river && center ? buildRiver(cells, center, { innerCells: inner }) : null;
 			if (wallData && riverData) suppressWallSegmentsOnRiver(wallData, riverData);
 			if (wallData || riverData) addObstacleCrossings(cells, wallData, riverData);
+			if (wallData && riverData) displaceWallTowers(wallData, riverData);
 			const dockData = buildDocks(cells, inner, { river: riverData });
 			if (inner.length >= Math.min(size, 4)) result = { cells, b, inner, center, river: riverData, wall: wallData, streets: streetData, docks: dockData };
 		} catch (e) {

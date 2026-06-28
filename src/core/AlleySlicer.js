@@ -342,6 +342,69 @@ function insetCutChainEdges(half, start, count, gap) {
 	return result;
 }
 
+function offsetCutChainEdges(half, start, count, gap) {
+	if (!half || half.length < 3 || !(gap > 0) || count <= 0) return half;
+	const n = half.length;
+	const area0 = Math.abs(half.square);
+	const rotated = half.slice(start).concat(half.slice(0, start));
+	if (count >= rotated.length) return half;
+
+	const d = gap / 2;
+	const areaSign = half.square >= 0 ? 1 : -1;
+	const lines = [];
+	for (let i = 0; i < count; i++) {
+		const a = rotated[i];
+		const b = rotated[i + 1];
+		const dx = b.x - a.x;
+		const dy = b.y - a.y;
+		const len = Math.hypot(dx, dy);
+		if (len < 1e-9) return half;
+		const nx = (-dy / len) * d * areaSign;
+		const ny = (dx / len) * d * areaSign;
+		lines.push({ p: new Point(a.x + nx, a.y + ny), dx, dy, nx, ny });
+	}
+
+	const offset = [new Point(rotated[0].x + lines[0].nx, rotated[0].y + lines[0].ny)];
+	for (let i = 1; i < count; i++) {
+		const prev = lines[i - 1];
+		const next = lines[i];
+		const hit = GeomUtils.intersectLines(prev.p.x, prev.p.y, prev.dx, prev.dy, next.p.x, next.p.y, next.dx, next.dy);
+		const original = rotated[i];
+		let p = hit ? new Point(prev.p.x + prev.dx * hit.x, prev.p.y + prev.dy * hit.x) : null;
+		if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) || Point.distance(original, p) > gap * 3) {
+			p = new Point(
+				original.x + (prev.nx + next.nx) / 2,
+				original.y + (prev.ny + next.ny) / 2
+			);
+		}
+		offset.push(p);
+	}
+	const last = lines[lines.length - 1];
+	offset.push(new Point(rotated[count].x + last.nx, rotated[count].y + last.ny));
+
+	const result = new Polygon(offset.concat(rotated.slice(count + 1)));
+	if (
+		!result ||
+		result.length < 3 ||
+		!result.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)) ||
+		Math.abs(result.square) < area0 * 0.15
+	) return half;
+	return result;
+}
+
+export function slicePolygonAlongElbow(poly, entryEdge, exitEdge, cut, gap = 0) {
+	if (!poly || poly.length < 3 || !cut || cut.length < 2) return { lots: poly ? [new Polygon(poly)] : [], alley: cut || [] };
+	if (entryEdge === exitEdge || entryEdge < 0 || exitEdge < 0 || entryEdge >= poly.length || exitEdge >= poly.length)
+		return { lots: [new Polygon(poly)], alley: cut };
+
+	const split = splitAlong(poly, entryEdge, exitEdge, cut);
+	let lots = split.halves;
+	if (gap > 0) {
+		lots = lots.map((lot, i) => offsetCutChainEdges(lot, split.ranges[i].start, split.ranges[i].count, gap));
+	}
+	return { lots: lots.filter((lot) => lot && lot.length >= 3), alley: cut };
+}
+
 // OBB for a given unit direction: axis-aligned bounding box in the h/k frame, returned
 // as 4 world-space corners (BL, BR, TR, TL) — same format as Gb.obb/aabb.
 function orientedAABB(pts, hDir) {
@@ -784,23 +847,67 @@ function chamferLots(lots, minAngle, size, edgeFrac) {
 	});
 }
 
-// In ~`prob` of lots, set back ONE side deeper than the rest: peel a single random edge by an
-// extra normal-random amount, scaled to up to double the usual gap/2 inset (mean ~the usual,
-// ranging 0..~gap). Gives some buildings a larger yard/setback on one side instead of a uniform
-// alley gap all around. Applied AFTER the uniform shrink; the neckFloor safety net downstream
-// drops any lot the deeper peel pinches into a hairline waist.
-function shrinkOneSideDeeper(lot, gap, prob) {
+// In ~`prob` of lots, set back ONE side deeper than the rest: clip a single random edge inward
+// by an extra normal-random amount, scaled to up to double the usual gap/2 inset (mean ~the
+// usual, ranging 0..~gap). If that would leave a tiny remnant, keep the uniformly-shrunk lot.
+function shrinkOneSideDeeper(lot, gap, prob, minArea = 0) {
 	if (!lot || lot.length < 3 || !(gap > 0) || !(prob > 0)) return lot;
 	if (!Random.bool(prob)) return lot;
 	const idx = Random.int(0, lot.length);
 	const extra = Random.normal() * gap; // mean ~gap/2 (the usual distance), up to ~gap (double)
 	if (!(extra > 1e-6)) return lot;
 	const area0 = Math.abs(lot.square);
+	const width0 = lotMinWidth(lot);
+	if (!(width0 > gap * 1.5)) return lot;
+	const distance = Math.min(extra, width0 * 0.22);
+	if (!(distance > 1e-6)) return lot;
 	try {
-		const peeled = lot.peel(lot[idx], extra);
-		if (peeled && peeled.length >= 3 && Math.abs(peeled.square) > area0 * 0.2) return peeled;
+		const clipped = clipOneSideInset(lot, idx, distance);
+		if (
+			clipped &&
+			clipped.length >= 3 &&
+			clipped.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)) &&
+			Math.abs(clipped.square) > Math.max(area0 * 0.72, minArea > 0 ? minArea * 0.75 : 0) &&
+			lotMinWidth(clipped) > Math.max(gap * 0.55, width0 * 0.45)
+		) return clipped;
 	} catch (e) { /* keep the uniformly-shrunk lot */ }
 	return lot;
+}
+
+function clipOneSideInset(lot, edgeIndex, distance) {
+	const n = lot.length;
+	if (n < 3 || !(distance > 0)) return lot;
+	const a = lot[edgeIndex];
+	const b = lot[(edgeIndex + 1) % n];
+	const dx = b.x - a.x;
+	const dy = b.y - a.y;
+	const len = Math.hypot(dx, dy);
+	const areaSign = lot.square >= 0 ? 1 : -1;
+	if (len < 1e-9) return lot;
+
+	const ax = a.x + (-dy / len) * distance * areaSign;
+	const ay = a.y + (dx / len) * distance * areaSign;
+	const inside = (p) => (dx * (p.y - ay) - dy * (p.x - ax)) * areaSign >= -1e-7;
+	const intersect = (p, q) => {
+		const sx = q.x - p.x;
+		const sy = q.y - p.y;
+		const t = GeomUtils.intersectLines(ax, ay, dx, dy, p.x, p.y, sx, sy);
+		if (!t) return p;
+		return new Point(p.x + sx * t.y, p.y + sy * t.y);
+	};
+
+	const out = [];
+	let prev = lot[n - 1];
+	let prevInside = inside(prev);
+	for (let i = 0; i < n; i++) {
+		const cur = lot[i];
+		const curInside = inside(cur);
+		if (curInside !== prevInside) out.push(intersect(prev, cur));
+		if (curInside) out.push(cur);
+		prev = cur;
+		prevInside = curInside;
+	}
+	return new Polygon(out);
 }
 
 // Distance from point p to segment [a, b].
@@ -1011,6 +1118,7 @@ export function sliceWardEdgeElbows(block, params = {}) {
 
 	if (gap > 0) {
 		const oneSideProb = params.oneSideSetbackProb != null ? params.oneSideSetbackProb : 0.5;
+		const saved = Random.getSeed();
 		lots = lots.map((lot) => {
 			if (!lot || lot.length < 3) return lot;
 			const area0 = Math.abs(lot.square);
@@ -1019,8 +1127,11 @@ export function sliceWardEdgeElbows(block, params = {}) {
 				const shrunk = lot.shrinkRobust(gap / 2);
 				if (shrunk && shrunk.length >= 3 && Math.abs(shrunk.square) > area0 * 0.15) shrunkLot = shrunk;
 			} catch (e) { /* fall back to full-size lot */ }
-			return shrinkOneSideDeeper(shrunkLot, gap, oneSideProb);
+			return shrinkOneSideDeeper(shrunkLot, gap, oneSideProb, params.minLotArea || 0);
 		});
+		// Variable setbacks are a local shape detail; they must not change the random stream for
+		// later wards, or unrelated alley cuts can differ and appear as missing lots.
+		Random.reset(saved);
 	}
 
 	// TEMP: keep lots even when the variable one-sided setback makes a thin neck. Re-enable once

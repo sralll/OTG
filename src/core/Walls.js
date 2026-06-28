@@ -124,15 +124,55 @@ function markCoastSegments(wall, cells) {
 }
 
 function rebuildTowers(wall) {
+	const builtSegmentCount = (i) => {
+		const prev = wall.segments[(i + wall.shape.length - 1) % wall.shape.length];
+		const next = wall.segments[i];
+		return (prev ? 1 : 0) + (next ? 1 : 0);
+	};
+	const gateSet = new Set(wall.gates.filter((gate) => builtSegmentCount(wall.shape.indexOf(gate)) === 2));
+	wall.gates = wall.gates.filter((gate) => gateSet.has(gate));
+	if (wall.crossingGates) wall.crossingGates = wall.crossingGates.filter((gate) => gateSet.has(gate));
 	wall.gateTowers = wall.gates.slice();
 	wall.towers = [];
 	// Place a tower if at least one adjacent segment is active (OR logic). Towers at
 	// water/river endpoints are offset inland by the renderer so they sit fully on land.
 	for (let i = 0; i < wall.shape.length; i++) {
-		const prev = wall.segments[(i + wall.shape.length - 1) % wall.shape.length];
-		const next = wall.segments[i];
-		if (!wall.gates.includes(wall.shape[i]) && (prev || next)) wall.towers.push(wall.shape[i]);
+		if (!gateSet.has(wall.shape[i]) && builtSegmentCount(i) > 0) wall.towers.push(wall.shape[i]);
 	}
+}
+
+// Replace tower / gate-tower references with NEW point objects pulled back from
+// the original shape vertex along the active wall segment, by the same halfRiver
+// the renderer uses. Mirrors the pull-back logic in generator.html `drawWall` so
+// the data position agrees with what's drawn. We allocate new {x,y} objects (not
+// mutate the shape vertices, which are shared with adjacent wards).
+//
+// Rules per shape vertex i:
+//   prev = segments[i-1], next = segments[i]
+//   if (!prev && next)  -> at start of next segment, pull toward shape[i+1]
+//   if (prev && !next)  -> at   end of prev segment, pull toward shape[i-1]
+//   else                -> no displacement (interior junction or no tower at all)
+export function displaceWallTowers(wall, river) {
+	if (!wall || !wall.shape || !wall.segments || !river || !(river.width > 0)) return;
+	const halfRiver = river.width / 2;
+	const n = wall.shape.length;
+	const segs = wall.segments;
+	const displaced = new Map();
+	for (let i = 0; i < n; i++) {
+		const prev = segs[(i + n - 1) % n];
+		const next = segs[i];
+		let neighbour = null;
+		if (!prev && next) neighbour = wall.shape[(i + 1) % n];
+		else if (prev && !next) neighbour = wall.shape[(i + n - 1) % n];
+		else continue;
+		const v = wall.shape[i];
+		const dx = neighbour.x - v.x, dy = neighbour.y - v.y;
+		const len = Math.hypot(dx, dy) || 1;
+		displaced.set(v, { x: v.x + (dx / len) * halfRiver, y: v.y + (dy / len) * halfRiver });
+	}
+	const remap = (arr) => arr.map((t) => displaced.get(t) || t);
+	if (wall.towers) wall.towers = remap(wall.towers);
+	if (wall.gateTowers) wall.gateTowers = remap(wall.gateTowers);
 }
 
 export function suppressWallSegmentsOnRiver(wall, river) {

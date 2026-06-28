@@ -10,7 +10,7 @@ import { GeomUtils } from './GeomUtils.js';
 import { Random } from './Random.js';
 import { Cutter } from './Cutter.js';
 import { amin } from './arrays.js';
-import { sliceWardEdgeElbows, sliceWard, minNeckWidth } from './AlleySlicer.js';
+import { sliceWardEdgeElbows, sliceWard, minNeckWidth, slicePolygonAlongElbow } from './AlleySlicer.js';
 import { recordFeature, recordRemovedTriangle } from './features.js';
 
 // Open patch types are kept as open space (no shrunken block). 'water' included so water
@@ -692,6 +692,310 @@ function filterOutskirts(model, patch, geometry) {
 	});
 }
 
+function isConvexCorner(poly, i) {
+	if (!poly || poly.length < 3) return false;
+	const n = poly.length;
+	const prev = poly[(i + n - 1) % n];
+	const cur = poly[i];
+	const next = poly[(i + 1) % n];
+	const ux = cur.x - prev.x;
+	const uy = cur.y - prev.y;
+	const vx = next.x - cur.x;
+	const vy = next.y - cur.y;
+	const turn = ux * vy - uy * vx;
+	const sign = poly.square >= 0 ? 1 : -1;
+	return turn * sign > 1e-7;
+}
+
+function convexCornerEdgeIndices(poly, minLength = 1e-6) {
+	const edges = [];
+	if (!poly || poly.length < 3) return edges;
+	for (let i = 0; i < poly.length; i++) {
+		if (!isConvexCorner(poly, i) || !isConvexCorner(poly, (i + 1) % poly.length)) continue;
+		if (Point.distance(poly[i], poly[(i + 1) % poly.length]) < minLength) continue;
+		edges.push(i);
+	}
+	for (let i = edges.length - 1; i > 0; i--) {
+		const j = Random.int(0, i + 1);
+		const t = edges[i];
+		edges[i] = edges[j];
+		edges[j] = t;
+	}
+	return edges;
+}
+
+function compactPolygonPoints(points) {
+	const out = [];
+	for (const p of points) {
+		if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+		const last = out[out.length - 1];
+		if (!last || Point.distance(last, p) > 1e-6) out.push(p);
+	}
+	if (out.length > 1 && Point.distance(out[0], out[out.length - 1]) <= 1e-6) out.pop();
+	return out;
+}
+
+function clipOneSideWithInsetShape(lot, a, b, side, distance) {
+	const n = lot.length;
+	if (n < 3 || !(distance > 0)) return null;
+	const signed = (p) => side * lineSignedDistance(a, b, p) - distance;
+	const intersection = (p, q, dp, dq) => {
+		const t = -dp / ((dq - dp) || 1e-12);
+		return new Point(p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t);
+	};
+
+	const kept = [];
+	const removed = [];
+	let prev = lot[n - 1];
+	let prevD = signed(prev);
+	let prevKept = prevD >= -1e-6;
+
+	for (let i = 0; i < n; i++) {
+		const cur = lot[i];
+		const curD = signed(cur);
+		const curKept = curD >= -1e-6;
+		const curRemoved = curD <= 1e-6;
+		if (curKept !== prevKept) {
+			const hit = intersection(prev, cur, prevD, curD);
+			kept.push(hit);
+			removed.push(hit);
+		}
+		if (curKept) kept.push(cur);
+		if (curRemoved) removed.push(cur);
+		prev = cur;
+		prevD = curD;
+		prevKept = curKept;
+	}
+
+	const insetLot = new Polygon(compactPolygonPoints(kept));
+	const insetShape = new Polygon(compactPolygonPoints(removed));
+	if (insetLot.length < 3 || insetShape.length < 3) return null;
+	return { insetLot, insetShape };
+}
+
+function markEntranceExcludedEdge(poly, sourceA, sourceB, side, distance) {
+	if (!poly || poly.length < 3) return;
+	let bestIndex = -1;
+	let bestLen = -Infinity;
+	for (let i = 0; i < poly.length; i++) {
+		const a = poly[i];
+		const b = poly[(i + 1) % poly.length];
+		const da = Math.abs(side * lineSignedDistance(sourceA, sourceB, a) - distance);
+		const db = Math.abs(side * lineSignedDistance(sourceA, sourceB, b) - distance);
+		const len = Point.distance(a, b);
+		if (da < 1e-5 && db < 1e-5 && len > bestLen) {
+			bestIndex = i;
+			bestLen = len;
+		}
+	}
+	if (bestIndex !== -1) poly.noEntranceEdges = new Set([bestIndex]);
+}
+
+function entranceFillPolygon(p1, q1, q2, p2) {
+	const fill = new Polygon([p1.clone(), q1.clone(), q2.clone(), p2.clone()]);
+	fill.class = 'housingEntranceFill';
+	return fill;
+}
+
+function entranceNotchFits(lot, p1, q1, q2, p2, alley) {
+	const midInner = new Point((q1.x + q2.x) / 2, (q1.y + q2.y) / 2);
+	const samples = [
+		q1, q2, midInner,
+		new Point((p1.x + q1.x) / 2, (p1.y + q1.y) / 2),
+		new Point((p2.x + q2.x) / 2, (p2.y + q2.y) / 2),
+	];
+	for (const p of samples) {
+		if (!pointInPolygon(p, lot)) return false;
+		if (pointPolygonDistance(p, lot) < Math.max(0.04, alley * 0.05)) return false;
+	}
+	return true;
+}
+
+function buildLotWithEntrancePlans(lot, plans, alley, area0) {
+	const out = new Polygon();
+	const byEdge = new Map();
+	for (const plan of plans) {
+		if (!byEdge.has(plan.edgeIndex)) byEdge.set(plan.edgeIndex, []);
+		byEdge.get(plan.edgeIndex).push(plan);
+	}
+	for (const list of byEdge.values()) list.sort((a, b) => a.start - b.start);
+
+	for (let i = 0; i < lot.length; i++) {
+		out.push(lot[i]);
+		const edgePlans = byEdge.get(i);
+		if (edgePlans) {
+			for (const plan of edgePlans) {
+				out.push(plan.p1);
+				out.push(plan.q1);
+				out.push(plan.q2);
+				out.push(plan.p2);
+			}
+		}
+	}
+	const cleaned = new Polygon(compactPolygonPoints(out));
+	if (lot.class) cleaned.class = lot.class;
+	if (lot.noEntranceEdges) cleaned.noEntranceEdges = new Set(Array.from(lot.noEntranceEdges));
+	if (cleaned.length < lot.length + 2) return false;
+	if (!cleaned.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y))) return false;
+	if (Math.sign(cleaned.square) !== Math.sign(lot.square)) return false;
+	if (Math.abs(cleaned.square) < area0 * 0.48) return false;
+	if (minNeckWidth(cleaned) < Math.max(0.28, alley * 0.42)) return false;
+	return cleaned;
+}
+
+function intervalOverlaps(intervals, lo, hi, gap) {
+	for (const [a, b] of intervals) {
+		if (lo < b + gap && hi > a - gap) return true;
+	}
+	return false;
+}
+
+function makeEntrancePlan(lot, edgeIndex, start, width, depth) {
+	const a = lot[edgeIndex];
+	const b = lot[(edgeIndex + 1) % lot.length];
+	const edge = b.subtract(a);
+	const len = edge.length;
+	if (!(len > 1e-6)) return null;
+	const u = edge.norm(1);
+	const side = sideForShape(lot, a, b);
+	const inward = new Point(-edge.y / len * side, edge.x / len * side);
+	const p1 = a.add(u.scale(start - width / 2));
+	const p2 = a.add(u.scale(start + width / 2));
+	const q1 = p1.add(inward.scale(depth));
+	const q2 = p2.add(inward.scale(depth));
+	return { edgeIndex, start, width, depth, p1, q1, q2, p2 };
+}
+
+function addHousingEntrance(lot, alley) {
+	if (!lot || lot.length < 3 || lot.class || !(alley > 0)) return { lot, fills: [] };
+	if (!Random.bool(0.75)) return { lot, fills: [] };
+	const area0 = Math.abs(lot.square);
+	if (area0 < alley * alley * 15) return { lot, fills: [] };
+
+	const plans = [];
+	const fills = [];
+	const cornerClearance = alley * 3;
+	const minSize = alley * 0.85;
+	const maxDepth = alley * 2.0;
+	const maxWidthSize = alley * 3.0;
+	const minGap = alley * 2;
+	let targetCount = 1;
+	if (Random.bool(0.85)) targetCount++;
+	if (area0 > alley * alley * 70 && Random.bool(0.45)) targetCount++;
+
+	const edgeIndices = [];
+	for (let i = 0; i < lot.length; i++) {
+		if (lot.noEntranceEdges && lot.noEntranceEdges.has(i)) continue;
+		edgeIndices.push(i);
+	}
+	for (let i = edgeIndices.length - 1; i > 0; i--) {
+		const j = Random.int(0, i + 1);
+		const t = edgeIndices[i];
+		edgeIndices[i] = edgeIndices[j];
+		edgeIndices[j] = t;
+	}
+
+	for (const edgeIndex of edgeIndices) {
+		if (plans.length >= targetCount) break;
+		const a = lot[edgeIndex];
+		const b = lot[(edgeIndex + 1) % lot.length];
+		const len = Point.distance(a, b);
+		if (len < cornerClearance * 2 + minSize) continue;
+
+		const maxSlots = Math.min(4, Math.floor((len - cornerClearance * 2 + minGap) / (minSize + minGap)));
+		if (maxSlots <= 0) continue;
+		const target = Math.min(maxSlots, targetCount - plans.length, Random.bool(0.12) ? 2 : 1);
+		const intervals = [];
+		for (let attempt = 0; attempt < maxSlots * 8 && intervals.length < target; attempt++) {
+			const depth = minSize + Random.float() * (maxDepth - minSize);
+			const minWidth = Math.max(minSize, depth * 0.5);
+			const maxWidth = Math.min(maxWidthSize, depth * 3);
+			if (minWidth > maxWidth) continue;
+			const width = minWidth + Random.float() * (maxWidth - minWidth);
+			if (len < cornerClearance * 2 + width) continue;
+
+			const minStart = cornerClearance + width / 2;
+			const maxStart = len - cornerClearance - width / 2;
+			if (minStart > maxStart) continue;
+			const start = minStart + Random.float() * (maxStart - minStart);
+			const lo = start - width / 2;
+			const hi = start + width / 2;
+			if (intervalOverlaps(intervals, lo, hi, minGap)) continue;
+
+			const plan = makeEntrancePlan(lot, edgeIndex, start, width, depth);
+			if (!plan || !entranceNotchFits(lot, plan.p1, plan.q1, plan.q2, plan.p2, alley)) continue;
+			intervals.push([lo, hi]);
+			plans.push(plan);
+			if (Random.bool(0.3)) fills.push(entranceFillPolygon(plan.p1, plan.q1, plan.q2, plan.p2));
+		}
+	}
+
+	if (plans.length === 0) return { lot, fills: [] };
+	const cleaned = buildLotWithEntrancePlans(lot, plans, alley, area0);
+	if (!cleaned) return { lot, fills: [] };
+	return { lot: cleaned, fills };
+}
+
+function addHousingEntrances(geometry, alley) {
+	if (!geometry || geometry.length === 0) return geometry;
+	const out = [];
+	for (const lot of geometry) {
+		const result = addHousingEntrance(lot, alley);
+		out.push(result.lot);
+		out.push(...result.fills);
+	}
+	return out;
+}
+
+function addLargestLotInset(geometry, alley) {
+	if (!geometry || geometry.length === 0 || !(alley > 0)) return geometry;
+
+	let bestIndex = -1;
+	let bestArea = 0;
+	for (let i = 0; i < geometry.length; i++) {
+		const lot = geometry[i];
+		if (!lot || lot.length < 3) continue;
+		const area = Math.abs(lot.square);
+		if (area > bestArea) {
+			bestArea = area;
+			bestIndex = i;
+		}
+	}
+	if (bestIndex === -1) return geometry;
+
+	const lot = geometry[bestIndex];
+	for (const edgeIndex of convexCornerEdgeIndices(lot, alley * 0.75)) {
+		const a = lot[edgeIndex];
+		const b = lot[(edgeIndex + 1) % lot.length];
+		const edge = b.subtract(a);
+		const len = edge.length;
+		if (!(len > 1e-6)) continue;
+
+		const distance = alley * (1 + Random.float() * 2);
+		const side = sideForShape(lot, a, b);
+		const clipped = clipOneSideWithInsetShape(lot, a, b, side, distance);
+		if (!clipped) continue;
+		const { insetLot, insetShape } = clipped;
+		insetShape.class = 'largestLotInset';
+		markEntranceExcludedEdge(insetLot, a, b, side, distance);
+
+		if (
+			!insetLot ||
+			insetLot.length < 3 ||
+			!insetLot.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)) ||
+			Math.abs(insetLot.square) < bestArea * 0.35 ||
+			Math.abs(insetShape.square) < 1e-6
+		) continue;
+
+		const out = geometry.slice();
+		out[bestIndex] = insetLot;
+		out.push(insetShape);
+		return out;
+	}
+
+	return geometry;
+}
+
 export function createCommonWardGeometry(model, patch, widths) {
 	const block = patch.block;
 	if (!block || block.length < 3) return [];
@@ -793,6 +1097,8 @@ export function createCommonWardGeometry(model, patch, widths) {
 	patch.alleys = alleys || [];
 	let geometry = (lots && lots.length > 0 ? lots : [preparedBlock]).map((lot) => roundedAcuteCorners(lot, params.minLotAngle));
 	geometry = geometry.filter((lot) => lot && lot.length >= 3);
+	geometry = addLargestLotInset(geometry, params.gap);
+	geometry = addHousingEntrances(geometry, params.gap);
 	// Final guard: drop any lot that pinches below minLotNeck — both lots left waisted by the
 	// corner rounding above and whole-ward blocks the slicer couldn't cut (returned as one lot).
 	// This is what actually bounds the ward's worst neck; a thin sliver becomes open space.
@@ -979,10 +1285,620 @@ export function createParkGeometry(model, patch, widths) {
 	return geometry.map(tagPark);
 }
 
-// Cathedral ward: fill the whole block with the cathedral colour, then draw a closed ring of
-// medium-thickness black wall lines around the precinct. The two openings are placed on the
-// longest and shortest ward edges; each opening leaves a fixed small gap in the middle of the
-// edge while the wall still runs right up to either side of it.
+function clonePolygon(poly, cls = null) {
+	const out = new Polygon(Array.from(poly, (v) => new Point(v.x, v.y)));
+	if (cls) out.class = cls;
+	return out;
+}
+
+function polygonContainsAll(poly, points) {
+	return points.every((p) => pointInPolygon(p, poly));
+}
+
+function pointOnSegment(a, b, t) {
+	return new Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+}
+
+function polygonFitsInside(poly, candidate, step = 0.9, clearance = 0) {
+	if (!poly || !candidate || candidate.length < 3) return false;
+	const pointFits = (p) => pointInPolygon(p, poly) && (!(clearance > 0) || pointPolygonDistance(p, poly) >= clearance);
+	for (const p of candidate) if (!pointFits(p)) return false;
+	for (let i = 0; i < candidate.length; i++) {
+		const a = candidate[i];
+		const b = candidate[(i + 1) % candidate.length];
+		const len = Point.distance(a, b);
+		const samples = Math.max(1, Math.ceil(len / step));
+		for (let j = 1; j < samples; j++) {
+			const p = pointOnSegment(a, b, j / samples);
+			if (!pointFits(p)) return false;
+		}
+	}
+	return true;
+}
+
+function orientedRect(center, axis, halfLen, halfWid) {
+	const perp = new Point(-axis.y, axis.x);
+	return new Polygon([
+		new Point(center.x - axis.x * halfLen - perp.x * halfWid, center.y - axis.y * halfLen - perp.y * halfWid),
+		new Point(center.x + axis.x * halfLen - perp.x * halfWid, center.y + axis.y * halfLen - perp.y * halfWid),
+		new Point(center.x + axis.x * halfLen + perp.x * halfWid, center.y + axis.y * halfLen + perp.y * halfWid),
+		new Point(center.x - axis.x * halfLen + perp.x * halfWid, center.y - axis.y * halfLen + perp.y * halfWid),
+	]);
+}
+
+function orientedLShape(center, axis, halfLen, halfWid) {
+	const perp = new Point(-axis.y, axis.x);
+	const cutLen = halfLen * (0.35 + Random.float() * 0.2);
+	const cutWid = halfWid * (0.35 + Random.float() * 0.25);
+	const corner = Math.trunc(Random.float() * 4);
+	let local;
+	if (corner === 0) {
+		local = [[-halfLen, -halfWid], [halfLen, -halfWid], [halfLen, halfWid - cutWid], [halfLen - cutLen, halfWid - cutWid], [halfLen - cutLen, halfWid], [-halfLen, halfWid]];
+	} else if (corner === 1) {
+		local = [[-halfLen, -halfWid], [halfLen, -halfWid], [halfLen, halfWid], [-halfLen + cutLen, halfWid], [-halfLen + cutLen, halfWid - cutWid], [-halfLen, halfWid - cutWid]];
+	} else if (corner === 2) {
+		local = [[-halfLen, -halfWid], [halfLen - cutLen, -halfWid], [halfLen - cutLen, -halfWid + cutWid], [halfLen, -halfWid + cutWid], [halfLen, halfWid], [-halfLen, halfWid]];
+	} else {
+		local = [[-halfLen + cutLen, -halfWid], [halfLen, -halfWid], [halfLen, halfWid], [-halfLen, halfWid], [-halfLen, -halfWid + cutWid], [-halfLen + cutLen, -halfWid + cutWid]];
+	}
+	return new Polygon(local.map(([u, v]) => new Point(center.x + axis.x * u + perp.x * v, center.y + axis.y * u + perp.y * v)));
+}
+
+function projectionExtents(poly, center, dir) {
+	let min = Infinity;
+	let max = -Infinity;
+	for (const v of poly) {
+		const pr = (v.x - center.x) * dir.x + (v.y - center.y) * dir.y;
+		min = Math.min(min, pr);
+		max = Math.max(max, pr);
+	}
+	return { min, max };
+}
+
+function placeSmallHouse(parcel, axis) {
+	const yard = parcel.shrinkRobust ? parcel.shrinkRobust(0.75) : null;
+	const base = yard && yard.length >= 3 && Math.abs(yard.square) > Math.abs(parcel.square) * 0.2 ? yard : parcel;
+	let center = base.centroid;
+	if (!pointInPolygon(center, base)) center = base.center;
+	if (!pointInPolygon(center, base)) return null;
+
+	const perp = new Point(-axis.y, axis.x);
+	const along = projectionExtents(base, center, axis);
+	const across = projectionExtents(base, center, perp);
+	let halfLen = Math.max(0.6, Math.min(along.max, -along.min) * (0.34 + Random.float() * 0.14));
+	let halfWid = Math.max(0.45, Math.min(across.max, -across.min) * (0.29 + Random.float() * 0.12));
+	if (!(halfLen > 0.35 && halfWid > 0.26)) return null;
+
+	for (let attempt = 0; attempt < 8; attempt++) {
+		const rect = orientedRect(center, axis, halfLen, halfWid);
+		if (polygonFitsInside(base, rect, 0.45)) {
+			const lShape = Random.bool(0.35) && halfLen > 0.45 && halfWid > 0.35 ? orientedLShape(center, axis, halfLen, halfWid) : null;
+			const house = lShape && polygonFitsInside(base, lShape, 0.45) ? lShape : rect;
+			house.class = 'outerHouse';
+			return house;
+		}
+		halfLen *= 0.82;
+		halfWid *= 0.82;
+	}
+	return null;
+}
+
+function rotateUnit(dir, angle) {
+	const c = Math.cos(angle);
+	const s = Math.sin(angle);
+	return new Point(dir.x * c - dir.y * s, dir.x * s + dir.y * c);
+}
+
+function longestEdgeAxis(poly) {
+	let best = null;
+	let bestLen = -Infinity;
+	if (!poly || poly.length < 2) return new Point(1, 0);
+	for (let i = 0; i < poly.length; i++) {
+		const a = poly[i];
+		const b = poly[(i + 1) % poly.length];
+		const edge = b.subtract(a);
+		const len = edge.length;
+		if (len > bestLen) {
+			bestLen = len;
+			best = edge;
+		}
+	}
+	return best && best.length > 1e-6 ? best.norm(1) : new Point(1, 0);
+}
+
+function parcelTargetCount(area) {
+	let base;
+	if (area < 1300) base = 4;
+	else if (area < 2600) base = 8;
+	else if (area < 4400) base = 12;
+	else if (area < 6500) base = 16;
+	else if (area < 9000) base = 20;
+	else if (area < 12000) base = 24;
+	else if (area < 15500) base = 28;
+	else base = 32;
+	if (base > 8 && Random.bool(0.25)) base -= 2;
+	return base;
+}
+
+function cutSegmentForLine(poly, center, lineDir) {
+	const hits = lineBoundaryIntersections(poly, center, lineDir);
+	if (hits.length < 2) return null;
+	return new Polygon([hits[0].point, hits[hits.length - 1].point]);
+}
+
+function trySplitParcel(parcel, axis, useAxis) {
+	const baseDir = useAxis ? axis : new Point(-axis.y, axis.x);
+	const splitDir = rotateUnit(baseDir, (Random.float() - 0.5) * 0.18);
+	const lineDir = new Point(-splitDir.y, splitDir.x);
+	const c = parcel.centroid;
+	const ext = projectionExtents(parcel, c, splitDir);
+	if (!(ext.max - ext.min > 2.2)) return null;
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const ratio = 0.5 + (Random.float() - 0.5) * 0.18;
+		const t = ext.min + (ext.max - ext.min) * ratio;
+		const p1 = new Point(c.x + splitDir.x * t, c.y + splitDir.y * t);
+		const halves = parcel.cut(p1, p1.add(lineDir), 0);
+		if (halves.length < 2) continue;
+		const a0 = Math.abs(parcel.square);
+		const a1 = Math.abs(halves[0].square);
+		const a2 = Math.abs(halves[1].square);
+		if (a1 < a0 * 0.14 || a2 < a0 * 0.14 || a1 < 45 || a2 < 45) continue;
+		const segment = cutSegmentForLine(parcel, p1, lineDir);
+		return { halves, segment };
+	}
+	return null;
+}
+
+function orderedParcelSubdivision(block, axis) {
+	const target = parcelTargetCount(Math.abs(block.square));
+	const parcels = [new Polygon(block)];
+	const cuts = [];
+	const locked = new Set();
+
+	for (let guard = 0; guard < target * 4 && parcels.length < target; guard++) {
+		let bestIndex = -1;
+		let bestArea = -Infinity;
+		for (let i = 0; i < parcels.length; i++) {
+			if (locked.has(parcels[i])) continue;
+			const area = Math.abs(parcels[i].square);
+			if (area > bestArea) {
+				bestArea = area;
+				bestIndex = i;
+			}
+		}
+		if (bestIndex === -1) break;
+
+		const parcel = parcels[bestIndex];
+		const c = parcel.centroid;
+		const along = projectionExtents(parcel, c, axis);
+		const perp = projectionExtents(parcel, c, new Point(-axis.y, axis.x));
+		const useAxis = (along.max - along.min) >= (perp.max - perp.min);
+		const split = trySplitParcel(parcel, axis, useAxis);
+		if (!split) {
+			locked.add(parcel);
+			continue;
+		}
+		parcels.splice(bestIndex, 1, split.halves[0], split.halves[1]);
+		if (split.segment) cuts.push(split.segment);
+	}
+
+	return { lots: parcels.filter((lot) => lot && lot.length >= 3), cuts };
+}
+
+function splitParcelLines(cuts) {
+	const hedges = [];
+	const walls = [];
+	for (const cut of cuts || []) {
+		if (!cut || cut.length < 2) continue;
+		if (Random.bool(0.28)) continue;
+		(Random.bool(0.18) ? walls : hedges).push(new Polygon(cut.map((p) => new Point(p.x, p.y))));
+	}
+	return { hedges, walls };
+}
+
+export function createOuterGardenGeometry(model, patch, widths) {
+	const block = patch.block;
+	if (!block || block.length < 3) return [];
+
+	const axis = longestEdgeAxis(patch.shape || block);
+	const area = Math.abs(block.square);
+	const { lots, cuts } = area > 700 ? orderedParcelSubdivision(block, axis) : { lots: [new Polygon(block)], cuts: [] };
+	const parcels = (lots && lots.length > 0 ? lots : [new Polygon(block)]).filter((lot) => lot && lot.length >= 3);
+	const geometry = [];
+	for (const parcel of parcels) {
+		const lawn = clonePolygon(parcel, 'outerGarden');
+		geometry.push(lawn);
+		const house = placeSmallHouse(parcel, axis);
+		if (house) geometry.push(house);
+	}
+	geometry.push(clonePolygon(block, 'outerGardenOutline'));
+	const lines = splitParcelLines(cuts);
+	patch.hedges = lines.hedges;
+	patch.cathedralHedges = lines.walls;
+	return geometry;
+}
+
+function lineBoundaryIntersections(poly, center, dir) {
+	const hits = [];
+	for (let i = 0; i < poly.length; i++) {
+		const a = poly[i];
+		const b = poly[(i + 1) % poly.length];
+		const edge = b.subtract(a);
+		const hit = GeomUtils.intersectLines(center.x, center.y, dir.x, dir.y, a.x, a.y, edge.x, edge.y);
+		if (hit && hit.y >= -1e-6 && hit.y <= 1 + 1e-6) {
+			hits.push({ t: hit.x, point: new Point(center.x + dir.x * hit.x, center.y + dir.y * hit.x) });
+		}
+	}
+	hits.sort((a, b) => a.t - b.t);
+	return hits;
+}
+
+function stairHighrise(center, axis, halfLen, halfWid) {
+	const perp = new Point(-axis.y, axis.x);
+	const steps = 4 + Math.trunc(Random.float() * 3);
+	const stepLen = (halfLen * 2) / steps;
+	const notch = halfWid * (0.22 + Random.float() * 0.12);
+	const top = [[-halfLen, halfWid]];
+	let topY = halfWid;
+	for (let i = 0; i < steps; i++) {
+		const x = -halfLen + stepLen * (i + 1);
+		top.push([x, topY]);
+		if (i < steps - 1) {
+			topY = i % 2 === 0 ? halfWid - notch : halfWid;
+			top.push([x, topY]);
+		}
+	}
+	const bottom = [[halfLen, -halfWid]];
+	let bottomY = -halfWid;
+	for (let i = steps - 1; i >= 0; i--) {
+		const x = -halfLen + stepLen * i;
+		bottom.push([x, bottomY]);
+		if (i > 0) {
+			bottomY = i % 2 === 0 ? -halfWid + notch : -halfWid;
+			bottom.push([x, bottomY]);
+		}
+	}
+	return new Polygon(top.concat(bottom).map(([u, v]) => new Point(center.x + axis.x * u + perp.x * v, center.y + axis.y * u + perp.y * v)));
+}
+
+function ascendingStairHighrise(center, axis, halfLen, halfWid) {
+	const perp = new Point(-axis.y, axis.x);
+	const steps = 4 + Math.trunc(Random.float() * 3);
+	const stepLen = (halfLen * 2) / steps;
+	const stepRise = (halfWid * 1.25) / steps;
+	const band = halfWid * (0.58 + Random.float() * 0.12);
+	const bottom = [[-halfLen, -halfWid]];
+	let y = -halfWid;
+	for (let i = 0; i < steps; i++) {
+		const x = -halfLen + stepLen * (i + 1);
+		bottom.push([x, y]);
+		if (i < steps - 1) {
+			y += stepRise;
+			bottom.push([x, y]);
+		}
+	}
+	const top = [];
+	for (let i = steps - 1; i >= 0; i--) {
+		const x = -halfLen + stepLen * i;
+		const upperY = -halfWid + stepRise * i + band;
+		top.push([x + stepLen, upperY]);
+		top.push([x, upperY]);
+		if (i > 0) top.push([x, upperY - stepRise]);
+	}
+	return new Polygon(bottom.concat(top).map(([u, v]) => new Point(center.x + axis.x * u + perp.x * v, center.y + axis.y * u + perp.y * v)));
+}
+
+function highriseFootprint(center, axis, halfLen, halfWid, kind) {
+	if (kind === 'stepped') return stairHighrise(center, axis, halfLen, halfWid);
+	if (kind === 'ascendingStair') return ascendingStairHighrise(center, axis, halfLen, halfWid);
+	return orientedRect(center, axis, halfLen, halfWid);
+}
+
+function randomHighriseKind() {
+	const r = Random.float();
+	if (r < 0.22) return 'ascendingStair';
+	if (r < 0.52) return 'stepped';
+	return 'rect';
+}
+
+function highriseMinDims(kind) {
+	return kind === 'rect'
+		? { halfLen: 1.55, halfWid: 0.62 }
+		: { halfLen: 2.25, halfWid: 0.92 };
+}
+
+function buildHighriseAt(base, center, axis, halfLen, halfWid, kind) {
+	const minDims = highriseMinDims(kind);
+	for (let attempt = 0; attempt < 5; attempt++) {
+		if (halfLen < minDims.halfLen || halfWid < minDims.halfWid) return null;
+		const b = highriseFootprint(center, axis, halfLen, halfWid, kind);
+		if (polygonFitsInside(base, b, 0.6)) {
+			b.class = 'highrise';
+			return b;
+		}
+		halfLen *= 0.86;
+		halfWid *= 0.86;
+	}
+	return null;
+}
+
+function segmentDistance(a, b, c, d) {
+	const cross = (p, q, r) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+	const overlaps = (p, q, r, s) =>
+		Math.min(p.x, q.x) <= Math.max(r.x, s.x) + 1e-6 &&
+		Math.min(r.x, s.x) <= Math.max(p.x, q.x) + 1e-6 &&
+		Math.min(p.y, q.y) <= Math.max(r.y, s.y) + 1e-6 &&
+		Math.min(r.y, s.y) <= Math.max(p.y, q.y) + 1e-6;
+	if (overlaps(a, b, c, d) && cross(a, b, c) * cross(a, b, d) <= 1e-9 && cross(c, d, a) * cross(c, d, b) <= 1e-9) return 0;
+	const pointSeg = (p, v, w) => {
+		const dx = w.x - v.x;
+		const dy = w.y - v.y;
+		const len2 = dx * dx + dy * dy;
+		if (len2 < 1e-9) return Point.distance(p, v);
+		const t = Math.max(0, Math.min(1, ((p.x - v.x) * dx + (p.y - v.y) * dy) / len2));
+		return Point.distance(p, new Point(v.x + dx * t, v.y + dy * t));
+	};
+	return Math.min(pointSeg(a, c, d), pointSeg(b, c, d), pointSeg(c, a, b), pointSeg(d, a, b));
+}
+
+function polygonDistance(a, b) {
+	if (!a || !b || a.length < 3 || b.length < 3) return Infinity;
+	if (a.some((p) => pointInPolygon(p, b)) || b.some((p) => pointInPolygon(p, a))) return 0;
+	let best = Infinity;
+	for (let i = 0; i < a.length; i++) {
+		const a0 = a[i];
+		const a1 = a[(i + 1) % a.length];
+		for (let j = 0; j < b.length; j++) {
+			best = Math.min(best, segmentDistance(a0, a1, b[j], b[(j + 1) % b.length]));
+			if (best <= 0) return 0;
+		}
+	}
+	return best;
+}
+
+function createHighriseParkPatches(block, axis, widths) {
+	return [clonePolygon(block, 'outerHighrisePark')];
+}
+
+function highriseTargetCount(usable, axis) {
+	const c = usable.centroid;
+	const perp = new Point(-axis.y, axis.x);
+	const along = projectionExtents(usable, c, axis);
+	const across = projectionExtents(usable, c, perp);
+	const length = along.max - along.min;
+	const width = across.max - across.min;
+	const area = Math.abs(usable.square);
+	if (area < 850 || width < 3.9 || length < 5.0) return 1;
+	if (area < 2000 || width < 6.0) return 2 + (length > 9 && width > 5.0 && Random.bool(0.35) ? 1 : 0);
+	if (area < 4800 || width < 9.0) return 3 + (length > 10 && Random.bool(0.55) ? 1 : 0);
+	return Math.min(7, 4 + (area > 6400 && width > 9.5 ? 1 : 0) + (area > 9000 && length > 12 ? 1 : 0) + (area > 13000 && Random.bool(0.5) ? 1 : 0));
+}
+
+// Place highrise buildings on a regular slot grid (slotCount along axis × rowCount across).
+// Each slot fits one building scaled to most of its cell, so the ward fills evenly. Stepped
+// kinds get a wider halfWid baseline since the user wants them visibly chunkier.
+function placeHighriseBuildingsSlotted(usable, axis, slotCount, rowCount, opts) {
+	const { length, width, minGap, minHalfWid, maxAspect } = opts;
+	if (slotCount < 1 || rowCount < 1) return [];
+	const center = usable.centroid;
+	const perp = new Point(-axis.y, axis.x);
+	const margin = Math.max(0.4, minGap * 0.7);
+
+	const usableLen = length - (slotCount - 1) * minGap - 2 * margin;
+	if (!(usableLen >= slotCount * 1.6)) return [];
+	const slotLen = usableLen / slotCount;
+
+	const usableWid = width - (rowCount - 1) * minGap - 2 * margin;
+	if (!(usableWid >= rowCount * 1.4)) return [];
+	const slotWid = usableWid / rowCount;
+
+	const startAlong = -length / 2 + margin + slotLen / 2;
+	const startAcross = -width / 2 + margin + slotWid / 2;
+
+	const buildings = [];
+	for (let row = 0; row < rowCount; row++) {
+		const acrossSlot = startAcross + row * (slotWid + minGap);
+		for (let col = 0; col < slotCount; col++) {
+			const alongSlot = startAlong + col * (slotLen + minGap);
+
+			let placed = null;
+			for (let attempt = 0; attempt < 16 && !placed; attempt++) {
+				const kind = randomHighriseKind();
+				// Building takes most of its slot's along-axis extent.
+				let halfLen = slotLen * 0.5 * (0.82 + Random.float() * 0.12);
+				// halfWid: rect stays slimmer; stepped/ascendingStair fill ~75-95% of slot width.
+				let halfWid;
+				if (kind === 'rect') {
+					halfWid = Math.min(slotWid * 0.5 * (0.60 + Random.float() * 0.18), halfLen / (1.85 + Random.float() * 0.55));
+				} else {
+					halfWid = Math.min(slotWid * 0.5 * (0.78 + Random.float() * 0.16), halfLen / (1.35 + Random.float() * 0.40));
+				}
+				const minDims = highriseMinDims(kind);
+				halfLen = Math.max(halfLen, minDims.halfLen);
+				halfWid = Math.max(Math.max(halfWid, minHalfWid), minDims.halfWid);
+				if (halfLen / halfWid > maxAspect) halfLen = halfWid * maxAspect;
+				if (halfWid < minHalfWid || halfLen < 1.7) continue;
+
+				// Small jitter inside the slot so trials with the same grid produce variety.
+				const alongJitter = (Random.float() - 0.5) * Math.max(0, slotLen - 2 * halfLen) * 0.7;
+				const acrossJitter = (Random.float() - 0.5) * Math.max(0, slotWid - 2 * halfWid) * 0.4;
+				const c = new Point(
+					center.x + axis.x * (alongSlot + alongJitter) + perp.x * (acrossSlot + acrossJitter),
+					center.y + axis.y * (alongSlot + alongJitter) + perp.y * (acrossSlot + acrossJitter)
+				);
+				const building = buildHighriseAt(usable, c, axis, halfLen, halfWid, kind);
+				if (!building) continue;
+				if (buildings.some((other) => polygonDistance(building, other) < minGap)) continue;
+				placed = building;
+			}
+			if (placed) buildings.push(placed);
+		}
+	}
+	return buildings;
+}
+
+function createHighriseBuildings(block, axis) {
+	const base = block.shrinkRobust ? block.shrinkRobust(0.9) : block;
+	const usable = base && base.length >= 3 && Math.abs(base.square) > Math.abs(block.square) * 0.25 ? base : block;
+	const center = usable.centroid;
+	const perp = new Point(-axis.y, axis.x);
+	const along = projectionExtents(usable, center, axis);
+	const across = projectionExtents(usable, center, perp);
+	const length = along.max - along.min;
+	const width = across.max - across.min;
+	if (length < 3.8 || width < 1.8) return [];
+
+	const target = highriseTargetCount(usable, axis);
+	const opts = { length, width, minGap: 0.55, minHalfWid: 0.62, maxAspect: 4.2 };
+
+	// 5 layout trials with varied slot/row counts; keep the densest by total building area.
+	const trials = [
+		{ slots: target, rows: 1 },
+		{ slots: Math.max(1, target - 1), rows: 1 },
+		{ slots: target + 1, rows: 1 },
+	];
+	if (width >= 5.2 && target >= 2) {
+		trials.push({ slots: Math.max(1, Math.ceil(target / 2)), rows: 2 });
+		trials.push({ slots: Math.max(2, Math.ceil((target + 1) / 2)), rows: 2 });
+	} else {
+		trials.push({ slots: target, rows: 1 });
+		trials.push({ slots: Math.max(1, target - 1), rows: 1 });
+	}
+
+	let best = [];
+	let bestArea = -1;
+	for (const trial of trials) {
+		const buildings = placeHighriseBuildingsSlotted(usable, axis, trial.slots, trial.rows, opts);
+		let area = 0;
+		for (const b of buildings) area += Math.abs(b.square);
+		if (area > bestArea) {
+			bestArea = area;
+			best = buildings;
+		}
+	}
+
+	if (best.length === 0) {
+		const kind = width > 4.5 && length > 6.0 ? randomHighriseKind() : 'rect';
+		const minDims = highriseMinDims(kind);
+		const halfWid = Math.max(minDims.halfWid, Math.min(width * 0.2, length * 0.09));
+		const halfLen = Math.max(minDims.halfLen, Math.min(length * 0.28, halfWid * opts.maxAspect));
+		const b = buildHighriseAt(usable, center, axis, halfLen, halfWid, kind);
+		if (b) best = [b];
+	}
+	return best;
+}
+
+function stripPolygon(a, b, width) {
+	const dx = b.x - a.x;
+	const dy = b.y - a.y;
+	const len = Math.hypot(dx, dy);
+	if (!(len > 1e-6)) return null;
+	const nx = -dy / len * width / 2;
+	const ny = dx / len * width / 2;
+	const poly = new Polygon([
+		new Point(a.x + nx, a.y + ny),
+		new Point(b.x + nx, b.y + ny),
+		new Point(b.x - nx, b.y - ny),
+		new Point(a.x - nx, a.y - ny),
+	]);
+	poly.class = 'outerHighrisePath';
+	return poly;
+}
+
+function squareAt(center, axis, width) {
+	const half = width / 2;
+	const perp = new Point(-axis.y, axis.x);
+	const poly = new Polygon([
+		new Point(center.x - axis.x * half - perp.x * half, center.y - axis.y * half - perp.y * half),
+		new Point(center.x + axis.x * half - perp.x * half, center.y + axis.y * half - perp.y * half),
+		new Point(center.x + axis.x * half + perp.x * half, center.y + axis.y * half + perp.y * half),
+		new Point(center.x - axis.x * half + perp.x * half, center.y - axis.y * half + perp.y * half),
+	]);
+	poly.class = 'outerHighrisePath';
+	return poly;
+}
+
+function createHighriseElbowPaths(block, buildings, axis, width = 0.75) {
+	const paths = [];
+	if (!buildings || buildings.length === 0) return paths;
+	const blockCenter = block.centroid;
+	const perp = new Point(-axis.y, axis.x);
+	const candidates = buildings.slice();
+	for (let i = candidates.length - 1; i > 0; i--) {
+		const j = Math.trunc(Random.float() * (i + 1));
+		const t = candidates[i];
+		candidates[i] = candidates[j];
+		candidates[j] = t;
+	}
+	let pathTargets = Math.min(candidates.length, 1 + (candidates.length > 1 && Random.bool(0.55) ? 1 : 0) + (candidates.length > 4 && Random.bool(0.18) ? 1 : 0));
+	for (const building of candidates) {
+		if (pathTargets-- <= 0) break;
+		const target = building.centroid;
+		let dir = target.subtract(blockCenter);
+		if (dir.length < 1e-6) dir = Random.bool() ? axis : perp;
+		dir.normalize(1);
+		const hits = lineBoundaryIntersections(block, target, dir);
+		const hit = hits.find((h) => h.t > 0) || [...hits].reverse().find((h) => h.t < 0);
+		if (!hit) continue;
+
+		const firstDir = Random.bool(0.65) ? axis : perp;
+		let elbow = hit.point.add(firstDir.norm((target.x - hit.point.x) * firstDir.x + (target.y - hit.point.y) * firstDir.y));
+		if (!pointInPolygon(elbow, block)) {
+			const alt = firstDir === axis ? perp : axis;
+			elbow = hit.point.add(alt.norm((target.x - hit.point.x) * alt.x + (target.y - hit.point.y) * alt.y));
+		}
+		if (!pointInPolygon(elbow, block)) {
+			const p = stripPolygon(hit.point, target, width);
+			if (p) paths.push(p);
+			continue;
+		}
+		const p1 = stripPolygon(hit.point, elbow, width);
+		const p2 = stripPolygon(elbow, target, width);
+		if (p1) paths.push(p1);
+		if (p2) paths.push(p2);
+		paths.push(squareAt(elbow, axis, width));
+	}
+	return paths;
+}
+
+function createOuterBoundaryHedges(block, chance = 0.3) {
+	const hedges = [];
+	if (!block || block.length < 3) return hedges;
+	const picked = [];
+	for (let i = 0; i < block.length; i++) {
+		if (Random.bool(chance)) picked.push(i);
+	}
+
+	const maxClosed = Math.max(0, block.length - 2);
+	while (picked.length > maxClosed) picked.splice(Math.trunc(Random.float() * picked.length), 1);
+
+	for (const i of picked) {
+		const a = block[i];
+		const b = block[(i + 1) % block.length];
+		if (Point.distance(a, b) < 0.8) continue;
+		hedges.push(new Polygon([new Point(a.x, a.y), new Point(b.x, b.y)]));
+	}
+	return hedges;
+}
+
+export function createOuterHighriseGeometry(model, patch, widths) {
+	const block = patch.block;
+	if (!block || block.length < 3) return [];
+
+	let axis = longestEdgeAxis(patch.shape || block);
+	const gold = createHighriseParkPatches(block, axis, widths);
+	const buildings = createHighriseBuildings(block, axis);
+	const paths = createHighriseElbowPaths(block, buildings, axis, Math.max(0.7, (widths.alley || 0.8) * 0.95));
+	patch.alleys = [];
+	patch.hedges = createOuterBoundaryHedges(block, 0.3);
+	return [...gold, ...paths, ...buildings];
+}
+
+// Cathedral ward: draw a walled precinct, then place a long church footprint inside it when
+// the usable area is generous enough. Compact precincts stay open and get a small grove.
+const CATHEDRAL_GATE_WIDTH = 1.2;
+
 function findLongestAndShortestEdges(block) {
 	const n = block.length;
 	let longest = 0;
@@ -1022,7 +1938,7 @@ function findLongestAndShortestEdges(block) {
 	return gaps;
 }
 
-function createWallSegments(block, gapEdges, gapWidth = 1.2) {
+function createWallSegments(block, gapEdges, gapWidth = CATHEDRAL_GATE_WIDTH) {
 	const n = block.length;
 	if (n < 3) return [];
 	if (gapEdges.size === 0) {
@@ -1081,17 +1997,173 @@ function createWallSegments(block, gapEdges, gapWidth = 1.2) {
 	return merged.filter((s) => s.length >= 2).map((s) => new Polygon(s));
 }
 
+function orientedCross(center, axis, halfLen, halfWid, transeptHalfLen, transeptHalfWid, longSide = 1) {
+	const perp = new Point(-axis.y, axis.x);
+	const crossHalfLen = Math.min(halfLen * 0.22, Math.max(halfWid * 1.1, transeptHalfLen));
+	const longLen = halfLen * 1.18;
+	const shortLen = halfLen * 0.42;
+	const left = longSide > 0 ? -shortLen : -longLen;
+	const right = longSide > 0 ? longLen : shortLen;
+	const local = [
+		[left, -halfWid],
+		[-crossHalfLen, -halfWid],
+		[-crossHalfLen, -transeptHalfWid],
+		[crossHalfLen, -transeptHalfWid],
+		[crossHalfLen, -halfWid],
+		[right, -halfWid],
+		[right, halfWid],
+		[crossHalfLen, halfWid],
+		[crossHalfLen, transeptHalfWid],
+		[-crossHalfLen, transeptHalfWid],
+		[-crossHalfLen, halfWid],
+		[left, halfWid],
+	];
+	return new Polygon(local.map(([u, v]) => new Point(center.x + axis.x * u + perp.x * v, center.y + axis.y * u + perp.y * v)));
+}
+
+function createCathedralFootprint(block, widths) {
+	const clearance = Math.max((widths.alley || 0.8) * 1.15, (widths.regular || 1) * 0.9, 1.05);
+	const yard = block.shrinkRobust ? block.shrinkRobust(clearance) : null;
+	if (!yard || yard.length < 3 || Math.abs(yard.square) < Math.abs(block.square) * 0.08) return null;
+	const usable = yard;
+	let center = usable.centroid;
+	if (!pointInPolygon(center, usable)) center = usable.center;
+	if (!pointInPolygon(center, usable)) return null;
+
+	const baseAxis = principalAxis(usable);
+	const minHalfLen = Math.max(2.8, (widths.main || 2) * 1.45);
+	const minHalfWid = Math.max(0.75, (widths.regular || 1) * 0.8);
+	const wantsCross = Random.bool(0.55);
+	const fitStep = Math.min(0.55, clearance / 2);
+	let best = null;
+	let bestArea = -Infinity;
+
+	for (let angleIndex = 0; angleIndex < 10; angleIndex++) {
+		const axis = rotateUnit(baseAxis, (Math.PI * angleIndex) / 10);
+		const perp = new Point(-axis.y, axis.x);
+		const along = projectionExtents(usable, center, axis);
+		const across = projectionExtents(usable, center, perp);
+		const halfAlong = Math.min(along.max, -along.min);
+		const halfAcross = Math.min(across.max, -across.min);
+		if (halfAlong < minHalfLen || halfAcross < minHalfWid) continue;
+
+		let halfLen = halfAlong * 0.92;
+		let halfWid = Math.min(halfAcross * 0.52, halfLen * 0.26);
+		for (let scaleAttempt = 0; scaleAttempt < 5; scaleAttempt++) {
+			if (halfLen < minHalfLen || halfWid < minHalfWid) break;
+			const footprints = wantsCross && halfAcross > halfWid * 1.8 && halfLen > minHalfLen * 1.12
+				? [
+					orientedCross(center, axis, halfLen, halfWid, halfWid * 1.45, Math.min(halfAcross * 0.78, halfWid * 2.45), 1),
+					orientedCross(center, axis, halfLen, halfWid, halfWid * 1.45, Math.min(halfAcross * 0.78, halfWid * 2.45), -1),
+				]
+				: [orientedRect(center, axis, halfLen, halfWid)];
+			for (const footprint of footprints) {
+				if (!polygonFitsInside(usable, footprint, fitStep)) continue;
+				if (!polygonFitsInside(block, footprint, fitStep, clearance)) continue;
+				const area = Math.abs(footprint.square);
+				if (area > bestArea) {
+					best = footprint;
+					bestArea = area;
+				}
+			}
+			halfLen *= 0.9;
+			halfWid *= 0.9;
+		}
+	}
+
+	if (!best) return null;
+	best.class = 'cathedral';
+	return best;
+}
+
+function cathedralGatePoints(block, gapEdges) {
+	const gates = [];
+	for (const edgeIndex of gapEdges) {
+		const v0 = block[edgeIndex];
+		const v1 = block[(edgeIndex + 1) % block.length];
+		if (Point.distance(v0, v1) < 1e-6) continue;
+		gates.push(pointOnSegment(v0, v1, 0.5));
+	}
+	return gates;
+}
+
+function createCathedralPaths(block, gapEdges) {
+	const gates = cathedralGatePoints(block, gapEdges);
+	if (gates.length < 2) return [];
+	let center = block.centroid;
+	if (!pointInPolygon(center, block)) center = block.center;
+	return [new Polygon([gates[0], center, gates[1]])];
+}
+
+function createCathedralGround(block, gapEdges, widths, gateWidth = CATHEDRAL_GATE_WIDTH) {
+	const path = createCathedralPaths(block, gapEdges)[0];
+	if (!path || path.length < 3) return [clonePolygon(block, 'cathedralGround')];
+
+	const edges = Array.from(gapEdges);
+	if (edges.length < 2) return [clonePolygon(block, 'cathedralGround')];
+
+	const gap = Math.max(gateWidth, (widths.alley || 0.8) * 0.95);
+	const sliced = slicePolygonAlongElbow(block, edges[0], edges[1], path, gap);
+	const pieces = sliced.lots && sliced.lots.length > 1 ? sliced.lots : [block];
+	return pieces.map((p) => clonePolygon(p, 'cathedralGround'));
+}
+
+function cathedralFeatureKind(x, y, salt, index) {
+	const band = Math.trunc(parkFeatureHash(x, y, salt) * 3);
+	const cycle = (index + band) % 5;
+	if (cycle === 1) return 'fountain';
+	if (cycle === 3) return 'object';
+	return 'tree';
+}
+
+function recordCathedralFeatures(ground, footprint, widths, gateWidth = CATHEDRAL_GATE_WIDTH) {
+	if (!ground || ground.length === 0) return;
+	const boundaryClearance = Math.max(0.75, gateWidth * 0.58, (widths.alley || 0.8) * 0.9);
+	const buildingClearance = Math.max(0.9, (widths.regular || 1) * 0.9);
+	const minSpacing = Math.max(1.25, gateWidth * 1.05);
+	const placed = [];
+
+	for (let gi = 0; gi < ground.length; gi++) {
+		const piece = ground[gi];
+		if (!piece || piece.length < 3) continue;
+		const area = Math.abs(piece.square);
+		if (area < 8) continue;
+		const bounds = piece.getBounds();
+		const target = Math.max(2, Math.min(18, Math.floor(area / 12)));
+		const maxAttempts = target * 44;
+		let made = 0;
+
+		for (let i = 0; i < maxAttempts && made < target; i++) {
+			const rx = parkFeatureHash(piece.centroid.x, piece.centroid.y, gi * 409 + i * 2 + 1);
+			const ry = parkFeatureHash(piece.centroid.y, piece.centroid.x, gi * 409 + i * 2 + 2);
+			const p = new Point(
+				bounds.left + (bounds.right - bounds.left) * rx,
+				bounds.top + (bounds.bottom - bounds.top) * ry
+			);
+			if (!pointInPolygon(p, piece)) continue;
+			if (pointPolygonDistance(p, piece) < boundaryClearance) continue;
+			if (footprint && (pointInPolygon(p, footprint) || pointPolygonDistance(p, footprint) < buildingClearance)) continue;
+			if (placed.some((q) => Point.distance(p, q) < minSpacing)) continue;
+			placed.push(p);
+			recordFeature(p.x, p.y, cathedralFeatureKind(p.x, p.y, gi * 97 + i, made + gi));
+			made++;
+		}
+	}
+}
+
 export function createCathedralGeometry(model, patch, widths) {
 	const block = patch.block;
 	if (!block || block.length < 3) return [];
 
-	const fill = new Polygon(Array.from(block, (v) => new Point(v.x, v.y)));
-	fill.class = 'cathedral';
+	const footprint = createCathedralFootprint(block, widths);
 
 	const gapEdges = findLongestAndShortestEdges(block);
-	patch.cathedralHedges = createWallSegments(block, gapEdges, 1.2);
+	const ground = createCathedralGround(block, gapEdges, widths, CATHEDRAL_GATE_WIDTH);
+	recordCathedralFeatures(ground, footprint, widths, CATHEDRAL_GATE_WIDTH);
+	patch.cathedralHedges = createWallSegments(block, gapEdges, CATHEDRAL_GATE_WIDTH);
+	patch.alleys = createCathedralPaths(block, gapEdges);
 
-	return [fill];
+	return footprint ? [...ground, footprint] : ground;
 }
 
 // Dominant orientation (long axis) of a point cloud, via 2x2 covariance eigenvector.
