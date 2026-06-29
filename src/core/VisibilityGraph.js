@@ -31,6 +31,28 @@ import { thickenPolyline } from './Obstacles.js';
 const EPS = 1e-9;
 const POINT_EPS = 1e-6;
 const GATE_DISC_SEGMENTS = 8;
+// --- A* tail-control defaults (see astar) ---
+// River detours fool the Euclidean heuristic into expanding a huge frontier
+// (goal is near as the crow flies but reachable only via a distant bridge),
+// which spikes a single A* call to >1s on large maps. Two guards:
+//  (A) a wall-clock budget that bails to "no route" instead of grinding, and
+//  (B) a small heuristic weight (weighted A*) that trims the frontier while
+//      keeping routes near-optimal: path cost is bounded by W × optimal.
+// Default 1.0 = exact/optimal A*. Weighting is available via opts.heuristicWeight
+// for callers that accept slightly suboptimal routes for speed, but it is OFF by
+// default: even W=1.05 disturbs the superlinear side-staying tie-break (a route
+// can flip to the wrong side of a bridge), and on the cold-cache river outliers
+// it only trims ~10% of expansions anyway — the time budget below is the real cap.
+const ASTAR_HEURISTIC_WEIGHT = 1.0;
+const ASTAR_TIME_BUDGET_MS = 400;    // per-call ceiling; 0 disables. Caps the cold-cache
+                                     // river-detour tail (~1450ms -> ~450ms worst single call).
+                                     // Rejects a valid route as "no path" only when it needs
+                                     // >400ms cold: ~1% on typical maps, ~23% on the rare size-40
+                                     // river extreme. Tunable per-call via opts.timeBudgetMs.
+const ASTAR_BUDGET_CHECK_MASK = 63; // check the clock every 64 expansions (cold LOS makes each one costly, so keep the granularity fine)
+const _now = (typeof performance !== 'undefined' && performance.now)
+	? () => performance.now()
+	: () => Date.now();
 const NODE_BLOCKING_OVERLAP_KINDS = new Set(['tower', 'wall', 'water', 'delta', 'river', 'hedge', 'cathedralHedge']);
 
 function keyOf(x, y) {
@@ -95,9 +117,6 @@ export class LazyVisibilityGraph {
 		// corners would be needed for an exact offset). Portals stay undilated
 		// so gates/bridges remain passable.
 		const clearance = Number.isFinite(opts.clearance) && opts.clearance > 0 ? opts.clearance : 0;
-		const waterNodePenalty = Number.isFinite(opts.waterNodePenalty) ? Math.max(0, opts.waterNodePenalty) : 4;
-		const towerNodePenalty = Number.isFinite(opts.towerNodePenalty) ? Math.max(0, opts.towerNodePenalty) : 4;
-		this.routeLinePenalty = Number.isFinite(opts.routeLinePenalty) ? Math.max(0, opts.routeLinePenalty) : 0.15;
 
 		// --- 1. Collect polygons as point arrays, then dilate, then flatten ---
 		const rawPolys = [];           // Array<Array<{x,y}>> before dilation
@@ -120,8 +139,13 @@ export class LazyVisibilityGraph {
 			if (p.kind === 'gate' && p.center && Number.isFinite(p.radius)) {
 				portals.push({ kind: 'gate', cx: p.center.x, cy: p.center.y, r: p.radius });
 			} else if (p.polygon && p.polygon.length >= 3) {
+				// Bridges: keep a clearance margin from the bridge SIDES (the long
+				// rails / the water edge) by shrinking only the WIDTH (minor) axis.
+				// The LENGTH (travel) axis is left untouched so the deck still reaches
+				// both banks — a uniform shrink would shorten it and break the
+				// shore connection.
 				const verts = (clearance > 0 && p.kind === 'bridge')
-					? dilatePolygon(p.polygon, -clearance)
+					? shrinkMinorAxis(p.polygon, clearance)
 					: p.polygon;
 				const flat = new Float64Array(verts.length * 2);
 				let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -134,21 +158,6 @@ export class LazyVisibilityGraph {
 				portals.push({ kind: p.kind, poly: flat, minX, minY, maxX, maxY });
 			}
 		}
-		const softBarrierSegments = [];
-		for (const b of obstacles.softBarriers || []) {
-			const pts = b.polyline || b.points || null;
-			if (!pts || pts.length < 2) continue;
-			const penalty = Number.isFinite(b.penalty) ? Math.max(0, b.penalty) : 1;
-			for (let i = 0; i < pts.length - 1; i++) {
-				const a = pts[i], c = pts[i + 1];
-				if (!a || !c) continue;
-				if (!Number.isFinite(a.x) || !Number.isFinite(a.y) || !Number.isFinite(c.x) || !Number.isFinite(c.y)) continue;
-				if (Math.hypot(c.x - a.x, c.y - a.y) < EPS) continue;
-				softBarrierSegments.push({ ax: a.x, ay: a.y, bx: c.x, by: c.y, penalty });
-			}
-		}
-		this.softBarrierCount = softBarrierSegments.length;
-
 		// Apply dilation, then flatten to SoA + bbox.
 		const polygons = [];          // Array<Float64Array>
 		const polyBboxes = [];
@@ -220,16 +229,6 @@ export class LazyVisibilityGraph {
 			if (b.minY < gMinY) gMinY = b.minY;
 			if (b.maxX > gMaxX) gMaxX = b.maxX;
 			if (b.maxY > gMaxY) gMaxY = b.maxY;
-		}
-		for (const s of softBarrierSegments) {
-			const minX = s.ax < s.bx ? s.ax : s.bx;
-			const minY = s.ay < s.by ? s.ay : s.by;
-			const maxX = s.ax > s.bx ? s.ax : s.bx;
-			const maxY = s.ay > s.by ? s.ay : s.by;
-			if (minX < gMinX) gMinX = minX;
-			if (minY < gMinY) gMinY = minY;
-			if (maxX > gMaxX) gMaxX = maxX;
-			if (maxY > gMaxY) gMaxY = maxY;
 		}
 		if (!isFinite(gMinX)) { gMinX = 0; gMinY = 0; gMaxX = 1; gMaxY = 1; }
 		this.bounds = { minX: gMinX, minY: gMinY, maxX: gMaxX, maxY: gMaxY };
@@ -339,38 +338,6 @@ export class LazyVisibilityGraph {
 
 		// --- 5. Nodes: dedup polygon vertices → SoA + cell buckets ---
 		const nodeMap = new Map();      // key → node index
-		// --- 4c. Soft barriers (roads): legal to cross, but costly. ---
-		this.sx1 = new Float64Array(this.softBarrierCount);
-		this.sy1 = new Float64Array(this.softBarrierCount);
-		this.sx2 = new Float64Array(this.softBarrierCount);
-		this.sy2 = new Float64Array(this.softBarrierCount);
-		this.sminX = new Float64Array(this.softBarrierCount);
-		this.sminY = new Float64Array(this.softBarrierCount);
-		this.smaxX = new Float64Array(this.softBarrierCount);
-		this.smaxY = new Float64Array(this.softBarrierCount);
-		this.sPenalty = new Float64Array(this.softBarrierCount);
-		this.softBarrierGrid = new SpatialGrid(this.bounds, cellSize);
-		const sbg = this.softBarrierGrid;
-		for (let i = 0; i < softBarrierSegments.length; i++) {
-			const s = softBarrierSegments[i];
-			this.sx1[i] = s.ax; this.sy1[i] = s.ay;
-			this.sx2[i] = s.bx; this.sy2[i] = s.by;
-			this.sminX[i] = s.ax < s.bx ? s.ax : s.bx;
-			this.sminY[i] = s.ay < s.by ? s.ay : s.by;
-			this.smaxX[i] = s.ax > s.bx ? s.ax : s.bx;
-			this.smaxY[i] = s.ay > s.by ? s.ay : s.by;
-			this.sPenalty[i] = s.penalty;
-			const x0 = sbg.col(this.sminX[i]), x1 = sbg.col(this.smaxX[i]);
-			const y0 = sbg.row(this.sminY[i]), y1 = sbg.row(this.smaxY[i]);
-			for (let cy = y0; cy <= y1; cy++)
-				for (let cx = x0; cx <= x1; cx++) {
-					const k = sbg.key(cx, cy);
-					let arr = sbg.bins[k];
-					if (!arr) { arr = []; sbg.bins[k] = arr; }
-					arr.push(i);
-				}
-		}
-
 		const nodeOwners = [];          // Int32Array per node later
 		const nXtmp = [], nYtmp = [];
 		const addNode = (x, y, owner) => {
@@ -416,25 +383,6 @@ export class LazyVisibilityGraph {
 		this.ownerIdx = new Int32Array(this.ownerStarts[this.nodeCount]);
 		for (let i = 0, k = 0; i < this.nodeCount; i++)
 			for (const o of nodeOwners[i]) this.ownerIdx[k++] = o;
-		this.nodePenalty = new Float64Array(this.nodeCount);
-		for (let i = 0; i < this.nodeCount; i++) {
-			if (this._inPortal(this.nodeX[i], this.nodeY[i])) continue;
-			const start = this.ownerStarts[i], end = this.ownerStarts[i + 1];
-			for (let k = start; k < end; k++) {
-				const owner = this.ownerIdx[k];
-				if (owner >= 0 && polyIsWater[owner]) {
-					this.nodePenalty[i] = waterNodePenalty;
-					break;
-				}
-				if (owner >= 0 && rawKinds[owner] === 'tower') {
-					this.nodePenalty[i] = Math.max(this.nodePenalty[i], towerNodePenalty);
-				}
-			}
-		}
-		this.nodePenaltyByKey = new Map();
-		for (let i = 0; i < this.nodeCount; i++) {
-			if (this.nodePenalty[i] > 0) this.nodePenaltyByKey.set(keyOf(this.nodeX[i], this.nodeY[i]), this.nodePenalty[i]);
-		}
 
 		// --- 6. Node spatial grid (bucket node indices) ---
 		this.nodeCellSize = opts.nodeCellSize || cellSize;
@@ -475,6 +423,11 @@ export class LazyVisibilityGraph {
 
 		// --- 7. Lazy edge cache: nodeIndex → array of {to, w} ---
 		this.adjCache = new Array(this.nodeCount).fill(null);
+		// EXPERIMENTAL EXACT ROUTING CACHE: used only by astar(..., { exact: true }).
+		// Remove this plus expandNodeExact/queryPoint exact branches to return to
+		// the previous local-neighbour graph.
+		this.exactAdjCache = new Array(this.nodeCount).fill(null);
+		this.rawExactAdjCache = new Array(this.nodeCount).fill(null);
 		this.neighborRing = opts.neighborRing || 8;
 
 		this._losVisited = new Uint32Array(this.blockerCount);
@@ -484,7 +437,34 @@ export class LazyVisibilityGraph {
 		this._nodeVisited = new Uint32Array(this.nodeCount);
 		this._nodeEpoch = 0;
 
+		this.tempBlockers = [];
+		// Transient overlays of adjCache/exactAdjCache filtered by the active temp
+		// blockers; null when no blockers are active. The base caches stay clean
+		// (blocker-free) so they survive blocker churn. See neighbors().
+		this._blockedAdjCache = null;
+		this._blockedExactCache = null;
+		this._blockedRawExactCache = null;
+
 		this.buildTimeMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tStart;
+	}
+
+	addTempBlocker(ax, ay, bx, by) {
+		this.tempBlockers.push({ ax, ay, bx, by });
+		// Only the transient blocked overlay is invalidated; the clean base
+		// adjacency (adjCache/exactAdjCache) is blocker-independent and stays warm.
+		this._blockedAdjCache = null;
+		this._blockedExactCache = null;
+		this._blockedRawExactCache = null;
+	}
+
+	clearTempBlockers() {
+		if (this.tempBlockers.length === 0) return;
+		// Cheap revert: drop the overlay, keep the warm base. Subsequent queries on
+		// this same map reuse the already-computed clean visibility.
+		this.tempBlockers = [];
+		this._blockedAdjCache = null;
+		this._blockedExactCache = null;
+		this._blockedRawExactCache = null;
 	}
 
 	// ---- Portal hit test (inlines-able; small loop) ----
@@ -494,10 +474,10 @@ export class LazyVisibilityGraph {
 			const p = portals[i];
 			if (p.kind === 'gate') {
 				const dx = px - p.cx, dy = py - p.cy;
-				if (dx * dx + dy * dy < p.r * p.r) return true;
+				if (dx * dx + dy * dy <= (p.r + POINT_EPS) * (p.r + POINT_EPS)) return true;
 			} else {
 				if (px < p.minX - EPS || px > p.maxX + EPS || py < p.minY - EPS || py > p.maxY + EPS) continue;
-				if (pointInPolygon(px, py, p.poly)) return true;
+				if (pointInPolygon(px, py, p.poly) || _onPolygonBoundary(px, py, p.poly, POINT_EPS)) return true;
 			}
 		}
 		return false;
@@ -531,14 +511,26 @@ export class LazyVisibilityGraph {
 		return false;
 	}
 
-	// True iff (uIdx, vIdx) are two non-adjacent vertices of the same polygon
-	// (a diagonal through the interior). Edge-cross alone misses this case
-	// because the diagonal lies entirely inside the polygon and crosses none
-	// of its edges. Endpoint coordinates are looked up by index.
+	// True iff the segment (uIdx, vIdx) passes through the interior of a polygon
+	// that both endpoints are vertices of. Edge-cross alone misses this case: a
+	// chord between two boundary vertices crosses none of the polygon's edges, yet
+	// for a CONVEX polygon it runs straight through the interior.
+	//
+	// The endpoints split into: adjacent vertices (a real boundary edge — never
+	// blocked) and non-adjacent vertices (a "diagonal"). A non-adjacent chord that
+	// crosses no edge is wholly inside or wholly outside the polygon — convex
+	// polygons put it inside (block), but a CONCAVE polygon's chord across a
+	// concave bay runs OUTSIDE (a legal shortest-path edge that hugs the wall).
+	// So we don't block on non-adjacency alone (that wrongly rejected wall-hugging
+	// routes around concave buildings); we sample the chord interior and block only
+	// when it actually enters the polygon. Any re-entry that does cross an edge is
+	// caught by the normal edge-cross test in losClear.
 	_diagonalBlocked(uIdx, vIdx) {
 		const uStart = this.ownerStarts[uIdx], uEnd = this.ownerStarts[uIdx + 1];
 		const vStart = this.ownerStarts[vIdx], vEnd = this.ownerStarts[vIdx + 1];
 		const ownerIdx = this.ownerIdx;
+		const ux = this.nodeX[uIdx], uy = this.nodeY[uIdx];
+		const vx = this.nodeX[vIdx], vy = this.nodeY[vIdx];
 		for (let i = uStart; i < uEnd; i++) {
 			const pi = ownerIdx[i];
 			if (pi < 0) continue;
@@ -547,8 +539,6 @@ export class LazyVisibilityGraph {
 				// Common polygon pi — find u, v positions in its vertex ring.
 				const poly = this.polygons[pi];
 				const n = poly.length / 2;
-				const ux = this.nodeX[uIdx], uy = this.nodeY[uIdx];
-				const vx = this.nodeX[vIdx], vy = this.nodeY[vIdx];
 				let uPos = -1, vPos = -1;
 				for (let k = 0; k < n; k++) {
 					if (uPos < 0 && Math.abs(poly[k * 2] - ux) < EPS && Math.abs(poly[k * 2 + 1] - uy) < EPS) uPos = k;
@@ -557,8 +547,15 @@ export class LazyVisibilityGraph {
 				}
 				if (uPos < 0 || vPos < 0) continue;
 				const diff = Math.abs(uPos - vPos);
-				// A polygon ring of length n has wraparound: positions 0 and n-1 are adjacent.
-				if (diff !== 1 && diff !== n - 1) return true;
+				// Adjacent (incl. ring wraparound 0..n-1): a real boundary edge, not a diagonal.
+				if (diff === 1 || diff === n - 1) continue;
+				// Non-adjacent: block only if the chord actually runs through pi's
+				// interior. Sample interior points (skip the endpoints, which sit on
+				// the boundary where ray-casting is unreliable).
+				for (let t = 1; t <= 3; t++) {
+					const s = t / 4;
+					if (pointInPolygon(ux + (vx - ux) * s, uy + (vy - uy) * s, poly)) return true;
+				}
 			}
 		}
 		return false;
@@ -571,7 +568,7 @@ export class LazyVisibilityGraph {
 	// to one of the endpoint's own polygons. This prevents paths from sneaking
 	// through gaps at vertices shared between different obstacles (e.g. wall
 	// segment quads meeting tower circles at wall corners).
-	losClear(ax, ay, bx, by, uIdx = -1, vIdx = -1) {
+	losClear(ax, ay, bx, by, uIdx = -1, vIdx = -1, ignoreTemp = false) {
 		if (uIdx >= 0 && vIdx >= 0 && this._diagonalBlocked(uIdx, vIdx)) return false;
 		const bg = this.blockerGrid;
 		const minX = ax < bx ? ax : bx, maxX = ax > bx ? ax : bx;
@@ -620,6 +617,12 @@ export class LazyVisibilityGraph {
 				}
 			}
 		}
+		if (!ignoreTemp) {
+			for (let ti = 0; ti < this.tempBlockers.length; ti++) {
+				const tb = this.tempBlockers[ti];
+				if (_segmentsCross(ax, ay, bx, by, tb.ax, tb.ay, tb.bx, tb.by)) return false;
+			}
+		}
 		return !this._segmentInteriorBlocked(ax, ay, bx, by);
 	}
 
@@ -644,7 +647,7 @@ export class LazyVisibilityGraph {
 	// Used by smoothPath() for post-processing. No ownership-aware edge
 	// skipping (path nodes come from the dilated graph; their "owners" don't
 	// correspond to raw polygon indices), so we use plain segment-cross.
-	losClearRaw(ax, ay, bx, by) {
+	losClearRaw(ax, ay, bx, by, ignoreTemp = false) {
 		const bg = this.rawBlockerGrid;
 		const minX = ax < bx ? ax : bx, maxX = ax > bx ? ax : bx;
 		const minY = ay < by ? ay : by, maxY = ay > by ? ay : by;
@@ -669,62 +672,23 @@ export class LazyVisibilityGraph {
 				}
 			}
 		}
+		if (!ignoreTemp) {
+			for (let ti = 0; ti < this.tempBlockers.length; ti++) {
+				const tb = this.tempBlockers[ti];
+				if (_segmentsCross(ax, ay, bx, by, tb.ax, tb.ay, tb.bx, tb.by)) return false;
+			}
+		}
 		return !this._segmentInteriorBlocked(ax, ay, bx, by);
 	}
 
-	softBarrierPenalty(ax, ay, bx, by) {
-		if (!this.softBarrierCount) return 0;
-		const minX = ax < bx ? ax : bx, maxX = ax > bx ? ax : bx;
-		const minY = ay < by ? ay : by, maxY = ay > by ? ay : by;
-		const sx1 = this.sx1, sy1 = this.sy1, sx2 = this.sx2, sy2 = this.sy2;
-		const smnX = this.sminX, smnY = this.sminY, smxX = this.smaxX, smxY = this.smaxY;
-		if (this.softBarrierCount <= 512) {
-			let penalty = 0;
-			for (let si = 0; si < this.softBarrierCount; si++) {
-				if (smxX[si] < minX - EPS || smnX[si] > maxX + EPS) continue;
-				if (smxY[si] < minY - EPS || smnY[si] > maxY + EPS) continue;
-				if (_segmentsProperlyCross(ax, ay, bx, by, sx1[si], sy1[si], sx2[si], sy2[si]))
-					penalty += this.sPenalty[si];
-			}
-			return penalty;
-		}
-		const bg = this.softBarrierGrid;
-		const x0 = bg.col(minX), x1 = bg.col(maxX);
-		const y0 = bg.row(minY), y1 = bg.row(maxY);
-		const seen = new Set();
-		let penalty = 0;
-		for (let cy = y0; cy <= y1; cy++) {
-			for (let cx = x0; cx <= x1; cx++) {
-				const arr = bg.bins[bg.key(cx, cy)];
-				if (!arr) continue;
-				for (let a = 0; a < arr.length; a++) {
-					const si = arr[a];
-					if (seen.has(si)) continue;
-					seen.add(si);
-					if (smxX[si] < minX - EPS || smnX[si] > maxX + EPS) continue;
-					if (smxY[si] < minY - EPS || smnY[si] > maxY + EPS) continue;
-					if (_segmentsProperlyCross(ax, ay, bx, by, sx1[si], sy1[si], sx2[si], sy2[si]))
-						penalty += this.sPenalty[si];
-				}
-			}
-		}
-		return penalty;
-	}
-
 	edgeCost(ax, ay, bx, by) {
-		const w = Math.hypot(bx - ax, by - ay);
-		const TIEBREAK = 0.001;
-		return w + TIEBREAK * w * w + this.softBarrierPenalty(ax, ay, bx, by);
-	}
-
-	pointPenalty(x, y) {
-		return this.nodePenaltyByKey.get(keyOf(x, y)) || 0;
+		return Math.hypot(bx - ax, by - ay);
 	}
 
 	pathCost(path, from, to) {
 		let cost = 0;
 		for (let i = from + 1; i <= to; i++)
-			cost += this.edgeCost(path[i - 1].x, path[i - 1].y, path[i].x, path[i].y) + this.pointPenalty(path[i].x, path[i].y);
+			cost += this.edgeCost(path[i - 1].x, path[i - 1].y, path[i].x, path[i].y);
 		return cost;
 	}
 
@@ -737,11 +701,9 @@ export class LazyVisibilityGraph {
 			for (let i = 1; i < out.length - 1; i++) {
 				const a = out[i - 1], b = out[i], c = out[i + 1];
 				if (!this.losClearRaw(a.x, a.y, c.x, c.y)) continue;
-				const scBarrier = this.softBarrierPenalty(a.x, a.y, c.x, c.y);
-				if (scBarrier > 0) {
-					const origBarrier = this.softBarrierPenalty(a.x, a.y, b.x, b.y) + this.softBarrierPenalty(b.x, b.y, c.x, c.y);
-					if (scBarrier > origBarrier) continue;
-				}
+				const shortcutCost = this.edgeCost(a.x, a.y, c.x, c.y);
+				const originalCost = this.edgeCost(a.x, a.y, b.x, b.y) + this.edgeCost(b.x, b.y, c.x, c.y);
+				if (shortcutCost > originalCost + EPS) continue;
 				out.splice(i, 1);
 				changed = true;
 				break;
@@ -764,13 +726,9 @@ export class LazyVisibilityGraph {
 			const ax = path[anchor].x, ay = path[anchor].y;
 			for (let j = path.length - 1; j > anchor + 1; j--) {
 				if (!this.losClearRaw(ax, ay, path[j].x, path[j].y)) continue;
-				const scBarrier = this.softBarrierPenalty(ax, ay, path[j].x, path[j].y);
-				if (scBarrier > 0) {
-					let origBarrier = 0;
-					for (let m = anchor + 1; m <= j; m++)
-						origBarrier += this.softBarrierPenalty(path[m - 1].x, path[m - 1].y, path[m].x, path[m].y);
-					if (scBarrier > origBarrier) continue;
-				}
+				const shortcutCost = this.edgeCost(ax, ay, path[j].x, path[j].y);
+				const originalCost = this.pathCost(path, anchor, j);
+				if (shortcutCost > originalCost + EPS) continue;
 				farthest = j;
 				break;
 			}
@@ -809,16 +767,89 @@ export class LazyVisibilityGraph {
 		for (let k = 0; k < candidates.length; k++) {
 			const j = candidates[k];
 			const vx = this.nodeX[j], vy = this.nodeY[j];
-			if (!this.losClear(ux, uy, vx, vy, i, j)) continue;
+			if (!this.losClear(ux, uy, vx, vy, i, j, true)) continue;
 			const w = Math.hypot(vx - ux, vy - uy);
-			out.push({ to: j, w, cost: this.edgeCost(ux, uy, vx, vy) + this.nodePenalty[j] });
+			out.push({ to: j, w, cost: w });
 		}
 		this.adjCache[i] = out;
 		return out;
 	}
 
-	neighbors(i) {
-		return this.adjCache[i] || this.expandNode(i);
+	// EXPERIMENTAL EXACT ROUTING: build the full visible-neighbour set for this
+	// node. This is intentionally slower than expandNode(), but avoids missing a
+	// long tangent edge around convex/round obstacles. Easy removal: delete this
+	// method and the astar/queryPoint exact branches.
+	expandNodeExact(i) {
+		const cached = this.exactAdjCache[i];
+		if (cached) return cached;
+		const ux = this.nodeX[i], uy = this.nodeY[i];
+		const out = [];
+		for (let j = 0; j < this.nodeCount; j++) {
+			if (j === i || this.nodeBlocked[j]) continue;
+			const vx = this.nodeX[j], vy = this.nodeY[j];
+			if (!this.losClear(ux, uy, vx, vy, i, j, true)) continue;
+			const w = Math.hypot(vx - ux, vy - uy);
+			out.push({ to: j, w, cost: w });
+		}
+		this.exactAdjCache[i] = out;
+		return out;
+	}
+
+	expandNodeRawExact(i) {
+		const cached = this.rawExactAdjCache[i];
+		if (cached) return cached;
+		const ux = this.nodeX[i], uy = this.nodeY[i];
+		const out = [];
+		for (let j = 0; j < this.nodeCount; j++) {
+			if (j === i || this.nodeBlocked[j]) continue;
+			const vx = this.nodeX[j], vy = this.nodeY[j];
+			if (!this.losClearRaw(ux, uy, vx, vy, true)) continue;
+			const w = Math.hypot(vx - ux, vy - uy);
+			out.push({ to: j, w, cost: w });
+		}
+		this.rawExactAdjCache[i] = out;
+		return out;
+	}
+
+	neighbors(i, exact = false, rawVisibility = false) {
+		const base = rawVisibility
+			? (this.rawExactAdjCache[i] || this.expandNodeRawExact(i))
+			: exact
+				? (this.exactAdjCache[i] || this.expandNodeExact(i))
+				: (this.adjCache[i] || this.expandNode(i));
+		if (this.tempBlockers.length === 0) return base;
+		// Temp blockers are a transient overlay over the clean base: a blocker can
+		// only REMOVE edges, so the blocked neighbour list is the base list minus
+		// edges crossing a blocker. The base is never mutated, so clearing blockers
+		// restores it instantly and it stays warm across queries on this map.
+		const overlay = rawVisibility
+			? (this._blockedRawExactCache || (this._blockedRawExactCache = new Array(this.nodeCount).fill(null)))
+			: exact
+				? (this._blockedExactCache || (this._blockedExactCache = new Array(this.nodeCount).fill(null)))
+				: (this._blockedAdjCache || (this._blockedAdjCache = new Array(this.nodeCount).fill(null)));
+		let blocked = overlay[i];
+		if (!blocked) { blocked = this._filterByTempBlockers(i, base); overlay[i] = blocked; }
+		return blocked;
+	}
+
+	// Drop edges from a clean adjacency list whose segment crosses an active temp
+	// blocker. Cheap (few neighbours x few blockers) and exact — this is what lets
+	// addTempBlocker skip recomputing visibility from scratch (see F: scoped revert).
+	_filterByTempBlockers(i, baseList) {
+		const ux = this.nodeX[i], uy = this.nodeY[i];
+		const tbs = this.tempBlockers;
+		const out = [];
+		for (let k = 0; k < baseList.length; k++) {
+			const e = baseList[k];
+			const vx = this.nodeX[e.to], vy = this.nodeY[e.to];
+			let crosses = false;
+			for (let ti = 0; ti < tbs.length; ti++) {
+				const tb = tbs[ti];
+				if (_segmentsCross(ux, uy, vx, vy, tb.ax, tb.ay, tb.bx, tb.by)) { crosses = true; break; }
+			}
+			if (!crosses) out.push(e);
+		}
+		return out;
 	}
 
 	// ---- Splice a transient start/goal point into the graph ----
@@ -826,8 +857,30 @@ export class LazyVisibilityGraph {
 	// Uses EXPANDING RINGS: starts at neighborRing cells and doubles until
 	// at least one visible node is found or the whole grid is covered. This
 	// guarantees connectivity for arbitrary click points in open space.
-	queryPoint(px, py) {
+	queryPoint(px, py, exact = false, rawVisibility = false) {
 		if (this._inRawObstacle(px, py)) return { index: -1, x: px, y: py, _links: [], _isQuery: true };
+		if (rawVisibility) {
+			const links = [];
+			for (let j = 0; j < this.nodeCount; j++) {
+				if (this.nodeBlocked[j]) continue;
+				const vx = this.nodeX[j], vy = this.nodeY[j];
+				if (this.losClearRaw(px, py, vx, vy))
+					links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
+			}
+			return { index: -1, x: px, y: py, _links: links, _isQuery: true };
+		}
+		if (exact) {
+			// EXPERIMENTAL EXACT ROUTING: route endpoints connect to every visible
+			// graph vertex instead of stopping at the first populated local ring.
+			const links = [];
+			for (let j = 0; j < this.nodeCount; j++) {
+				if (this.nodeBlocked[j]) continue;
+				const vx = this.nodeX[j], vy = this.nodeY[j];
+				if (this.losClear(px, py, vx, vy, -1, j))
+					links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
+			}
+			return { index: -1, x: px, y: py, _links: links, _isQuery: true };
+		}
 		const ng = this.nodeGrid;
 		const cx0 = ng.col(px), cy0 = ng.row(py);
 		const maxRing = Math.max(ng.cols, ng.rows);
@@ -849,7 +902,7 @@ export class LazyVisibilityGraph {
 						seen.add(j);
 						const vx = this.nodeX[j], vy = this.nodeY[j];
 						if (this.losClear(px, py, vx, vy, -1, j)) {
-							links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: this.edgeCost(px, py, vx, vy) + this.nodePenalty[j] });
+							links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
 						}
 					}
 				}
@@ -863,10 +916,15 @@ export class LazyVisibilityGraph {
 	// start, goal may be node indices or {x, y} points (spliced as query points).
 	// Off-graph points use expanding-ring queryPoint so they always find visible
 	// graph nodes (unless fully enclosed by obstacles).
-	astar(start, goal) {
+	astar(start, goal, opts = {}) {
+		// EXPERIMENTAL EXACT ROUTING SWITCH: { exact: true } trades speed for a
+		// fuller visibility graph during route testing. Omit the option to keep
+		// the older lazy local-neighbour behaviour.
+		const exact = !!opts.exact;
+		const rawVisibility = !!opts.rawVisibility;
 		const startNode = (typeof start === 'number')
 			? { index: start, x: this.nodeX[start], y: this.nodeY[start], _links: null, _isQuery: false }
-			: this.queryPoint(start.x, start.y);
+			: this.queryPoint(start.x, start.y, exact, rawVisibility);
 
 		// For off-graph goals: precompute which graph nodes can see the goal.
 		// A* terminates when any of those nodes is popped → append goal to path.
@@ -878,21 +936,14 @@ export class LazyVisibilityGraph {
 		const GOAL_IDX = -3;
 		let goalLinkMap = null;
 		if (goalIsOffGraph) {
-			const goalQuery = this.queryPoint(goal.x, goal.y);
+			const goalQuery = this.queryPoint(goal.x, goal.y, exact, rawVisibility);
 			goalLinkMap = new Map(goalQuery._links.map(l => [l.to, l.w]));
 		}
 
-		// Superlinear edge penalty: tiny epsilon * w² added to each hop so
-		// ties in total length break toward paths with more short hops (staying
-		// local, one side of the street) instead of fewer long hops (switching
-		// sides). The penalty is small enough not to dominate real path length
-		// but breaks the degenerate case where both sides yield equal length.
-		const sgLen = Math.hypot(goalX - startNode.x, goalY - startNode.y);
-		const useSgBarrier = sgLen > 5 && this.routeLinePenalty > 0;
-		const sgSx = startNode.x, sgSy = startNode.y;
-		const sgGx = goalX, sgGy = goalY;
-
-		const h = (nx, ny) => Math.hypot(nx - goalX, ny - goalY);
+		// Weighted A*: f = g + W·h. W>1 trims the frontier (fewer node expansions,
+		// fewer lazy-visibility computations) at the cost of paths up to W× optimal.
+		const W = Number.isFinite(opts.heuristicWeight) ? opts.heuristicWeight : ASTAR_HEURISTIC_WEIGHT;
+		const h = (nx, ny) => W * Math.hypot(nx - goalX, ny - goalY);
 		const open = [];
 		const push = (idx, x, y, g, f, parent) => {
 			open.push({ idx, x, y, g, f, parent });
@@ -930,9 +981,15 @@ export class LazyVisibilityGraph {
 		push(startIdx, startNode.x, startNode.y, 0, h(startNode.x, startNode.y), null);
 
 		let iterations = 0;
-		const MAX_ITER = 100000;
+		const MAX_ITER = Number.isFinite(opts.maxExpansions) ? opts.maxExpansions : 100000;
+		const timeBudgetMs = Number.isFinite(opts.timeBudgetMs) ? opts.timeBudgetMs : ASTAR_TIME_BUDGET_MS;
+		const tStart = timeBudgetMs > 0 ? _now() : 0;
 		while (open.length > 0 && iterations++ < MAX_ITER) {
+			// (A) Wall-clock budget: bail to "no route" rather than grinding the
+			// whole graph on a heuristic-defeating cross-river detour.
+			if (timeBudgetMs > 0 && (iterations & ASTAR_BUDGET_CHECK_MASK) === 0 && _now() - tStart > timeBudgetMs) return null;
 			const cur = pop();
+			if (cur.g > (gScore.get(cur.idx) ?? Infinity) + EPS) continue;
 			if (closed.has(cur.idx)) continue;
 			closed.add(cur.idx);
 
@@ -946,18 +1003,17 @@ export class LazyVisibilityGraph {
 
 			let neighbours = (cur.idx === START_IDX)
 				? startNode._links
-				: this.neighbors(cur.idx);
+				: this.neighbors(cur.idx, exact, rawVisibility);
 			if (goalIsOffGraph) {
 				let goalLink = null;
 				if (cur.idx === START_IDX) {
-					if (this.losClear(cur.x, cur.y, goalX, goalY, -1, -1) &&
-						this.losClearRaw(cur.x, cur.y, goalX, goalY))
+					if (rawVisibility ? this.losClearRaw(cur.x, cur.y, goalX, goalY) : this.losClear(cur.x, cur.y, goalX, goalY, -1, -1))
 						goalLink = {
 							to: GOAL_IDX,
 							w: Math.hypot(goalX - cur.x, goalY - cur.y),
 							cost: this.edgeCost(cur.x, cur.y, goalX, goalY),
 						};
-				} else if (goalLinkMap.has(cur.idx) && this.losClearRaw(cur.x, cur.y, goalX, goalY)) {
+				} else if (goalLinkMap.has(cur.idx) && (rawVisibility ? this.losClearRaw(cur.x, cur.y, goalX, goalY) : this.losClear(cur.x, cur.y, goalX, goalY, cur.idx, -1))) {
 					goalLink = {
 						to: GOAL_IDX,
 						w: goalLinkMap.get(cur.idx),
@@ -972,11 +1028,7 @@ export class LazyVisibilityGraph {
 				const ex = e.to === GOAL_IDX ? goalX : this.nodeX[e.to];
 				const ey = e.to === GOAL_IDX ? goalY : this.nodeY[e.to];
 				const baseCost = Number.isFinite(e.cost) ? e.cost : this.edgeCost(cur.x, cur.y, ex, ey);
-				let sgPenalty = 0;
-				if (useSgBarrier && _segmentsProperlyCross(cur.x, cur.y, ex, ey, sgSx, sgSy, sgGx, sgGy)) {
-					sgPenalty = this.routeLinePenalty;
-				}
-				const tentative = cur.g + baseCost + sgPenalty;
+				const tentative = cur.g + baseCost;
 				if (gScore.has(e.to) && tentative >= gScore.get(e.to)) continue;
 				gScore.set(e.to, tentative);
 				push(e.to, ex, ey, tentative, tentative + h(ex, ey), cur);
@@ -988,11 +1040,19 @@ export class LazyVisibilityGraph {
 
 // ---------- geometry primitives (module-level, hot) ----------
 
-// Minkowski-sum-with-disc approximation: offset each convex vertex outward
-// along the exterior angle bisector by r / sin(θ/2). Reflex vertices are kept
-// in place (standard offset-polygon approximation; exact offset would insert
-// an arc at each reflex corner). Portal polygons are never dilated — only
-// the obstacle polygons passed through `rawPolys` in the constructor.
+// Minkowski-sum-with-disc approximation: offset each vertex outward along the
+// exterior angle bisector by r / sin(θ/2) (the miter point where the two
+// edge-lines, each pushed out by r, meet). Convex AND reflex vertices use the
+// same miter — a reflex (concave) corner is pushed into the FREE area on its
+// open side so the clearance band stays continuous there too, instead of
+// leaving an un-dilated notch a path could cut into. Reflex miters are clamped
+// twice (a bevel limit AND half the shorter adjacent edge) so they can't
+// overshoot a narrow notch; and as a hard guarantee, if mitering the reflex
+// vertices would make the ring self-intersect, those vertices are left in
+// place for that polygon (worst case = the old offset, never worse). Portal
+// polygons are never dilated.
+const REFLEX_MITER_LIMIT = 2.5;
+const REFLEX_EDGE_FRAC = 0.5;
 export function dilatePolygon(pts, r) {
 	const n = pts.length;
 	if (n < 3 || r === 0) return pts;
@@ -1013,6 +1073,7 @@ export function dilatePolygon(pts, r) {
 		else normals[i] = { x: -dy / len, y: dx / len };
 	}
 	const result = new Array(n);
+	const reflexIdx = [];
 	for (let i = 0; i < n; i++) {
 		const prev = (i - 1 + n) % n;
 		const next = (i + 1) % n;
@@ -1021,26 +1082,96 @@ export function dilatePolygon(pts, r) {
 		const e2x = pts[next].x - pts[i].x, e2y = pts[next].y - pts[i].y;
 		const cross = e1x * e2y - e1y * e2x;
 		const isConvex = ccw ? cross > EPS : cross < -EPS;
-		if (!isConvex) {
-			// Reflex vertex — keep in place (gap filled by adjacent convex offsets).
-			result[i] = { x: pts[i].x, y: pts[i].y };
-			continue;
-		}
 		const na = normals[prev], nb = normals[i];
 		const dot = na.x * nb.x + na.y * nb.y;
+		const sumX = na.x + nb.x, sumY = na.y + nb.y;
 		// Offset distance = r / sin(θ/2) where θ is interior angle.
 		// sin(θ/2) = sqrt((1 + dot) / 2) where dot = cos(exterior angle).
 		// Combined with bisector direction (na+nb)/|na+nb|, the vertex offset is:
 		//   P' = P + r * (na + nb) / (1 + dot)
-		const sumX = na.x + nb.x, sumY = na.y + nb.y;
 		if (Math.abs(1 + dot) < 1e-9) {
 			result[i] = { x: pts[i].x, y: pts[i].y };
 			continue;
 		}
-		const factor = r / (1 + dot);
+		let factor = r / (1 + dot);
+		if (!isConvex) {
+			// Reflex vertex — miter into the free (concave-side) area, but clamp the
+			// displacement so it can't bevel-spike or jump across a narrow notch.
+			const dispLen = Math.abs(factor) * Math.hypot(sumX, sumY);
+			const edgeClamp = REFLEX_EDGE_FRAC * Math.min(Math.hypot(e1x, e1y), Math.hypot(e2x, e2y));
+			const maxLen = Math.min(REFLEX_MITER_LIMIT * Math.abs(r), edgeClamp);
+			if (dispLen > maxLen && dispLen > 1e-12) factor *= maxLen / dispLen;
+			reflexIdx.push(i);
+		}
 		result[i] = { x: pts[i].x + sumX * factor, y: pts[i].y + sumY * factor };
 	}
+	// Hard safety net: if moving the reflex vertices made the ring self-intersect,
+	// drop them back onto the original wall (the old, always-simple behaviour).
+	if (reflexIdx.length && _polygonSelfIntersects(result)) {
+		for (const i of reflexIdx) result[i] = { x: pts[i].x, y: pts[i].y };
+	}
 	return result;
+}
+
+// Proper (non-adjacent) edge-crossing test for a closed ring. O(n²); only run
+// when a polygon actually has mitered reflex vertices.
+function _polygonSelfIntersects(poly) {
+	const m = poly.length;
+	for (let i = 0; i < m; i++) {
+		const a1 = poly[i], a2 = poly[(i + 1) % m];
+		for (let j = i + 1; j < m; j++) {
+			if (j === i || (j + 1) % m === i || (i + 1) % m === j) continue;
+			const b1 = poly[j], b2 = poly[(j + 1) % m];
+			if (_segmentsProperlyCross(a1.x, a1.y, a2.x, a2.y, b1.x, b1.y, b2.x, b2.y)) return true;
+		}
+	}
+	return false;
+}
+
+// Shrink a (roughly rectangular) polygon inward along its MINOR axis only,
+// leaving the major (long) axis untouched. Used for bridges: pull the deck in
+// by `r` from each long side (the rails / water edge) for clearance, but keep
+// its length so it still reaches both banks.
+//
+// The width (shrink) axis is PERPENDICULAR TO THE LONGEST EDGE (a rail / the
+// length direction). Do NOT derive it from a short edge: bridge decks are
+// built by intersecting the rails with the (often angled) river, so the two
+// short shore-end edges run along the slanted bank — not across the deck. Using
+// a shore-end edge as the axis misclassifies the corners on an angled bridge
+// and pushes 2 of the 4 outward, into the water. Every vertex is then moved
+// toward the centreline by `r` along the width axis (clamped so it can't
+// collapse).
+export function shrinkMinorAxis(pts, r) {
+	const n = pts.length;
+	if (n < 3 || r <= 0) return pts;
+	// Centroid.
+	let cx = 0, cy = 0;
+	for (const p of pts) { cx += p.x; cy += p.y; }
+	cx /= n; cy /= n;
+	// Major axis = direction of the longest edge (a rail); width axis ⊥ to it.
+	let bi = 0, bestLen2 = -1;
+	for (let i = 0; i < n; i++) {
+		const j = (i + 1) % n;
+		const dx = pts[j].x - pts[i].x, dy = pts[j].y - pts[i].y;
+		const l2 = dx * dx + dy * dy;
+		if (l2 > bestLen2) { bestLen2 = l2; bi = i; }
+	}
+	const bj = (bi + 1) % n;
+	const mx = pts[bj].x - pts[bi].x, my = pts[bj].y - pts[bi].y;
+	const ml = Math.hypot(mx, my) || 1;
+	const ax = -my / ml, ay = mx / ml; // unit normal to the longest edge
+	// Half-width = max |projection onto minor axis| over all vertices.
+	let half = 0;
+	for (const p of pts) { const proj = Math.abs((p.x - cx) * ax + (p.y - cy) * ay); if (proj > half) half = proj; }
+	// Don't shrink away more than ~80% of the half-width (keep a usable deck).
+	const move = Math.min(r, half * 0.8);
+	const out = new Array(n);
+	for (let i = 0; i < n; i++) {
+		const s = (pts[i].x - cx) * ax + (pts[i].y - cy) * ay; // signed minor-axis offset
+		const k = s > 0 ? -move : move; // pull toward the centreline
+		out[i] = { x: pts[i].x + ax * k, y: pts[i].y + ay * k };
+	}
+	return out;
 }
 
 function _reconstructPath(cur, goalX, goalY, appendGoal) {

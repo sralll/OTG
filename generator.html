@@ -34,6 +34,9 @@
 	<label><input id="obstacles" type="checkbox" /> obstacles</label>
 	<label><input id="routemode" type="checkbox" /> route</label>
 	<button id="clearroute" class="sec">clear route</button>
+	<button id="routetest" class="sec">route stress</button>
+	<button id="saveroutelog" class="sec">save route log</button>
+	<button id="saverouteshots" class="sec">save shots</button>
 	<button id="gen">Generate</button>
 	<button id="fit" class="sec">Fit</button>
 	<span id="status">…</span>
@@ -42,10 +45,25 @@
 
 <script type="module">
 import { generateWards } from './src/core/CityGen.js?v=26';
-import { extractObstacles, thickenPolyline } from './src/core/Obstacles.js?v=5';
-import { buildVisibilityGraph, dilatePolygon } from './src/core/VisibilityGraph.js?v=7';
+import { extractObstacles, thickenPolyline } from './src/core/Obstacles.js?v=7';
+import { buildVisibilityGraph, dilatePolygon } from './src/core/VisibilityGraph.js?v=12';
 
 let visibilityGraph = null;
+const ROUTE_VISIBILITY_GRAPH_OPTIONS = {
+	// Physical runner clearance: routes keep this far from every wall. The route
+	// hugs the DILATED corner (clearance out from the true wall), which is the
+	// correct shortest path under a real body/safety margin — not a detour. The
+	// earlier suboptimality was the _diagonalBlocked over-block (now fixed) plus
+	// route-steering penalties (now removed), not the clearance itself.
+	clearance: 0.3,
+	// Lazy expansion only links nodes within an N-cell ring. ring=8 missed long
+	// tangent/straight edges on open routes (measured up to +100% length); ring=16
+	// is optimal across all tested pairs at size 20/30/40. NOTE: empirical, not a
+	// proof — a sufficiently long open route on a large map could still outrun any
+	// fixed ring. The structurally-guaranteed alternative is a sparse visibility
+	// graph (one-time multi-second precompute per map); see notes.
+	neighborRing: 16,
+};
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const svg = document.getElementById('map');
@@ -779,7 +797,7 @@ function generate() {
 	const vgStart = performance.now();
 	try {
 		const obstacles = extractObstacles(data);
-		visibilityGraph = buildVisibilityGraph(obstacles, { clearance: 0.2 });
+		visibilityGraph = buildVisibilityGraph(obstacles, ROUTE_VISIBILITY_GRAPH_OPTIONS);
 		console.log(`Visibility graph scaffolding built in ${(performance.now() - vgStart).toFixed(1)} ms · ${visibilityGraph.nodeCount} nodes · ${visibilityGraph.blockerCount} blocker edges · edges computed lazily (${visibilityGraph.neighborRing}-cell ring)`);
 	} catch (e) {
 		visibilityGraph = null;
@@ -829,6 +847,322 @@ function screenToWorld(clientX, clientY) {
 	const sx = clientX - r.left, sy = clientY - r.top;
 	return { x: (sx - tx) / scale, y: (sy - ty) / scale };
 }
+function routePathLength(path) {
+	let len = 0;
+	for (let i = 1; i < path.length; i++)
+		len += Math.hypot(path[i].x - path[i-1].x, path[i].y - path[i-1].y);
+	return len;
+}
+const ROUTE_INSIGNIFICANT_BARRIER_KINDS = new Set(['hedge']);
+function routePointInFlatPolygon(px, py, poly) {
+	let inside = false;
+	const n = poly.length;
+	for (let i = 0, j = n - 2; i < n; i += 2, j = i - 2) {
+		const ax = poly[j], ay = poly[j + 1];
+		const bx = poly[i], by = poly[i + 1];
+		if ((ay > py) !== (by > py)) {
+			const xInt = ax + (py - ay) * (bx - ax) / (by - ay);
+			if (px < xInt) inside = !inside;
+		}
+	}
+	return inside;
+}
+function routePointInSignificantRawObstacle(px, py, visGraph) {
+	if (visGraph._inPortal && visGraph._inPortal(px, py)) return false;
+	const grid = visGraph.rawPolyGrid;
+	if (!grid || !visGraph.rawPolygons || !visGraph.rawPolyBboxes || !visGraph.rawKinds)
+		return visGraph._inRawObstacle(px, py);
+	const arr = grid.bins[grid.key(grid.col(px), grid.row(py))];
+	if (!arr) return false;
+	for (let a = 0; a < arr.length; a++) {
+		const pi = arr[a];
+		if (ROUTE_INSIGNIFICANT_BARRIER_KINDS.has(visGraph.rawKinds[pi])) continue;
+		const b = visGraph.rawPolyBboxes[pi];
+		if (px < b.minX || px > b.maxX || py < b.minY || py > b.maxY) continue;
+		if (routePointInFlatPolygon(px, py, visGraph.rawPolygons[pi])) return true;
+	}
+	return false;
+}
+function findSmartBarrier(path, visGraph) {
+	const total = routePathLength(path);
+	if (total < 1e-6) return null;
+	const MAX_HALF = 12;
+	const STEP = 0.25;
+	const MARGIN = 1.0;
+	const SAMPLES = 30;
+
+	// Walk the route to the point at `frac` of its length, then probe perpendicular
+	// to find the corridor wall on each side. `leftHit`/`rightHit` say whether a real
+	// obstacle was found (vs. the probe running off into open space at the MAX_HALF cap).
+	const probe = (frac) => {
+		const targetLen = total * frac;
+		let accum = 0;
+		for (let i = 1; i < path.length; i++) {
+			const segLen = Math.hypot(path[i].x - path[i-1].x, path[i].y - path[i-1].y);
+			if (accum + segLen >= targetLen) {
+				const t = (targetLen - accum) / (segLen || 1);
+				const mx = path[i-1].x + (path[i].x - path[i-1].x) * t;
+				const my = path[i-1].y + (path[i].y - path[i-1].y) * t;
+				const norm = segLen || 1;
+				const px = -(path[i].y - path[i-1].y) / norm;
+				const py = (path[i].x - path[i-1].x) / norm;
+				let leftDist = MAX_HALF, rightDist = MAX_HALF;
+				let leftHit = false, rightHit = false;
+				for (let d = STEP; d <= MAX_HALF; d += STEP) {
+					if (routePointInSignificantRawObstacle(mx + px * d, my + py * d, visGraph)) { leftDist = d; leftHit = true; break; }
+				}
+				for (let d = STEP; d <= MAX_HALF; d += STEP) {
+					if (routePointInSignificantRawObstacle(mx - px * d, my - py * d, visGraph)) { rightDist = d; rightHit = true; break; }
+				}
+				return { mx, my, px, py, leftDist, rightDist, leftHit, rightHit };
+			}
+			accum += segLen;
+		}
+		return null;
+	};
+	// Build the wall segment spanning the corridor at probe point `p`, extended by
+	// MARGIN past each wall so it seats firmly into the flanking obstacles.
+	const wallAt = (p) => ({
+		mx: p.mx, my: p.my,
+		ax: p.mx + p.px * (p.leftDist + MARGIN), ay: p.my + p.py * (p.leftDist + MARGIN),
+		bx: p.mx - p.px * (p.rightDist + MARGIN), by: p.my - p.py * (p.rightDist + MARGIN),
+	});
+
+	// Preferred placement: ~50% of route length (statistically the most decisive
+	// point), but slid to the nearest *enclosed* sample — one with an obstacle on
+	// BOTH sides, so the wall actually seals an alley instead of ending in open
+	// space at a junction (which the path would just round). Narrowest-anywhere is
+	// kept only as a fallback for open maps that have no enclosed corridor at all.
+	let bestEnclosed = null, bestEnclosedScore = Infinity;
+	let bestFallback = null, bestFallbackWidth = Infinity;
+	for (let s = 0; s <= SAMPLES; s++) {
+		const frac = 0.25 + 0.5 * (s / SAMPLES);
+		const p = probe(frac);
+		if (!p) continue;
+		if (p.leftHit && p.rightHit) {
+			const score = Math.abs(frac - 0.5);
+			if (score < bestEnclosedScore) { bestEnclosedScore = score; bestEnclosed = wallAt(p); }
+		}
+		const width = p.leftDist + p.rightDist;
+		if (width < bestFallbackWidth) { bestFallbackWidth = width; bestFallback = wallAt(p); }
+	}
+	return bestEnclosed || bestFallback;
+}
+function drawEndpointMarkers(g, color) {
+	for (const p of routeEndpoints) {
+		const c = document.createElementNS(SVGNS, 'circle');
+		c.setAttribute('cx', p.x); c.setAttribute('cy', p.y);
+		c.setAttribute('r', 0.6); c.setAttribute('fill', color);
+		c.setAttribute('stroke', '#000'); c.setAttribute('stroke-width', 0.1);
+		g.appendChild(c);
+	}
+}
+function drawPathLine(g, path, color) {
+	const pts = path.map(p => `${p.x},${p.y}`).join(' ');
+	const poly = document.createElementNS(SVGNS, 'polyline');
+	poly.setAttribute('points', pts);
+	poly.setAttribute('fill', 'none');
+	poly.setAttribute('stroke', color);
+	poly.setAttribute('stroke-width', 0.3);
+	poly.setAttribute('stroke-linejoin', 'round');
+	poly.setAttribute('stroke-linecap', 'round');
+	g.appendChild(poly);
+}
+
+// EXPERIMENTAL EXACT ROUTING: set false to return route clicks/stress tests to
+// the previous faster local-neighbour visibility graph.
+const ROUTE_USE_EXACT_VISIBILITY = false;
+const ROUTE_ASTAR_OPTIONS = ROUTE_USE_EXACT_VISIBILITY ? { exact: true } : {};
+const ROUTE_MANUAL_ASTAR_OPTIONS = ROUTE_USE_EXACT_VISIBILITY
+	? { exact: true, rawVisibility: true, timeBudgetMs: 0, maxExpansions: 1000000 }
+	: {};
+const ROUTE_MANUAL_ALTERNATE_ATTEMPTS = 3;
+
+function computeRouteOptions(startPt, goalPt, visGraph) {
+	const t0 = performance.now();
+	if (!visGraph) return { ok: false, reason: 'side', paths: [], selected: null, routeLengthSlots: [null, null, null], routeSideSlots: [null, null, null], routeSideLabelSlots: [null, null, null], routeIndexes: [], blockFastest: false, barriers: [], dt: 0 };
+	visGraph.clearTempBlockers();
+
+	const paths = [];
+	const barriers = [];
+	let acceptFirstTwoByDistance = false;
+
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const result = visGraph.astar(startPt, goalPt, ROUTE_ASTAR_OPTIONS);
+		if (!result || result.path.length < 2) break;
+		const path = result.path;
+		const len = routePathLength(path);
+		paths.push({ path, len, routeIndex: attempt + 1 });
+		if (paths.length === 2) {
+			const shorter = Math.min(paths[0].len, paths[1].len);
+			const longer = Math.max(paths[0].len, paths[1].len);
+			if (shorter > 0 && longer <= 1.15 * shorter) {
+				acceptFirstTwoByDistance = true;
+				break;
+			}
+		}
+		const barrier = findSmartBarrier(path, visGraph);
+		if (!barrier) break;
+		if (barrier) {
+			barriers.push(barrier);
+			visGraph.addTempBlocker(barrier.ax, barrier.ay, barrier.bx, barrier.by);
+		}
+	}
+
+	visGraph.clearTempBlockers();
+	const dt = performance.now() - t0;
+
+	if (paths.length === 0) {
+		return { ok: false, reason: 'side', paths, selected: null, routeLengthSlots: [null, null, null], routeSideSlots: [null, null, null], routeSideLabelSlots: [null, null, null], routeIndexes: [], blockFastest: false, barriers, dt };
+	}
+	if (paths.length === 1) {
+		return { ok: false, reason: 'distinct', paths, selected: null, routeLengthSlots: [paths[0].len, null, null], routeSideSlots: [null, null, null], routeSideLabelSlots: [null, null, null], routeIndexes: [1], blockFastest: false, barriers, dt };
+	}
+
+	paths.sort((a, b) => a.len - b.len);
+	for (let i = 0; i < paths.length; i++) paths[i].routeIndex = i + 1;
+
+	const sgDx = goalPt.x - startPt.x, sgDy = goalPt.y - startPt.y;
+	for (const p of paths) {
+		let sum = 0;
+		for (const pt of p.path) sum += sgDx * (pt.y - startPt.y) - sgDy * (pt.x - startPt.x);
+		p.side = sum / p.path.length;
+		p.sideLabel = p.side > 0 ? 'R' : p.side < 0 ? 'L' : 'C';
+	}
+
+	let selected = null;
+	let blockFastest = false;
+
+	const oppSides = (a, b) => a.side * b.side < 0;
+	const distinctPair = (a, b) => oppSides(a, b) && Math.abs(a.side - b.side) >= ROUTE_STRESS_MIN_SIDE_GAP;
+	const len1 = paths[0].len, len2 = paths[1].len;
+	const len3 = paths.length >= 3 ? paths[2].len : Infinity;
+	const diff12 = len2 - len1, diff23 = len3 - len2;
+
+	if (acceptFirstTwoByDistance && distinctPair(paths[0], paths[1])) {
+		selected = [paths[0], paths[1]];
+	} else if (diff12 < diff23 && distinctPair(paths[0], paths[1])) {
+		selected = [paths[0], paths[1]];
+	} else if (paths.length >= 3 && len3 <= 1.2 * len2 && distinctPair(paths[1], paths[2])) {
+		selected = [paths[1], paths[2]];
+		blockFastest = true;
+	}
+
+	if (!selected) {
+		const pairs = [];
+		for (let i = 0; i < paths.length; i++)
+			for (let j = i + 1; j < paths.length; j++)
+				if (distinctPair(paths[i], paths[j]))
+					pairs.push({ i, j, total: paths[i].len + paths[j].len, ratio: paths[j].len / paths[i].len });
+		pairs.sort((a, b) => a.total - b.total);
+		for (const { i, j } of pairs) {
+			if (paths[j].len <= 1.5 * paths[i].len) {
+				selected = [paths[i], paths[j]];
+				blockFastest = i > 0;
+				break;
+			}
+		}
+	}
+
+	if (!selected) {
+		const oppositePairs = [];
+		for (let i = 0; i < paths.length; i++)
+			for (let j = i + 1; j < paths.length; j++)
+				if (oppSides(paths[i], paths[j])) oppositePairs.push({ i, j, ratio: paths[j].len / paths[i].len, gap: Math.abs(paths[i].side - paths[j].side) });
+		const distinctPairs = oppositePairs.filter((p) => p.gap >= ROUTE_STRESS_MIN_SIDE_GAP);
+		const reason = oppositePairs.length === 0
+			? 'side'
+			: distinctPairs.length === 0
+				? 'distinct'
+				: distinctPairs.every((p) => p.ratio > 1.5)
+					? 'distance'
+					: 'distinct';
+		const routeSideSlots = [null, null, null];
+		const routeSideLabelSlots = [null, null, null];
+		for (const p of paths) {
+			routeSideSlots[p.routeIndex - 1] = p.side;
+			routeSideLabelSlots[p.routeIndex - 1] = p.sideLabel;
+		}
+		return { ok: false, reason, paths, selected: null, routeLengthSlots: [null, null, null], routeSideSlots, routeSideLabelSlots, routeIndexes: [], blockFastest, barriers, dt };
+	}
+
+	const routeLengthSlots = [null, null, null];
+	const routeSideSlots = [null, null, null];
+	const routeSideLabelSlots = [null, null, null];
+	for (const p of selected) routeLengthSlots[p.routeIndex - 1] = p.len;
+	for (const p of paths) {
+		routeSideSlots[p.routeIndex - 1] = p.side;
+		routeSideLabelSlots[p.routeIndex - 1] = p.sideLabel;
+	}
+	return {
+		ok: true,
+		reason: 'ok',
+		paths,
+		selected,
+		routeLengthSlots,
+		routeSideSlots,
+		routeSideLabelSlots,
+		routeIndexes: selected.map(p => p.routeIndex),
+		blockFastest,
+		barriers,
+		dt,
+	};
+}
+function drawComputedRoute(g, result) {
+	const MARK = '#d12b2b';
+	drawEndpointMarkers(g, MARK);
+	if (!result || !result.ok) {
+		if (result && result.paths && result.paths.length === 1) drawPathLine(g, result.paths[0].path, '#d12b2b');
+		return;
+	}
+	const COLORS = ['#d12b2b', '#2b7bd1'];
+	result.selected.forEach((p, i) => drawPathLine(g, p.path, COLORS[i]));
+
+	if (result.blockFastest && result.barriers.length > 0) {
+		const b = result.barriers[0];
+		const line = document.createElementNS(SVGNS, 'line');
+		line.setAttribute('x1', b.ax); line.setAttribute('y1', b.ay);
+		line.setAttribute('x2', b.bx); line.setAttribute('y2', b.by);
+		line.setAttribute('stroke', '#a033f0');
+		line.setAttribute('stroke-width', 0.8);
+		line.setAttribute('stroke-linecap', 'butt');
+		g.appendChild(line);
+	}
+}
+
+function drawManualSingleRoute(g, startPt, goalPt, visGraph) {
+	drawEndpointMarkers(g, '#d12b2b');
+	if (!visGraph) return;
+	if (visGraph.clearTempBlockers) visGraph.clearTempBlockers();
+	const t0 = performance.now();
+	const candidates = [];
+	const barriers = [];
+	for (let attempt = 0; attempt < ROUTE_MANUAL_ALTERNATE_ATTEMPTS; attempt++) {
+		const candidate = visGraph.astar(startPt, goalPt, ROUTE_MANUAL_ASTAR_OPTIONS);
+		if (!candidate || !candidate.path || candidate.path.length < 2) break;
+		candidates.push({
+			result: candidate,
+			len: routePathLength(candidate.path),
+		});
+		const barrier = findSmartBarrier(candidate.path, visGraph);
+		if (!barrier) break;
+		barriers.push(barrier);
+		visGraph.addTempBlocker(barrier.ax, barrier.ay, barrier.bx, barrier.by);
+	}
+	if (visGraph.clearTempBlockers) visGraph.clearTempBlockers();
+	const dt = performance.now() - t0;
+	candidates.sort((a, b) => a.len - b.len);
+	const result = candidates.length ? candidates[0].result : null;
+	if (!result || !result.path || result.path.length < 2) {
+		console.log(`route: no path found · ${dt.toFixed(2)}ms`);
+		return;
+	}
+	drawPathLine(g, result.path, '#d12b2b');
+	const len = routePathLength(result.path);
+	const altText = candidates.length > 1 ? ` · best of ${candidates.length}` : '';
+	console.log(`route: single path · ${result.path.length} hops · len=${len.toFixed(2)} · ${result.iterations} iters${altText} · ${dt.toFixed(2)}ms`);
+}
+
 function drawRouteLayer() {
 	const layer = document.getElementById('routeLayer');
 	if (layer) layer.remove();
@@ -836,36 +1170,471 @@ function drawRouteLayer() {
 	const g = document.createElementNS(SVGNS, 'g');
 	g.id = 'routeLayer';
 	g.setAttribute('pointer-events', 'none');
-	const STROKE = '#d12b2b', MARK = '#d12b2b';
-	for (const p of routeEndpoints) {
-		const c = document.createElementNS(SVGNS, 'circle');
-		c.setAttribute('cx', p.x); c.setAttribute('cy', p.y);
-		c.setAttribute('r', 0.6); c.setAttribute('fill', MARK);
-		c.setAttribute('stroke', '#000'); c.setAttribute('stroke-width', 0.1);
-		g.appendChild(c);
-	}
+
 	if (routeEndpoints.length === 2 && visibilityGraph) {
-		const t0 = performance.now();
-		const result = visibilityGraph.astar(routeEndpoints[0], routeEndpoints[1]);
-		const dt = performance.now() - t0;
-		if (result && result.path.length >= 2) {
-			const pts = result.path.map(p => `${p.x},${p.y}`).join(' ');
-			const poly = document.createElementNS(SVGNS, 'polyline');
-			poly.setAttribute('points', pts);
-			poly.setAttribute('fill', 'none');
-			poly.setAttribute('stroke', STROKE);
-			poly.setAttribute('stroke-width', 0.3);
-			poly.setAttribute('stroke-linejoin', 'round');
-			poly.setAttribute('stroke-linecap', 'round');
-			g.appendChild(poly);
-			const len = result.path.reduce((a, p, i, arr) => i ? a + Math.hypot(p.x - arr[i - 1].x, p.y - arr[i - 1].y) : 0, 0);
-			console.log(`route: ${result.path.length} hops · len=${len.toFixed(2)} · ${result.iterations} iters · ${dt.toFixed(2)}ms`);
-		} else {
-			console.log(`route: no path found · ${dt.toFixed(2)}ms`);
-		}
+		drawManualSingleRoute(g, routeEndpoints[0], routeEndpoints[1], visibilityGraph);
+	} else {
+		drawEndpointMarkers(g, '#d12b2b');
 	}
+
 	vp.appendChild(g);
 }
+
+const ROUTE_STRESS_DEFAULTS = {
+	size: 30,
+	plaza: true,
+	coast: true,
+	river: true,
+	walls: true,
+	streets: true,
+	outerRatio: 4,
+	roadDensity: 5,
+	gates: -1,
+};
+function routeTestRandomSettings(seed) {
+	return {
+		...ROUTE_STRESS_DEFAULTS,
+		seed,
+		size: 25 + Math.floor(Math.random() * 16),
+		river: Math.random() >= 0.5,
+		coast: Math.random() >= 0.5,
+		walls: Math.random() >= 0.25,
+	};
+}
+const ROUTE_STRESS_MAX_RUNS = 100;
+const ROUTE_STRESS_MIN_DIST = 30;
+const ROUTE_STRESS_MAX_DIST = 100;
+const ROUTE_STRESS_MIN_SIDE_GAP = 200; // min |sideA - sideB| for a route pair to count as distinct (data-derived: ~P15 of opposite-sign gaps from 10k stress run)
+const ROUTE_STRESS_ROUTE_ATTEMPT_PAUSE = 20;
+const ROUTE_STRESS_EXPORT_EVERY = 1000;
+const ROUTE_STRESS_OUTSIDE_WALL_MAX_DIST = 12;
+let routeStressRunning = false;
+let routeStressAbort = false;
+let routeStressLog = [];
+let routeStressScreenshots = [];
+window.routeStressLog = routeStressLog;
+window.routeStressScreenshots = routeStressScreenshots;
+
+function routeTestPointInPolygon(pt, poly) {
+	let inside = false;
+	for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+		const a = poly[i], b = poly[j];
+		if ((a.y > pt.y) !== (b.y > pt.y)) {
+			const x = (b.x - a.x) * (pt.y - a.y) / (b.y - a.y) + a.x;
+			if (pt.x < x) inside = !inside;
+		}
+	}
+	return inside;
+}
+
+function routeTestWardBbox(ward) {
+	let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+	for (const p of ward.polygon) {
+		if (p.x < minX) minX = p.x;
+		if (p.y < minY) minY = p.y;
+		if (p.x > maxX) maxX = p.x;
+		if (p.y > maxY) maxY = p.y;
+	}
+	return { minX, minY, maxX, maxY };
+}
+
+function routeTestPointSegmentDistance(pt, a, b) {
+	const dx = b.x - a.x, dy = b.y - a.y;
+	const len2 = dx * dx + dy * dy;
+	if (len2 <= 1e-9) return Math.hypot(pt.x - a.x, pt.y - a.y);
+	const t = Math.max(0, Math.min(1, ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / len2));
+	return Math.hypot(pt.x - (a.x + dx * t), pt.y - (a.y + dy * t));
+}
+
+function routeTestDistanceToClosedPolyline(pt, pts) {
+	let best = Infinity;
+	for (let i = 0; i < pts.length; i++) {
+		const a = pts[i], b = pts[(i + 1) % pts.length];
+		best = Math.min(best, routeTestPointSegmentDistance(pt, a, b));
+	}
+	return best;
+}
+
+function routeTestPointAllowedForStress(pt, ward, wall) {
+	if (ward.inner) return 'inner';
+	const wallShape = wall && wall.shape;
+	if (!wallShape || wallShape.length < 3) return null;
+	if (routeTestPointInPolygon(pt, wallShape)) return null;
+	if (routeTestDistanceToClosedPolyline(pt, wallShape) <= ROUTE_STRESS_OUTSIDE_WALL_MAX_DIST) return 'outsideWall';
+	return null;
+}
+
+function routeTestPickPoint(candidates, visGraph, wall = null) {
+	for (let attempt = 0; attempt < 500; attempt++) {
+		const item = candidates[(Math.random() * candidates.length) | 0];
+		const b = item.bbox;
+		for (let local = 0; local < 20; local++) {
+			const pt = {
+				x: b.minX + Math.random() * (b.maxX - b.minX),
+				y: b.minY + Math.random() * (b.maxY - b.minY),
+			};
+			if (!routeTestPointInPolygon(pt, item.ward.polygon)) continue;
+			const area = routeTestPointAllowedForStress(pt, item.ward, wall);
+			if (!area) continue;
+			if (visGraph._inRawObstacle(pt.x, pt.y)) continue;
+			return { ...pt, wardType: item.ward.type || 'generic', area };
+		}
+	}
+	return null;
+}
+
+function routeTestPickPair(candidates, visGraph, wall = null, rejectionCounts = null) {
+	for (let attempt = 0; attempt < 1000; attempt++) {
+		const start = routeTestPickPoint(candidates, visGraph, wall);
+		const goal = routeTestPickPoint(candidates, visGraph, wall);
+		if (!start || !goal) return null;
+		const straightLine = Math.hypot(goal.x - start.x, goal.y - start.y);
+		if (straightLine >= ROUTE_STRESS_MIN_DIST && straightLine <= ROUTE_STRESS_MAX_DIST)
+			return { start, goal, straightLine };
+		// Note: per-attempt distance rejections are NOT counted here. One rejection is
+		// counted per outer retry in runRouteStressTest so retries == sum of rejectX.
+	}
+	return null;
+}
+
+function routeTestAppendLog(record) {
+	routeStressLog.push(record);
+	window.routeStressLog = routeStressLog;
+	console.log('route-stress', record);
+	if (routeStressRunning && routeStressLog.length % ROUTE_STRESS_EXPORT_EVERY === 0) routeTestDownloadLog();
+}
+
+function routeTestCsvValue(v) {
+	if (v == null) return '';
+	const s = String(v);
+	return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function routeTestRecordsToCsv(records) {
+	const columns = [
+		'run', 'seed', 'status', 'screenshotIndex', 'screenshotFile',
+		'size', 'river', 'shore', 'walls',
+		'retries', 'rejectDistinct', 'rejectDistance', 'rejectSide',
+		'cityGenerationMs', 'navMeshGenerationMs', 'pathfindingUntilFoundMs',
+		'startX', 'startY', 'startWardType', 'startArea', 'goalX', 'goalY', 'goalWardType', 'goalArea', 'straightLineDistance',
+		'selectedRouteIndexes', 'route1Length', 'route2Length', 'route3Length',
+		'route1Side', 'route2Side', 'route3Side', 'route1SideLabel', 'route2SideLabel', 'route3SideLabel',
+		'candidateRouteLengths', 'reason',
+	];
+	const rows = [columns.join(',')];
+	for (const r of records) {
+		rows.push(columns.map((col) => routeTestCsvValue(r[col])).join(','));
+	}
+	return rows.join('\n') + '\n';
+}
+
+function routeTestDownloadLog() {
+	if (!routeStressLog.length) {
+		console.warn('route-stress: no log records to save');
+		return;
+	}
+	const text = routeTestRecordsToCsv(routeStressLog);
+	const blob = new Blob([text], { type: 'text/csv' });
+	const url = URL.createObjectURL(blob);
+	const a = document.createElement('a');
+	const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+	a.href = url;
+	a.download = `route-stress-${stamp}.csv`;
+	document.body.appendChild(a);
+	a.click();
+	a.remove();
+	URL.revokeObjectURL(url);
+}
+
+function routeTestRouteBounds(pair, routeResult, pad = 8) {
+	const pts = [];
+	if (pair) pts.push(pair.start, pair.goal);
+	if (routeResult && routeResult.selected) {
+		for (const r of routeResult.selected)
+			for (const p of r.path) pts.push(p);
+	}
+	if (pts.length === 0) return null;
+	let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+	for (const p of pts) {
+		if (p.x < minX) minX = p.x;
+		if (p.y < minY) minY = p.y;
+		if (p.x > maxX) maxX = p.x;
+		if (p.y > maxY) maxY = p.y;
+	}
+	return { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad };
+}
+
+function routeTestStandaloneSvg(crop) {
+	const width = Math.max(1, crop.maxX - crop.minX);
+	const height = Math.max(1, crop.maxY - crop.minY);
+	const clone = vp.cloneNode(true);
+	clone.removeAttribute('transform');
+	clone.setAttribute('transform', `translate(${-crop.minX},${-crop.minY})`);
+	const body = new XMLSerializer().serializeToString(clone);
+	return `<svg xmlns="${SVGNS}" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#efe9d8"/>${body}</svg>`;
+}
+
+async function routeTestCaptureScreenshot(index, pair, routeResult) {
+	const crop = routeTestRouteBounds(pair, routeResult);
+	if (!crop) return null;
+	const svgText = routeTestStandaloneSvg(crop);
+	const cropWidth = crop.maxX - crop.minX;
+	const cropHeight = crop.maxY - crop.minY;
+	const maxPixels = 550;
+	const scaleFactor = Math.min(maxPixels / Math.max(cropWidth, cropHeight), 5);
+	const canvasWidth = Math.max(1, Math.round(cropWidth * scaleFactor));
+	const canvasHeight = Math.max(1, Math.round(cropHeight * scaleFactor));
+	const svgBlob = new Blob([svgText], { type: 'image/svg+xml' });
+	const url = URL.createObjectURL(svgBlob);
+	try {
+		const img = new Image();
+		await new Promise((resolve, reject) => {
+			img.onload = resolve;
+			img.onerror = reject;
+			img.src = url;
+		});
+		const canvas = document.createElement('canvas');
+		canvas.width = canvasWidth;
+		canvas.height = canvasHeight;
+		const ctx = canvas.getContext('2d');
+		ctx.drawImage(img, 0, 0, canvasWidth, canvasHeight);
+		const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+		if (!blob) return null;
+		const filename = `route-stress-${String(index).padStart(4, '0')}.png`;
+		const shot = { index, filename, blob, crop };
+		routeStressScreenshots.push(shot);
+		window.routeStressScreenshots = routeStressScreenshots;
+		return shot;
+	} finally {
+		URL.revokeObjectURL(url);
+	}
+}
+
+function routeTestCrc32(bytes) {
+	let c = -1;
+	for (let i = 0; i < bytes.length; i++) {
+		c ^= bytes[i];
+		for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+	}
+	return (c ^ -1) >>> 0;
+}
+
+function routeTestU16(out, v) { out.push(v & 255, (v >>> 8) & 255); }
+function routeTestU32(out, v) { out.push(v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255); }
+
+async function routeTestCreateZip(files) {
+	const encoder = new TextEncoder();
+	const chunks = [];
+	const central = [];
+	let offset = 0;
+	for (const file of files) {
+		const nameBytes = encoder.encode(file.name);
+		const bytes = new Uint8Array(await file.blob.arrayBuffer());
+		const crc = routeTestCrc32(bytes);
+		const local = [];
+		routeTestU32(local, 0x04034b50);
+		routeTestU16(local, 20); routeTestU16(local, 0); routeTestU16(local, 0);
+		routeTestU16(local, 0); routeTestU16(local, 0);
+		routeTestU32(local, crc); routeTestU32(local, bytes.length); routeTestU32(local, bytes.length);
+		routeTestU16(local, nameBytes.length); routeTestU16(local, 0);
+		chunks.push(new Uint8Array(local), nameBytes, bytes);
+
+		const cd = [];
+		routeTestU32(cd, 0x02014b50);
+		routeTestU16(cd, 20); routeTestU16(cd, 20); routeTestU16(cd, 0); routeTestU16(cd, 0);
+		routeTestU16(cd, 0); routeTestU16(cd, 0);
+		routeTestU32(cd, crc); routeTestU32(cd, bytes.length); routeTestU32(cd, bytes.length);
+		routeTestU16(cd, nameBytes.length); routeTestU16(cd, 0); routeTestU16(cd, 0);
+		routeTestU16(cd, 0); routeTestU16(cd, 0); routeTestU32(cd, 0); routeTestU32(cd, offset);
+		central.push(new Uint8Array(cd), nameBytes);
+		offset += local.length + nameBytes.length + bytes.length;
+	}
+	const centralOffset = offset;
+	let centralSize = 0;
+	for (const c of central) centralSize += c.length;
+	const end = [];
+	routeTestU32(end, 0x06054b50);
+	routeTestU16(end, 0); routeTestU16(end, 0);
+	routeTestU16(end, files.length); routeTestU16(end, files.length);
+	routeTestU32(end, centralSize); routeTestU32(end, centralOffset); routeTestU16(end, 0);
+	return new Blob([...chunks, ...central, new Uint8Array(end)], { type: 'application/zip' });
+}
+
+async function routeTestDownloadScreenshots(clearAfter = false) {
+	const shots = routeStressScreenshots.slice();
+	if (!shots.length) {
+		console.warn('route-stress: no screenshots to save');
+		return;
+	}
+	const files = shots.map((shot) => ({ name: shot.filename, blob: shot.blob }));
+	const zip = await routeTestCreateZip(files);
+	const url = URL.createObjectURL(zip);
+	const a = document.createElement('a');
+	const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+	const first = String(shots[0].index).padStart(4, '0');
+	const last = String(shots[shots.length - 1].index).padStart(4, '0');
+	a.href = url;
+	a.download = `route-stress-shots-${first}-${last}-${stamp}.zip`;
+	document.body.appendChild(a);
+	a.click();
+	a.remove();
+	URL.revokeObjectURL(url);
+	if (clearAfter) {
+		routeStressScreenshots = [];
+		window.routeStressScreenshots = routeStressScreenshots;
+	}
+}
+
+function routeTestShowResult(d, vg, endpoints, routeResult) {
+	data = d;
+	visibilityGraph = vg;
+	render(data);
+	routeEndpoints = [endpoints.start, endpoints.goal];
+	const layer = document.getElementById('routeLayer');
+	if (layer) layer.remove();
+	const g = document.createElementNS(SVGNS, 'g');
+	g.id = 'routeLayer';
+	g.setAttribute('pointer-events', 'none');
+	drawComputedRoute(g, routeResult);
+	vp.appendChild(g);
+}
+
+function routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs, pathfindingMs, retries, pair, routeResult, status, rejectionCounts = null, screenshot = null) {
+	const lengths = routeResult ? routeResult.routeLengthSlots : [null, null, null];
+	const sides = routeResult ? routeResult.routeSideSlots : [null, null, null];
+	const sideLabels = routeResult ? routeResult.routeSideLabelSlots : [null, null, null];
+	const counts = rejectionCounts || { distinct: 0, distance: 0, side: 0 };
+	return {
+		run,
+		seed,
+		status,
+		screenshotIndex: screenshot ? screenshot.index : '',
+		screenshotFile: screenshot ? screenshot.filename : '',
+		size: settings ? settings.size : '',
+		river: settings ? settings.river : '',
+		shore: settings ? settings.coast : '',
+		walls: settings ? settings.walls : '',
+		retries,
+		rejectDistinct: counts.distinct,
+		rejectDistance: counts.distance,
+		rejectSide: counts.side,
+		cityGenerationMs: Number(generationMs.toFixed(3)),
+		navMeshGenerationMs: Number(navMeshMs.toFixed(3)),
+		pathfindingUntilFoundMs: Number(pathfindingMs.toFixed(3)),
+		startX: pair ? Number(pair.start.x.toFixed(6)) : '',
+		startY: pair ? Number(pair.start.y.toFixed(6)) : '',
+		startWardType: pair ? pair.start.wardType : '',
+		startArea: pair ? pair.start.area : '',
+		goalX: pair ? Number(pair.goal.x.toFixed(6)) : '',
+		goalY: pair ? Number(pair.goal.y.toFixed(6)) : '',
+		goalWardType: pair ? pair.goal.wardType : '',
+		goalArea: pair ? pair.goal.area : '',
+		straightLineDistance: pair ? Number(pair.straightLine.toFixed(3)) : '',
+		selectedRouteIndexes: routeResult ? routeResult.routeIndexes.join('|') : '',
+		route1Length: lengths[0] == null ? '' : Number(lengths[0].toFixed(3)),
+		route2Length: lengths[1] == null ? '' : Number(lengths[1].toFixed(3)),
+		route3Length: lengths[2] == null ? '' : Number(lengths[2].toFixed(3)),
+		route1Side: sides[0] == null ? '' : Number(sides[0].toFixed(6)),
+		route2Side: sides[1] == null ? '' : Number(sides[1].toFixed(6)),
+		route3Side: sides[2] == null ? '' : Number(sides[2].toFixed(6)),
+		route1SideLabel: sideLabels[0] || '',
+		route2SideLabel: sideLabels[1] || '',
+		route3SideLabel: sideLabels[2] || '',
+		candidateRouteLengths: routeResult ? routeResult.paths.slice(0, 3).map((p) => Number(p.len.toFixed(3))).join('|') : '',
+		reason: routeResult ? routeResult.reason : status,
+	};
+}
+
+async function runRouteStressTest(maxRuns = ROUTE_STRESS_MAX_RUNS) {
+	if (routeStressRunning) {
+		routeStressAbort = true;
+		return;
+	}
+	routeStressRunning = true;
+	routeStressAbort = false;
+	routeStressLog = [];
+	routeStressScreenshots = [];
+	window.routeStressLog = routeStressLog;
+	window.routeStressScreenshots = routeStressScreenshots;
+	$('routetest').textContent = 'stop stress';
+	statusEl.textContent = 'route stress starting...';
+
+	for (let run = 1; run <= maxRuns && !routeStressAbort; run++) {
+		const seed = Math.floor(Math.random() * 2147483646) + 1;
+		const settings = routeTestRandomSettings(seed);
+		let d = null;
+		let vg = null;
+		let generationMs = 0;
+		let navMeshMs = 0;
+		try {
+			const genStart = performance.now();
+			d = generateWards(settings);
+			generationMs = performance.now() - genStart;
+
+			const navStart = performance.now();
+			vg = buildVisibilityGraph(extractObstacles(d), ROUTE_VISIBILITY_GRAPH_OPTIONS);
+			navMeshMs = performance.now() - navStart;
+		} catch (e) {
+			routeTestAppendLog(routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs, 0, 0, null, null, `generation-error:${e.message}`));
+			continue;
+		}
+
+		const candidates = (d.wards || [])
+			.filter((w) => !w.water && w.polygon && w.polygon.length >= 3)
+			.map((ward) => ({ ward, bbox: routeTestWardBbox(ward) }));
+		if (candidates.length === 0) {
+			routeTestAppendLog(routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs, 0, 0, null, null, 'no-traversable-wards'));
+			continue;
+		}
+
+		const routeStart = performance.now();
+		let retries = 0;
+		let pair = null;
+		let routeResult = null;
+		const rejectionCounts = { distinct: 0, distance: 0, side: 0 };
+		while (!routeStressAbort) {
+			pair = routeTestPickPair(candidates, vg, d.wall, rejectionCounts);
+			if (!pair) {
+				rejectionCounts.distance++;
+				retries++;
+				if (retries % ROUTE_STRESS_ROUTE_ATTEMPT_PAUSE === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+				continue;
+			}
+			routeResult = computeRouteOptions(pair.start, pair.goal, vg);
+			if (routeResult.ok) break;
+			if (routeResult.reason === 'distinct') rejectionCounts.distinct++;
+			else if (routeResult.reason === 'distance') rejectionCounts.distance++;
+			else rejectionCounts.side++;
+			retries++;
+			if (retries % ROUTE_STRESS_ROUTE_ATTEMPT_PAUSE === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		const pathfindingMs = performance.now() - routeStart;
+		if (routeStressAbort) break;
+
+		routeTestShowResult(d, vg, pair, routeResult);
+		let screenshot = null;
+		try {
+			screenshot = await routeTestCaptureScreenshot(run, pair, routeResult);
+		} catch (e) {
+			console.warn('route-stress: screenshot capture failed', e);
+		}
+		const record = routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs, pathfindingMs, retries, pair, routeResult, 'ok', rejectionCounts, screenshot);
+		routeTestAppendLog(record);
+		if (routeStressScreenshots.length >= ROUTE_STRESS_EXPORT_EVERY) await routeTestDownloadScreenshots(true);
+		statusEl.textContent = `route stress ${run}/${maxRuns} · retries ${retries} · seed ${seed} · size ${settings.size} · river ${settings.river ? 'on' : 'off'} · shore ${settings.coast ? 'on' : 'off'} · walls ${settings.walls ? 'on' : 'off'}`;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+
+	routeStressRunning = false;
+	routeStressAbort = false;
+	$('routetest').textContent = 'route stress';
+	statusEl.textContent = `route stress stopped · ${routeStressLog.length} records`;
+	console.log(`route-stress: stopped after ${routeStressLog.length} records; use window.routeStressLog or Save Route Log`);
+}
+
+window.runRouteStressTest = runRouteStressTest;
+window.saveRouteStressLog = routeTestDownloadLog;
+window.saveRouteStressScreenshots = routeTestDownloadScreenshots;
 svg.addEventListener('click', (e) => {
 	if (!$('routemode').checked) return;
 	if (e.detail > 2) return; // triple+ clicks: ignore
@@ -903,6 +1672,9 @@ $('routemode').onchange = () => {
 	if (!$('routemode').checked) { routeEndpoints = []; drawRouteLayer(); }
 };
 $('clearroute').onclick = () => { routeEndpoints = []; drawRouteLayer(); };
+$('routetest').onclick = () => runRouteStressTest();
+$('saveroutelog').onclick = () => routeTestDownloadLog();
+$('saverouteshots').onclick = () => routeTestDownloadScreenshots();
 
 $('gen').onclick = generate;
 $('fit').onclick = () => fit();

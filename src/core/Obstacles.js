@@ -9,8 +9,6 @@
 //   portals:  passable crossings overlaid on otherwise-impassable shapes — used
 //             later to punch openings into obstacle unions (bridges across the
 //             river, light-grey gate towers in the city wall, dock landings).
-//   softBarriers: passable centerlines, currently roads, that add routing cost
-//             when crossed but never block line of sight.
 //
 // The river polyline is pre-smoothed here with the same Chaikin (3 iterations)
 // the renderer uses, so the obstacle aligns with what the eye sees. That ~8×
@@ -43,7 +41,14 @@ export const CATHEDRAL_HEDGE_THICKNESS = 0.6;
 // Dark-grey wall tower as rendered: thickness 1.6 × scale 2 / 2 = 1.6m radius.
 export const WALL_TOWER_RADIUS = 1.6;
 export const RIVER_SMOOTH_ITERATIONS = 3;
-const CIRCLE_OBSTACLE_SEGMENTS = 16;
+// Routing-only river simplification. The visible river still uses the full
+// smoothed curve; this trims redundant centerline vertices before thickening
+// the river obstacle so the visibility graph has fewer river nodes. Set to 0
+// to remove this experiment.
+export const RIVER_OBSTACLE_SIMPLIFY_TOLERANCE = 0.1;
+// Routing-only approximation for dark wall-tower discs. The rendered towers
+// stay circular; fewer obstacle vertices keep the visibility graph lighter.
+const CIRCLE_OBSTACLE_SEGMENTS = 8;
 // Bridge / pier deck constants — kept in sync with the renderer (generator.html
 // drawBridges / drawDocks) so the green overlay polygon matches the brown deck.
 const BRIDGE_FILL_WIDTH = 1.6;
@@ -55,9 +60,8 @@ export function extractObstacles(data) {
 	const polygons = [];
 	const lines = [];
 	const portals = [];
-	const softBarriers = [];
 
-	if (!data) return { polygons, lines, portals, softBarriers };
+	if (!data) return { polygons, lines, portals };
 
 	for (const w of data.wards || [])
 		if (w.water && w.polygon && w.polygon.length >= 3)
@@ -118,7 +122,12 @@ export function extractObstacles(data) {
 			? [{ x: (raw[0].x + raw[1].x) / 2, y: (raw[0].y + raw[1].y) / 2 }, ...raw.slice(1)]
 			: raw.map((p) => ({ x: p.x, y: p.y }));
 		const smoothed = chaikinSmooth(seed, RIVER_SMOOTH_ITERATIONS);
-		lines.push({ polyline: smoothed, thickness: data.river.width || 5, kind: 'river' });
+		const riverWidth = data.river.width || 5;
+		const riverKeep = riverSimplifyKeepIndices(smoothed, data.river.bridges || [], riverWidth);
+		const obstacleCourse = RIVER_OBSTACLE_SIMPLIFY_TOLERANCE > 0
+			? simplifyPolyline(smoothed, RIVER_OBSTACLE_SIMPLIFY_TOLERANCE, riverKeep)
+			: smoothed;
+		lines.push({ polyline: obstacleCourse, thickness: riverWidth, kind: 'river' });
 
 		// Delta fan = the river mouth where it meets the sea. The renderer builds it
 		// from data.river.delta + the smoothed course; sample the two cubic beziers
@@ -134,7 +143,7 @@ export function extractObstacles(data) {
 		// up exactly with the brown bridge fill; the visibility graph can then take
 		// the deck as the carved opening through the river polygon.
 		for (const b of data.river.bridges || []) {
-			const deck = buildBridgeDeck(b, data.river.course, smoothed, data.river.width || 5);
+			const deck = buildBridgeDeck(b, data.river.course, smoothed, riverWidth);
 			if (deck && deck.length >= 3)
 				portals.push({ kind: 'bridge', polygon: deck, a: b.from || null, b: b.to || null });
 		}
@@ -155,29 +164,7 @@ export function extractObstacles(data) {
 		}
 	}
 
-	const roadData = data.roads || null;
-	if (roadData) {
-		// Road crossings are only a tie-breaker. A high value over-biases routes
-		// to stay on one side and hurts concave building-front cases.
-		const arteries = Array.isArray(roadData.arteries) ? roadData.arteries : [];
-		if (arteries.length > 0) {
-			addSoftRoadBarriers(softBarriers, arteries, 'road', 0.5);
-			addSoftRoadBarriers(softBarriers, roadData.streets, 'street', 0.15);
-		} else {
-			addSoftRoadBarriers(softBarriers, roadData.streets, 'street', 0.35);
-			addSoftRoadBarriers(softBarriers, roadData.roads, 'road', 0.5);
-		}
-	}
-
-	return { polygons, lines, portals, softBarriers };
-}
-
-function addSoftRoadBarriers(out, paths, kind, penalty) {
-	if (!Array.isArray(paths)) return;
-	for (const path of paths) {
-		if (!path || path.length < 2) continue;
-		out.push({ polyline: path, kind, penalty });
-	}
+	return { polygons, lines, portals };
 }
 
 function wallObstaclePolylines(wall, river) {
@@ -317,6 +304,74 @@ function chaikinSmooth(pts, iterations) {
 		a = h;
 	}
 	return a;
+}
+
+function riverSimplifyKeepIndices(pts, bridges, riverWidth) {
+	const keep = new Set([0, pts.length - 1]);
+	if (!pts || !bridges || bridges.length === 0) return keep;
+	const radius = Math.max(2, riverWidth * 1.25);
+	const radius2 = radius * radius;
+	for (const b of bridges) {
+		if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) continue;
+		for (let i = 0; i < pts.length; i++) {
+			const dx = pts[i].x - b.x, dy = pts[i].y - b.y;
+			if (dx * dx + dy * dy <= radius2) keep.add(i);
+		}
+	}
+	return keep;
+}
+
+function simplifyPolyline(pts, tolerance, forceKeep = null) {
+	if (!pts || pts.length <= 2 || !(tolerance > 0)) return pts || [];
+	const keep = new Uint8Array(pts.length);
+	const tol2 = tolerance * tolerance;
+	keep[0] = 1;
+	keep[pts.length - 1] = 1;
+	if (forceKeep) {
+		for (const i of forceKeep)
+			if (i >= 0 && i < pts.length) keep[i] = 1;
+	}
+	const breaks = [];
+	for (let i = 0; i < pts.length; i++)
+		if (keep[i]) breaks.push(i);
+	const stack = [];
+	for (let i = 1; i < breaks.length; i++)
+		if (breaks[i] > breaks[i - 1] + 1) stack.push([breaks[i - 1], breaks[i]]);
+	while (stack.length > 0) {
+		const [start, end] = stack.pop();
+		let best = -1;
+		let bestDist = tol2;
+		for (let i = start + 1; i < end; i++) {
+			const d = pointSegmentDistanceSq(pts[i], pts[start], pts[end]);
+			if (d > bestDist) {
+				bestDist = d;
+				best = i;
+			}
+		}
+		if (best >= 0) {
+			keep[best] = 1;
+			stack.push([start, best], [best, end]);
+		}
+	}
+	const out = [];
+	for (let i = 0; i < pts.length; i++)
+		if (keep[i]) out.push(pts[i]);
+	return out;
+}
+
+function pointSegmentDistanceSq(p, a, b) {
+	const dx = b.x - a.x, dy = b.y - a.y;
+	const len2 = dx * dx + dy * dy;
+	if (len2 <= 1e-12) {
+		const ex = p.x - a.x, ey = p.y - a.y;
+		return ex * ex + ey * ey;
+	}
+	let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+	if (t < 0) t = 0;
+	else if (t > 1) t = 1;
+	const qx = a.x + dx * t, qy = a.y + dy * t;
+	const ex = p.x - qx, ey = p.y - qy;
+	return ex * ex + ey * ey;
 }
 
 // Sample one cubic bezier between P0 and P3 with controls C1, C2 into `steps`+1

@@ -1,6 +1,8 @@
 // Headless smoke test for the DOM-free generation core (also proves Node/Django reuse).
 // Run: node test/smoke.mjs
 import { generateWards } from '../src/core/CityGen.js';
+import { extractObstacles } from '../src/core/Obstacles.js';
+import { buildVisibilityGraph } from '../src/core/VisibilityGraph.js';
 
 let failures = 0;
 let checks = 0;
@@ -31,6 +33,19 @@ function samePoint(a, b) {
 	return Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.y - b.y) < 1e-6;
 }
 
+function routePointOwnerKinds(vg, p) {
+	for (let i = 0; i < vg.nodeCount; i++) {
+		if (Math.hypot(vg.nodeX[i] - p.x, vg.nodeY[i] - p.y) > 1e-6) continue;
+		const kinds = [];
+		for (let k = vg.ownerStarts[i]; k < vg.ownerStarts[i + 1]; k++) {
+			const owner = vg.ownerIdx[k];
+			if (owner >= 0) kinds.push(vg.rawKinds[owner]);
+		}
+		return kinds;
+	}
+	return [];
+}
+
 function builtWallSegmentCount(wall, point) {
 	const i = wall.shape.findIndex((p) => samePoint(p, point));
 	if (i === -1) return 0;
@@ -41,6 +56,117 @@ function builtWallSegmentCount(wall, point) {
 
 const seeds = [1, 2, 3, 7, 42, 99, 1000, 12345, 777, 54321];
 const sizes = [6, 10, 15, 24];
+
+{
+	const bridgeVG = buildVisibilityGraph({
+		polygons: [],
+		lines: [{ polyline: [{ x: 0, y: -30 }, { x: 0, y: 30 }], thickness: 6, kind: 'river' }],
+		portals: [{
+			kind: 'bridge',
+			polygon: [{ x: -3.5, y: -0.8 }, { x: 3.5, y: -0.8 }, { x: 3.5, y: 0.8 }, { x: -3.5, y: 0.8 }],
+		}],
+	}, { clearance: 0.2 });
+	const topSideRoute = bridgeVG.astar({ x: 8, y: 0.7 }, { x: -8, y: 0.7 });
+	check(topSideRoute && topSideRoute.path.length >= 2, 'bridge side-boundary route is passable');
+	if (topSideRoute) {
+		const bridgeNodes = topSideRoute.path.filter((p) => Math.abs(p.x) < 4);
+		check(bridgeNodes.length > 0 && bridgeNodes.every((p) => p.y > 0.5), 'bridge side-boundary route stays on the near side');
+	}
+}
+
+{
+	const data = generateWards({
+		seed: 42,
+		size: 30,
+		plaza: true,
+		coast: true,
+		river: true,
+		walls: true,
+		streets: true,
+		outerRatio: 4,
+		roadDensity: 5,
+		gates: -1,
+	});
+	const bridgeVG = buildVisibilityGraph(extractObstacles(data), { clearance: 0.2 });
+	const route = bridgeVG.astar(
+		{ x: 14.245979665816341, y: 14.936383712695582 },
+		{ x: 13.269100251319081, y: 4.2021149255644925 },
+	);
+	check(route && route.path.length >= 2, 'seed=42 bridge-side route is passable');
+	if (route) {
+		check(route.path.length === 4, 'seed=42 bridge-side route avoids the far-side bridge hop');
+		check(route.path.some((p) => Math.abs(p.x - 8.015819) < 1e-4 && Math.abs(p.y - 5.056725) < 1e-4), 'seed=42 bridge-side route exits from the near bridge side');
+	}
+}
+
+{
+	const data = generateWards({
+		seed: 42,
+		size: 30,
+		plaza: true,
+		coast: true,
+		river: true,
+		walls: true,
+		streets: true,
+		outerRatio: 4,
+		roadDensity: 5,
+		gates: -1,
+	});
+	const vg = buildVisibilityGraph(extractObstacles(data), { clearance: 0.2 });
+	const start = { x: -20.23013864183214, y: -17.849568765826298 };
+	const goal = { x: -36.83885416198647, y: -26.636115041004714 };
+	const route = vg.astar(start, goal, { exact: true, timeBudgetMs: 0, maxExpansions: 1000000 });
+	check(vg.losClear(start.x, start.y, goal.x, goal.y, -1, -1), 'seed=42 clear direct route has line of sight');
+	check(route && route.path.length === 2, 'seed=42 clear direct route is not detoured by soft barriers');
+}
+
+{
+	const data = generateWards({
+		seed: 42,
+		size: 30,
+		plaza: true,
+		coast: true,
+		river: true,
+		walls: true,
+		streets: true,
+		outerRatio: 4,
+		roadDensity: 5,
+		gates: -1,
+	});
+	const vg = buildVisibilityGraph(extractObstacles(data), { clearance: 0.2 });
+	const route = vg.astar(
+		{ x: 20.158644276117588, y: -34.083117503749726 },
+		{ x: -20.465600822860143, y: -49.687664029871655 },
+		{ exact: true, timeBudgetMs: 0, maxExpansions: 1000000 },
+	);
+	check(route && route.path.length === 4, 'seed=42 blocked direct route keeps only necessary tangent nodes');
+}
+
+{
+	const data = generateWards({
+		seed: 42,
+		size: 30,
+		plaza: true,
+		coast: true,
+		river: true,
+		walls: true,
+		streets: true,
+		outerRatio: 4,
+		roadDensity: 5,
+		gates: -1,
+	});
+	const vg = buildVisibilityGraph(extractObstacles(data), { clearance: 0.2 });
+	const route = vg.astar(
+		{ x: -37.084557847483644, y: 6.493791266869135 },
+		{ x: -60.073747658371836, y: -14.547162119367517 },
+		{ exact: true, rawVisibility: true, timeBudgetMs: 0, maxExpansions: 1000000 },
+	);
+	check(route && route.path.length >= 2, 'seed=42 house-corner route is passable with raw visibility');
+	if (route) {
+		const usesWaterNode = route.path.some((p) => routePointOwnerKinds(vg, p).some((kind) => kind === 'water' || kind === 'river' || kind === 'delta'));
+		check(!usesWaterNode, 'seed=42 house-corner route does not need a shore tangent node');
+	}
+}
 
 for (const seed of seeds) {
 	for (const size of sizes) {
