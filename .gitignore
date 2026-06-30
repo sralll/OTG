@@ -4,7 +4,10 @@ node_modules/
 
 .claude/
 .claude-code-router/
+.config/
 reference/
 TownGeneratorOS/
 
 ZZ_changes.txt
+
+serve.py

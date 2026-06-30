@@ -133,13 +133,41 @@ const sizes = [6, 10, 15, 24];
 		roadDensity: 5,
 		gates: -1,
 	});
-	const vg = buildVisibilityGraph(extractObstacles(data), { clearance: 0.2 });
+	const CLEAR = 0.2;
+	const vg = buildVisibilityGraph(extractObstacles(data), { clearance: CLEAR });
 	const route = vg.astar(
 		{ x: 20.158644276117588, y: -34.083117503749726 },
 		{ x: -20.465600822860143, y: -49.687664029871655 },
 		{ exact: true, timeBudgetMs: 0, maxExpansions: 1000000 },
 	);
-	check(route && route.path.length === 4, 'seed=42 blocked direct route keeps only necessary tangent nodes');
+	check(route && route.path.length >= 2, 'seed=42 blocked direct route is passable');
+	if (route) {
+		// Clearance-preserving smoothing: string-pulling runs against the DILATED
+		// edges, so the path keeps ~clearance off every raw wall instead of sliding
+		// tangent onto it (the bug that hugged the river banks / building fronts).
+		let minClear = Infinity;
+		for (let i = 1; i < route.path.length; i++) {
+			const a = route.path[i - 1], b = route.path[i];
+			const steps = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / 0.2));
+			for (let t = 0; t <= steps; t++) {
+				const x = a.x + (b.x - a.x) * t / steps, y = a.y + (b.y - a.y) * t / steps;
+				for (let pi = 0; pi < vg.rawPolygons.length; pi++) {
+					const bb = vg.rawPolyBboxes[pi];
+					if (x < bb.minX - 1 || x > bb.maxX + 1 || y < bb.minY - 1 || y > bb.maxY + 1) continue;
+					const poly = vg.rawPolygons[pi], n = poly.length / 2;
+					for (let k = 0; k < n; k++) {
+						const j = (k + 1) % n;
+						const px = poly[k * 2], py = poly[k * 2 + 1], qx = poly[j * 2], qy = poly[j * 2 + 1];
+						const dx = qx - px, dy = qy - py, L2 = dx * dx + dy * dy || 1;
+						const tt = Math.max(0, Math.min(1, ((x - px) * dx + (y - py) * dy) / L2));
+						const d = Math.hypot(x - (px + dx * tt), y - (py + dy * tt));
+						if (d < minClear) minClear = d;
+					}
+				}
+			}
+		}
+		check(minClear > CLEAR * 0.6, `seed=42 blocked route keeps clearance off walls (min ${minClear.toFixed(3)} > ${(CLEAR * 0.6).toFixed(3)})`);
+	}
 }
 
 {
@@ -159,9 +187,9 @@ const sizes = [6, 10, 15, 24];
 	const route = vg.astar(
 		{ x: -37.084557847483644, y: 6.493791266869135 },
 		{ x: -60.073747658371836, y: -14.547162119367517 },
-		{ exact: true, rawVisibility: true, timeBudgetMs: 0, maxExpansions: 1000000 },
+		{ exact: true, timeBudgetMs: 0, maxExpansions: 1000000 },
 	);
-	check(route && route.path.length >= 2, 'seed=42 house-corner route is passable with raw visibility');
+	check(route && route.path.length >= 2, 'seed=42 house-corner route is passable');
 	if (route) {
 		const usesWaterNode = route.path.some((p) => routePointOwnerKinds(vg, p).some((kind) => kind === 'water' || kind === 'river' || kind === 'delta'));
 		check(!usesWaterNode, 'seed=42 house-corner route does not need a shore tangent node');

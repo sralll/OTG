@@ -320,6 +320,22 @@ export class LazyVisibilityGraph {
 				}
 		}
 
+		// --- 4c. Spatial grid for dilated polygon containment (_inObstacle) ---
+		this.polyGrid = new SpatialGrid(this.bounds, cellSize);
+		const pg = this.polyGrid;
+		for (let pi = 0; pi < polygons.length; pi++) {
+			const b = polyBboxes[pi];
+			const px0 = pg.col(b.minX), px1 = pg.col(b.maxX);
+			const py0 = pg.row(b.minY), py1 = pg.row(b.maxY);
+			for (let cy = py0; cy <= py1; cy++)
+				for (let cx = px0; cx <= px1; cx++) {
+					const k = pg.key(cx, cy);
+					let arr = pg.bins[k];
+					if (!arr) { arr = []; pg.bins[k] = arr; }
+					arr.push(pi);
+				}
+		}
+
 		// --- 4d. Spatial grid for raw polygon containment (_inRawObstacle) ---
 		this.rawPolyGrid = new SpatialGrid(this.bounds, cellSize);
 		const rpg = this.rawPolyGrid;
@@ -400,7 +416,12 @@ export class LazyVisibilityGraph {
 			const px = this.nodeX[i], py = this.nodeY[i];
 			if (this._inPortal(px, py)) continue;
 			const owners = this._nodeOwnerSet(i);
-			for (let pi = 0; pi < this.rawPolyBboxes.length; pi++) {
+			// PERF-EXPERIMENT: only test raw polygons from this node's grid cell.
+			// Undo by restoring the old full rawPolyBboxes loop if this ever looks suspect.
+			const arr = rpg.bins[rpg.key(rpg.col(px), rpg.row(py))];
+			if (!arr) continue;
+			for (let a = 0; a < arr.length; a++) {
+				const pi = arr[a];
 				if (!NODE_BLOCKING_OVERLAP_KINDS.has(this.rawKinds[pi])) continue;
 				if (owners.has(pi)) continue;
 				const b = this.rawPolyBboxes[pi];
@@ -479,6 +500,22 @@ export class LazyVisibilityGraph {
 				if (px < p.minX - EPS || px > p.maxX + EPS || py < p.minY - EPS || py > p.maxY + EPS) continue;
 				if (pointInPolygon(px, py, p.poly) || _onPolygonBoundary(px, py, p.poly, POINT_EPS)) return true;
 			}
+		}
+		return false;
+	}
+
+	_inObstacle(px, py) {
+		if (this._inPortal(px, py)) return false;
+		const pg = this.polyGrid;
+		const arr = pg.bins[pg.key(pg.col(px), pg.row(py))];
+		if (!arr) return false;
+		const polys = this.polygons;
+		const bboxes = this.polyBboxes;
+		for (let a = 0; a < arr.length; a++) {
+			const pi = arr[a];
+			const b = bboxes[pi];
+			if (px < b.minX - EPS || px > b.maxX + EPS || py < b.minY - EPS || py > b.maxY + EPS) continue;
+			if (pointInPolygon(px, py, polys[pi]) && !_onPolygonBoundary(px, py, polys[pi], 1e-7)) return true;
 		}
 		return false;
 	}
@@ -694,13 +731,14 @@ export class LazyVisibilityGraph {
 
 	pruneVisibleMidpoints(path) {
 		if (!path || path.length < 3) return path;
+		const clear = (a, b) => this.losClear(a.x, a.y, b.x, b.y, this._pathNodeIndex(a), this._pathNodeIndex(b));
 		const out = path.slice();
 		let changed = true;
 		while (changed) {
 			changed = false;
 			for (let i = 1; i < out.length - 1; i++) {
 				const a = out[i - 1], b = out[i], c = out[i + 1];
-				if (!this.losClearRaw(a.x, a.y, c.x, c.y)) continue;
+				if (!clear(a, c)) continue;
 				const shortcutCost = this.edgeCost(a.x, a.y, c.x, c.y);
 				const originalCost = this.edgeCost(a.x, a.y, b.x, b.y) + this.edgeCost(b.x, b.y, c.x, c.y);
 				if (shortcutCost > originalCost + EPS) continue;
@@ -712,6 +750,10 @@ export class LazyVisibilityGraph {
 		return out;
 	}
 
+	_pathNodeIndex(p) {
+		return p && Number.isInteger(p.idx) && p.idx >= 0 ? p.idx : -1;
+	}
+
 	// ---- Path smoothing (string-pulling / line-of-sight simplification) ----
 	// Walks the path from start; for each anchor, tries to skip ahead to the
 	// farthest node that still has LOS (against the non-dilated edges). This
@@ -719,14 +761,14 @@ export class LazyVisibilityGraph {
 	// O(n²) in path length — paths are short (10-30 hops), so plenty fast.
 	smoothPath(path) {
 		if (!path || path.length < 3) return path;
+		const clear = (a, b) => this.losClear(a.x, a.y, b.x, b.y, this._pathNodeIndex(a), this._pathNodeIndex(b));
 		const smoothed = [path[0]];
 		let anchor = 0;
 		while (anchor < path.length - 1) {
 			let farthest = anchor + 1;
-			const ax = path[anchor].x, ay = path[anchor].y;
 			for (let j = path.length - 1; j > anchor + 1; j--) {
-				if (!this.losClearRaw(ax, ay, path[j].x, path[j].y)) continue;
-				const shortcutCost = this.edgeCost(ax, ay, path[j].x, path[j].y);
+				if (!clear(path[anchor], path[j])) continue;
+				const shortcutCost = this.edgeCost(path[anchor].x, path[anchor].y, path[j].x, path[j].y);
 				const originalCost = this.pathCost(path, anchor, j);
 				if (shortcutCost > originalCost + EPS) continue;
 				farthest = j;
@@ -1177,9 +1219,9 @@ export function shrinkMinorAxis(pts, r) {
 function _reconstructPath(cur, goalX, goalY, appendGoal) {
 	const path = [];
 	let n = cur;
-	while (n) { path.push({ x: n.x, y: n.y }); n = n.parent; }
+	while (n) { path.push({ x: n.x, y: n.y, idx: n.idx }); n = n.parent; }
 	path.reverse();
-	if (appendGoal) path.push({ x: goalX, y: goalY });
+	if (appendGoal) path.push({ x: goalX, y: goalY, idx: -1 });
 	return path;
 }
 
@@ -1265,15 +1307,60 @@ function _segCrossParam(ax, ay, bx, by, cx, cy, dx, dy) {
 	return t;
 }
 
+function _flatPolyBbox(poly) {
+	let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+	for (let i = 0; i < poly.length; i += 2) {
+		const x = poly[i], y = poly[i + 1];
+		if (x < minX) minX = x;
+		if (y < minY) minY = y;
+		if (x > maxX) maxX = x;
+		if (y > maxY) maxY = y;
+	}
+	return { minX, minY, maxX, maxY };
+}
+
+function _bboxesOverlap(a, b) {
+	return !(a.maxX < b.minX - EPS || a.minX > b.maxX + EPS || a.maxY < b.minY - EPS || a.minY > b.maxY + EPS);
+}
+
+function _segmentBbox(ax, ay, bx, by) {
+	return {
+		minX: ax < bx ? ax : bx,
+		minY: ay < by ? ay : by,
+		maxX: ax > bx ? ax : bx,
+		maxY: ay > by ? ay : by,
+	};
+}
+
+function _segmentBboxOverlapsBox(ax, ay, bx, by, box) {
+	const minX = ax < bx ? ax : bx, maxX = ax > bx ? ax : bx;
+	const minY = ay < by ? ay : by, maxY = ay > by ? ay : by;
+	return !(maxX < box.minX - EPS || minX > box.maxX + EPS || maxY < box.minY - EPS || minY > box.maxY + EPS);
+}
+
+function _segmentsBboxOverlap(ax, ay, bx, by, cx, cy, dx, dy) {
+	const minX1 = ax < bx ? ax : bx, maxX1 = ax > bx ? ax : bx;
+	const minY1 = ay < by ? ay : by, maxY1 = ay > by ? ay : by;
+	const minX2 = cx < dx ? cx : dx, maxX2 = cx > dx ? cx : dx;
+	const minY2 = cy < dy ? cy : dy, maxY2 = cy > dy ? cy : dy;
+	return !(maxX1 < minX2 - EPS || minX1 > maxX2 + EPS || maxY1 < minY2 - EPS || minY1 > maxY2 + EPS);
+}
+
 // Clip obstacle polygon edges against portal polygons: edges are split at
 // portal boundary crossings, and sub-segments whose midpoint is inside a
 // portal are discarded (carving gaps at bridges/gates). Portal boundary edges
 // whose midpoint is inside an obstacle polygon become barrier blocker edges
 // (confining paths within the portal corridor). Returns {edges, clipPoints}.
 function _clipAndBuildBlockers(polygons, polyBboxes, portalPolys, polyIsWater) {
+	// PERF-EXPERIMENT: portal/edge bbox prefilters. Undo by removing portalBboxes
+	// and the _bboxesOverlap checks below; clipping decisions themselves are unchanged.
+	const portalBboxes = portalPolys.map(_flatPolyBbox);
 	const inAnyPortalPoly = (px, py) => {
-		for (const pp of portalPolys)
-			if (pointInPolygon(px, py, pp)) return true;
+		for (let i = 0; i < portalPolys.length; i++) {
+			const b = portalBboxes[i];
+			if (px < b.minX - EPS || px > b.maxX + EPS || py < b.minY - EPS || py > b.maxY + EPS) continue;
+			if (pointInPolygon(px, py, portalPolys[i])) return true;
+		}
 		return false;
 	};
 	const inAnyObstaclePoly = (px, py) => {
@@ -1295,11 +1382,15 @@ function _clipAndBuildBlockers(polygons, polyBboxes, portalPolys, polyIsWater) {
 			const j = (i + 1) % n;
 			const ax = poly[i * 2], ay = poly[i * 2 + 1];
 			const bx = poly[j * 2], by = poly[j * 2 + 1];
+			const edgeBox = _segmentBbox(ax, ay, bx, by);
 			const breaks = [0];
-			for (const pp of portalPolys) {
+			for (let ppi = 0; ppi < portalPolys.length; ppi++) {
+				if (!_bboxesOverlap(edgeBox, portalBboxes[ppi])) continue;
+				const pp = portalPolys[ppi];
 				const pn = pp.length / 2;
 				for (let k = 0; k < pn; k++) {
 					const k2 = (k + 1) % pn;
+					if (!_segmentBboxOverlapsBox(pp[k * 2], pp[k * 2 + 1], pp[k2 * 2], pp[k2 * 2 + 1], edgeBox)) continue;
 					const t = _segCrossParam(ax, ay, bx, by,
 						pp[k * 2], pp[k * 2 + 1], pp[k2 * 2], pp[k2 * 2 + 1]);
 					if (t !== null && t > EPS && t < 1 - EPS) {
@@ -1325,18 +1416,22 @@ function _clipAndBuildBlockers(polygons, polyBboxes, portalPolys, polyIsWater) {
 		}
 	}
 
-	for (const pp of portalPolys) {
+	for (let ppi = 0; ppi < portalPolys.length; ppi++) {
+		const pp = portalPolys[ppi];
 		const pn = pp.length / 2;
 		for (let i = 0; i < pn; i++) {
 			const j = (i + 1) % pn;
 			const ex1 = pp[i * 2], ey1 = pp[i * 2 + 1];
 			const ex2 = pp[j * 2], ey2 = pp[j * 2 + 1];
+			const edgeBox = _segmentBbox(ex1, ey1, ex2, ey2);
 			const breaks = [0];
 			for (let pi = 0; pi < polygons.length; pi++) {
+				if (!_bboxesOverlap(edgeBox, polyBboxes[pi])) continue;
 				const poly = polygons[pi];
 				const n = poly.length / 2;
 				for (let k = 0; k < n; k++) {
 					const k2 = (k + 1) % n;
+					if (!_segmentsBboxOverlap(ex1, ey1, ex2, ey2, poly[k * 2], poly[k * 2 + 1], poly[k2 * 2], poly[k2 * 2 + 1])) continue;
 					const t = _segCrossParam(ex1, ey1, ex2, ey2,
 						poly[k * 2], poly[k * 2 + 1], poly[k2 * 2], poly[k2 * 2 + 1]);
 					if (t !== null && t > EPS && t < 1 - EPS) {

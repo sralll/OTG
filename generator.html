@@ -56,13 +56,9 @@ const ROUTE_VISIBILITY_GRAPH_OPTIONS = {
 	// earlier suboptimality was the _diagonalBlocked over-block (now fixed) plus
 	// route-steering penalties (now removed), not the clearance itself.
 	clearance: 0.3,
-	// Lazy expansion only links nodes within an N-cell ring. ring=8 missed long
-	// tangent/straight edges on open routes (measured up to +100% length); ring=16
-	// is optimal across all tested pairs at size 20/30/40. NOTE: empirical, not a
-	// proof — a sufficiently long open route on a large map could still outrun any
-	// fixed ring. The structurally-guaranteed alternative is a sparse visibility
-	// graph (one-time multi-second precompute per map); see notes.
-	neighborRing: 16,
+	// PERF-EXPERIMENT: reduced from 16 to 8 for stress testing. Undo by restoring
+	// neighborRing: 16 if route quality drops on long tangent/open routes.
+	neighborRing: 8,
 };
 
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -973,37 +969,45 @@ function drawPathLine(g, path, color) {
 // the previous faster local-neighbour visibility graph.
 const ROUTE_USE_EXACT_VISIBILITY = false;
 const ROUTE_ASTAR_OPTIONS = ROUTE_USE_EXACT_VISIBILITY ? { exact: true } : {};
+const ROUTE_EXTRA_ASTAR_OPTIONS = { ...ROUTE_ASTAR_OPTIONS, timeBudgetMs: 200 };
 const ROUTE_MANUAL_ASTAR_OPTIONS = ROUTE_USE_EXACT_VISIBILITY
-	? { exact: true, rawVisibility: true, timeBudgetMs: 0, maxExpansions: 1000000 }
+	? { exact: true, timeBudgetMs: 0, maxExpansions: 1000000 }
 	: {};
+const ROUTE_STRESS_ALTERNATE_ATTEMPTS = 4;
 const ROUTE_MANUAL_ALTERNATE_ATTEMPTS = 3;
+
+const emptyRouteSlots = () => [null, null, null, null];
+function routePathSignature(path) {
+	return path.map((p) => `${Math.round(p.x * 1000)},${Math.round(p.y * 1000)}`).join('|');
+}
 
 function computeRouteOptions(startPt, goalPt, visGraph) {
 	const t0 = performance.now();
-	if (!visGraph) return { ok: false, reason: 'side', paths: [], selected: null, routeLengthSlots: [null, null, null], routeSideSlots: [null, null, null], routeSideLabelSlots: [null, null, null], routeIndexes: [], blockFastest: false, barriers: [], dt: 0 };
+	if (!visGraph) return { ok: false, reason: 'side', paths: [], selected: null, routeLengthSlots: emptyRouteSlots(), routeSideSlots: emptyRouteSlots(), routeSideLabelSlots: emptyRouteSlots(), routeIndexes: [], blockFastest: false, barriers: [], skippedBarriers: [], dt: 0, timeout: false };
 	visGraph.clearTempBlockers();
 
-	const paths = [];
+	let paths = [];
 	const barriers = [];
-	let acceptFirstTwoByDistance = false;
+	// True if ANY of this pair's A* attempts bailed on the time budget. Lets the
+	// stress log tell a genuine geometric reject ('side'/'distinct'/'distance')
+	// apart from one caused by A* timing out on a hard cross-river detour.
+	let timeout = false;
 
-	for (let attempt = 0; attempt < 3; attempt++) {
-		const result = visGraph.astar(startPt, goalPt, ROUTE_ASTAR_OPTIONS);
+	for (let attempt = 0; attempt < ROUTE_STRESS_ALTERNATE_ATTEMPTS; attempt++) {
+		const astarOptions = attempt >= 2 ? ROUTE_EXTRA_ASTAR_OPTIONS : ROUTE_ASTAR_OPTIONS;
+		const result = visGraph.astar(startPt, goalPt, astarOptions);
+		if (visGraph.lastAstarTimedOut) timeout = true;
 		if (!result || result.path.length < 2) break;
 		const path = result.path;
 		const len = routePathLength(path);
-		paths.push({ path, len, routeIndex: attempt + 1 });
-		if (paths.length === 2) {
-			const shorter = Math.min(paths[0].len, paths[1].len);
-			const longer = Math.max(paths[0].len, paths[1].len);
-			if (shorter > 0 && longer <= 1.15 * shorter) {
-				acceptFirstTwoByDistance = true;
-				break;
-			}
-		}
+		const pathRecord = { path, len, routeIndex: attempt + 1, attemptIndex: attempt + 1, barrier: null };
+		paths.push(pathRecord);
+		if (attempt >= ROUTE_STRESS_ALTERNATE_ATTEMPTS - 1) break;
 		const barrier = findSmartBarrier(path, visGraph);
 		if (!barrier) break;
 		if (barrier) {
+			barrier.attemptIndex = attempt + 1;
+			pathRecord.barrier = barrier;
 			barriers.push(barrier);
 			visGraph.addTempBlocker(barrier.ax, barrier.ay, barrier.bx, barrier.by);
 		}
@@ -1013,82 +1017,92 @@ function computeRouteOptions(startPt, goalPt, visGraph) {
 	const dt = performance.now() - t0;
 
 	if (paths.length === 0) {
-		return { ok: false, reason: 'side', paths, selected: null, routeLengthSlots: [null, null, null], routeSideSlots: [null, null, null], routeSideLabelSlots: [null, null, null], routeIndexes: [], blockFastest: false, barriers, dt };
+		return { ok: false, reason: 'timeout', paths, selected: null, routeLengthSlots: emptyRouteSlots(), routeSideSlots: emptyRouteSlots(), routeSideLabelSlots: emptyRouteSlots(), routeIndexes: [], blockFastest: false, barriers, skippedBarriers: [], dt, timeout: true };
 	}
 	if (paths.length === 1) {
-		return { ok: false, reason: 'distinct', paths, selected: null, routeLengthSlots: [paths[0].len, null, null], routeSideSlots: [null, null, null], routeSideLabelSlots: [null, null, null], routeIndexes: [1], blockFastest: false, barriers, dt };
+		const routeLengthSlots = emptyRouteSlots();
+		routeLengthSlots[0] = paths[0].len;
+		return { ok: false, reason: timeout ? 'timeout' : 'distinct', paths, selected: null, routeLengthSlots, routeSideSlots: emptyRouteSlots(), routeSideLabelSlots: emptyRouteSlots(), routeIndexes: [1], blockFastest: false, barriers, skippedBarriers: [], dt, timeout };
 	}
 
 	paths.sort((a, b) => a.len - b.len);
 	for (let i = 0; i < paths.length; i++) paths[i].routeIndex = i + 1;
 
 	const sgDx = goalPt.x - startPt.x, sgDy = goalPt.y - startPt.y;
+	const sgLen = Math.hypot(sgDx, sgDy) || 1;
 	for (const p of paths) {
 		let sum = 0;
 		for (const pt of p.path) sum += sgDx * (pt.y - startPt.y) - sgDy * (pt.x - startPt.x);
-		p.side = sum / p.path.length;
+		p.side = (sum / p.path.length) / sgLen;
 		p.sideLabel = p.side > 0 ? 'R' : p.side < 0 ? 'L' : 'C';
 	}
 
-	let selected = null;
-	let blockFastest = false;
-
-	const oppSides = (a, b) => a.side * b.side < 0;
-	const distinctPair = (a, b) => oppSides(a, b) && Math.abs(a.side - b.side) >= ROUTE_STRESS_MIN_SIDE_GAP;
-	const len1 = paths[0].len, len2 = paths[1].len;
-	const len3 = paths.length >= 3 ? paths[2].len : Infinity;
-	const diff12 = len2 - len1, diff23 = len3 - len2;
-
-	if (acceptFirstTwoByDistance && distinctPair(paths[0], paths[1])) {
-		selected = [paths[0], paths[1]];
-	} else if (diff12 < diff23 && distinctPair(paths[0], paths[1])) {
-		selected = [paths[0], paths[1]];
-	} else if (paths.length >= 3 && len3 <= 1.2 * len2 && distinctPair(paths[1], paths[2])) {
-		selected = [paths[1], paths[2]];
-		blockFastest = true;
-	}
-
-	if (!selected) {
-		const pairs = [];
-		for (let i = 0; i < paths.length; i++)
-			for (let j = i + 1; j < paths.length; j++)
-				if (distinctPair(paths[i], paths[j]))
-					pairs.push({ i, j, total: paths[i].len + paths[j].len, ratio: paths[j].len / paths[i].len });
-		pairs.sort((a, b) => a.total - b.total);
-		for (const { i, j } of pairs) {
-			if (paths[j].len <= 1.5 * paths[i].len) {
-				selected = [paths[i], paths[j]];
-				blockFastest = i > 0;
-				break;
-			}
-		}
-	}
-
-	if (!selected) {
-		const oppositePairs = [];
-		for (let i = 0; i < paths.length; i++)
-			for (let j = i + 1; j < paths.length; j++)
-				if (oppSides(paths[i], paths[j])) oppositePairs.push({ i, j, ratio: paths[j].len / paths[i].len, gap: Math.abs(paths[i].side - paths[j].side) });
-		const distinctPairs = oppositePairs.filter((p) => p.gap >= ROUTE_STRESS_MIN_SIDE_GAP);
-		const reason = oppositePairs.length === 0
-			? 'side'
-			: distinctPairs.length === 0
-				? 'distinct'
-				: distinctPairs.every((p) => p.ratio > 1.5)
-					? 'distance'
-					: 'distinct';
-		const routeSideSlots = [null, null, null];
-		const routeSideLabelSlots = [null, null, null];
+	const seenPathSignatures = new Set();
+	paths = paths.filter((p) => {
+		const sig = routePathSignature(p.path);
+		if (seenPathSignatures.has(sig)) return false;
+		seenPathSignatures.add(sig);
+		return true;
+	});
+	for (let i = 0; i < paths.length; i++) paths[i].routeIndex = i + 1;
+	if (paths.length < 2) {
+		const routeLengthSlots = emptyRouteSlots();
+		const routeSideSlots = emptyRouteSlots();
+		const routeSideLabelSlots = emptyRouteSlots();
 		for (const p of paths) {
+			routeLengthSlots[p.routeIndex - 1] = p.len;
 			routeSideSlots[p.routeIndex - 1] = p.side;
 			routeSideLabelSlots[p.routeIndex - 1] = p.sideLabel;
 		}
-		return { ok: false, reason, paths, selected: null, routeLengthSlots: [null, null, null], routeSideSlots, routeSideLabelSlots, routeIndexes: [], blockFastest, barriers, dt };
+		return { ok: false, reason: 'distinct', paths, selected: null, routeLengthSlots, routeSideSlots, routeSideLabelSlots, routeIndexes: [], blockFastest: false, barriers, skippedBarriers: [], dt, timeout };
 	}
 
-	const routeLengthSlots = [null, null, null];
-	const routeSideSlots = [null, null, null];
-	const routeSideLabelSlots = [null, null, null];
+	const pairs = [];
+	for (let i = 0; i < paths.length; i++) {
+		for (let j = i + 1; j < paths.length; j++) {
+			const sideGap = Math.abs(paths[i].side - paths[j].side);
+			const shorter = paths[i].len;
+			const longer = paths[j].len;
+			pairs.push({ i, j, relativeGap: shorter > 0 ? (longer - shorter) / shorter : Infinity, total: shorter + longer, sideGap });
+		}
+	}
+	pairs.sort((a, b) => a.relativeGap - b.relativeGap || a.total - b.total);
+	const bestPair = pairs[0];
+	const selected = [paths[bestPair.i], paths[bestPair.j]];
+
+	if (bestPair.relativeGap > 0.5) {
+		const routeLengthSlots = emptyRouteSlots();
+		const routeSideSlots = emptyRouteSlots();
+		const routeSideLabelSlots = emptyRouteSlots();
+		for (const p of paths) {
+			routeLengthSlots[p.routeIndex - 1] = p.len;
+			routeSideSlots[p.routeIndex - 1] = p.side;
+			routeSideLabelSlots[p.routeIndex - 1] = p.sideLabel;
+		}
+		return { ok: false, reason: 'distance', paths, selected: null, routeLengthSlots, routeSideSlots, routeSideLabelSlots, routeIndexes: [], blockFastest: false, barriers, skippedBarriers: [], dt, timeout };
+	}
+
+	if (bestPair.sideGap < ROUTE_STRESS_MIN_SIDE_GAP) {
+		const routeLengthSlots = emptyRouteSlots();
+		const routeSideSlots = emptyRouteSlots();
+		const routeSideLabelSlots = emptyRouteSlots();
+		for (const p of paths) {
+			routeLengthSlots[p.routeIndex - 1] = p.len;
+			routeSideSlots[p.routeIndex - 1] = p.side;
+			routeSideLabelSlots[p.routeIndex - 1] = p.sideLabel;
+		}
+		return { ok: false, reason: 'side', paths, selected: null, routeLengthSlots, routeSideSlots, routeSideLabelSlots, routeIndexes: [], blockFastest: false, barriers, skippedBarriers: [], dt, timeout };
+	}
+
+	const selectedShortest = Math.min(selected[0].len, selected[1].len);
+	const skippedBarriers = paths
+		.filter((p) => p.len < selectedShortest && p.barrier)
+		.map((p) => p.barrier);
+	const blockFastest = skippedBarriers.length > 0;
+
+	const routeLengthSlots = emptyRouteSlots();
+	const routeSideSlots = emptyRouteSlots();
+	const routeSideLabelSlots = emptyRouteSlots();
 	for (const p of selected) routeLengthSlots[p.routeIndex - 1] = p.len;
 	for (const p of paths) {
 		routeSideSlots[p.routeIndex - 1] = p.side;
@@ -1105,7 +1119,9 @@ function computeRouteOptions(startPt, goalPt, visGraph) {
 		routeIndexes: selected.map(p => p.routeIndex),
 		blockFastest,
 		barriers,
+		skippedBarriers,
 		dt,
+		timeout,
 	};
 }
 function drawComputedRoute(g, result) {
@@ -1118,8 +1134,10 @@ function drawComputedRoute(g, result) {
 	const COLORS = ['#d12b2b', '#2b7bd1'];
 	result.selected.forEach((p, i) => drawPathLine(g, p.path, COLORS[i]));
 
-	if (result.blockFastest && result.barriers.length > 0) {
-		const b = result.barriers[0];
+	const blockedBars = (result.skippedBarriers && result.skippedBarriers.length)
+		? result.skippedBarriers
+		: (result.blockFastest && result.barriers.length > 0 ? [result.barriers[0]] : []);
+	for (const b of blockedBars) {
 		const line = document.createElementNS(SVGNS, 'line');
 		line.setAttribute('x1', b.ax); line.setAttribute('y1', b.ay);
 		line.setAttribute('x2', b.bx); line.setAttribute('y2', b.by);
@@ -1204,7 +1222,7 @@ function routeTestRandomSettings(seed) {
 const ROUTE_STRESS_MAX_RUNS = 100;
 const ROUTE_STRESS_MIN_DIST = 30;
 const ROUTE_STRESS_MAX_DIST = 100;
-const ROUTE_STRESS_MIN_SIDE_GAP = 200; // min |sideA - sideB| for a route pair to count as distinct (data-derived: ~P15 of opposite-sign gaps from 10k stress run)
+const ROUTE_STRESS_MIN_SIDE_GAP = 10; // min average side-position gap in map units for a route pair
 const ROUTE_STRESS_ROUTE_ATTEMPT_PAUSE = 20;
 const ROUTE_STRESS_EXPORT_EVERY = 1000;
 const ROUTE_STRESS_OUTSIDE_WALL_MAX_DIST = 12;
@@ -1276,7 +1294,7 @@ function routeTestPickPoint(candidates, visGraph, wall = null) {
 			if (!routeTestPointInPolygon(pt, item.ward.polygon)) continue;
 			const area = routeTestPointAllowedForStress(pt, item.ward, wall);
 			if (!area) continue;
-			if (visGraph._inRawObstacle(pt.x, pt.y)) continue;
+			if (visGraph._inObstacle ? visGraph._inObstacle(pt.x, pt.y) : visGraph._inRawObstacle(pt.x, pt.y)) continue;
 			return { ...pt, wardType: item.ward.type || 'generic', area };
 		}
 	}
@@ -1314,12 +1332,12 @@ function routeTestRecordsToCsv(records) {
 	const columns = [
 		'run', 'seed', 'status', 'screenshotIndex', 'screenshotFile',
 		'size', 'river', 'shore', 'walls',
-		'retries', 'rejectDistinct', 'rejectDistance', 'rejectSide',
-		'cityGenerationMs', 'navMeshGenerationMs', 'pathfindingUntilFoundMs',
+		'retries', 'rejectDistinct', 'rejectDistance', 'rejectSide', 'timeout',
+		'cityGenerationMs', 'navMeshGenerationMs', 'pathfindingUntilFoundMs', 'pathfindingMsByRetry',
 		'startX', 'startY', 'startWardType', 'startArea', 'goalX', 'goalY', 'goalWardType', 'goalArea', 'straightLineDistance',
-		'selectedRouteIndexes', 'route1Length', 'route2Length', 'route3Length',
-		'route1Side', 'route2Side', 'route3Side', 'route1SideLabel', 'route2SideLabel', 'route3SideLabel',
-		'candidateRouteLengths', 'reason',
+		'selectedRouteIndexes', 'route1Length', 'route2Length', 'route3Length', 'route4Length',
+		'route1Side', 'route2Side', 'route3Side', 'route4Side', 'route1SideLabel', 'route2SideLabel', 'route3SideLabel', 'route4SideLabel',
+		'candidateRouteLengths', 'reason', 'failedAttempts',
 	];
 	const rows = [columns.join(',')];
 	for (const r of records) {
@@ -1499,11 +1517,20 @@ function routeTestShowResult(d, vg, endpoints, routeResult) {
 	vp.appendChild(g);
 }
 
-function routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs, pathfindingMs, retries, pair, routeResult, status, rejectionCounts = null, screenshot = null) {
-	const lengths = routeResult ? routeResult.routeLengthSlots : [null, null, null];
-	const sides = routeResult ? routeResult.routeSideSlots : [null, null, null];
-	const sideLabels = routeResult ? routeResult.routeSideLabelSlots : [null, null, null];
+function routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs, pathfindingMs, retries, pair, routeResult, status, rejectionCounts = null, screenshot = null, extra = {}) {
+	const lengths = routeResult ? routeResult.routeLengthSlots : emptyRouteSlots();
+	const sides = routeResult ? routeResult.routeSideSlots : emptyRouteSlots();
+	const sideLabels = routeResult ? routeResult.routeSideLabelSlots : emptyRouteSlots();
 	const counts = rejectionCounts || { distinct: 0, distance: 0, side: 0 };
+	// Each failed (route-rejected) attempt as "sx,sy>gx,gy:reason[:timeout]";
+	// entries separated by ';' so the whole list fits one CSV cell and any
+	// weird pair can be pasted straight back into a route to reproduce it.
+	const failed = extra.failedAttempts || [];
+	const failedAttempts = failed
+		.map((a) => `${a.sx.toFixed(6)},${a.sy.toFixed(6)}>${a.gx.toFixed(6)},${a.gy.toFixed(6)}:${a.reason}${a.timeout ? ':timeout' : ''}`)
+		.join(';');
+	// A* time (ms) of every attempt, final success last; '|'-separated.
+	const pathfindingMsByRetry = (extra.pathfindingMsByRetry || []).join('|');
 	return {
 		run,
 		seed,
@@ -1518,9 +1545,11 @@ function routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs,
 		rejectDistinct: counts.distinct,
 		rejectDistance: counts.distance,
 		rejectSide: counts.side,
+		timeout: extra.timeoutCount || 0,
 		cityGenerationMs: Number(generationMs.toFixed(3)),
 		navMeshGenerationMs: Number(navMeshMs.toFixed(3)),
 		pathfindingUntilFoundMs: Number(pathfindingMs.toFixed(3)),
+		pathfindingMsByRetry,
 		startX: pair ? Number(pair.start.x.toFixed(6)) : '',
 		startY: pair ? Number(pair.start.y.toFixed(6)) : '',
 		startWardType: pair ? pair.start.wardType : '',
@@ -1534,14 +1563,18 @@ function routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs,
 		route1Length: lengths[0] == null ? '' : Number(lengths[0].toFixed(3)),
 		route2Length: lengths[1] == null ? '' : Number(lengths[1].toFixed(3)),
 		route3Length: lengths[2] == null ? '' : Number(lengths[2].toFixed(3)),
+		route4Length: lengths[3] == null ? '' : Number(lengths[3].toFixed(3)),
 		route1Side: sides[0] == null ? '' : Number(sides[0].toFixed(6)),
 		route2Side: sides[1] == null ? '' : Number(sides[1].toFixed(6)),
 		route3Side: sides[2] == null ? '' : Number(sides[2].toFixed(6)),
+		route4Side: sides[3] == null ? '' : Number(sides[3].toFixed(6)),
 		route1SideLabel: sideLabels[0] || '',
 		route2SideLabel: sideLabels[1] || '',
 		route3SideLabel: sideLabels[2] || '',
-		candidateRouteLengths: routeResult ? routeResult.paths.slice(0, 3).map((p) => Number(p.len.toFixed(3))).join('|') : '',
+		route4SideLabel: sideLabels[3] || '',
+		candidateRouteLengths: routeResult ? routeResult.paths.slice(0, ROUTE_STRESS_ALTERNATE_ATTEMPTS).map((p) => Number(p.len.toFixed(3))).join('|') : '',
 		reason: routeResult ? routeResult.reason : status,
+		failedAttempts,
 	};
 }
 
@@ -1592,6 +1625,12 @@ async function runRouteStressTest(maxRuns = ROUTE_STRESS_MAX_RUNS) {
 		let pair = null;
 		let routeResult = null;
 		const rejectionCounts = { distinct: 0, distance: 0, side: 0 };
+		// Per-retry detail so weird cases stay reproducible: each route-rejected
+		// attempt's start/goal + reason + whether A* timed out, the A* time of
+		// every attempt (incl. the final success), and a timeout tally.
+		const failedAttempts = [];
+		const pathfindingMsByRetry = [];
+		let timeoutCount = 0;
 		while (!routeStressAbort) {
 			pair = routeTestPickPair(candidates, vg, d.wall, rejectionCounts);
 			if (!pair) {
@@ -1601,8 +1640,17 @@ async function runRouteStressTest(maxRuns = ROUTE_STRESS_MAX_RUNS) {
 				continue;
 			}
 			routeResult = computeRouteOptions(pair.start, pair.goal, vg);
+			pathfindingMsByRetry.push(Number(routeResult.dt.toFixed(3)));
+			if (routeResult.timeout) timeoutCount++;
 			if (routeResult.ok) break;
-			if (routeResult.reason === 'distinct') rejectionCounts.distinct++;
+			failedAttempts.push({
+				sx: pair.start.x, sy: pair.start.y, gx: pair.goal.x, gy: pair.goal.y,
+				reason: routeResult.reason, timeout: routeResult.timeout,
+			});
+			if (routeResult.reason === 'timeout') {
+				if (!routeResult.timeout) timeoutCount++;
+			}
+			else if (routeResult.reason === 'distinct') rejectionCounts.distinct++;
 			else if (routeResult.reason === 'distance') rejectionCounts.distance++;
 			else rejectionCounts.side++;
 			retries++;
@@ -1618,7 +1666,7 @@ async function runRouteStressTest(maxRuns = ROUTE_STRESS_MAX_RUNS) {
 		} catch (e) {
 			console.warn('route-stress: screenshot capture failed', e);
 		}
-		const record = routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs, pathfindingMs, retries, pair, routeResult, 'ok', rejectionCounts, screenshot);
+		const record = routeTestRecordFromResult(run, seed, settings, generationMs, navMeshMs, pathfindingMs, retries, pair, routeResult, 'ok', rejectionCounts, screenshot, { failedAttempts, pathfindingMsByRetry, timeoutCount });
 		routeTestAppendLog(record);
 		if (routeStressScreenshots.length >= ROUTE_STRESS_EXPORT_EVERY) await routeTestDownloadScreenshots(true);
 		statusEl.textContent = `route stress ${run}/${maxRuns} · retries ${retries} · seed ${seed} · size ${settings.size} · river ${settings.river ? 'on' : 'off'} · shore ${settings.coast ? 'on' : 'off'} · walls ${settings.walls ? 'on' : 'off'}`;
