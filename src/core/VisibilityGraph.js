@@ -731,7 +731,7 @@ export class LazyVisibilityGraph {
 
 	pruneVisibleMidpoints(path) {
 		if (!path || path.length < 3) return path;
-		const clear = (a, b) => this.losClear(a.x, a.y, b.x, b.y, this._pathNodeIndex(a), this._pathNodeIndex(b));
+		const clear = (a, b) => this._losClearForPath(a, b);
 		const out = path.slice();
 		let changed = true;
 		while (changed) {
@@ -754,6 +754,22 @@ export class LazyVisibilityGraph {
 		return p && Number.isInteger(p.idx) && p.idx >= 0 ? p.idx : -1;
 	}
 
+	// LOS for a pair of path nodes, with the same endpoint-in-dilation
+	// relaxation used by queryPoint / astar's goal-edge test: when an
+	// endpoint is an off-graph marker (idx < 0) that sits inside a clearance
+	// buffer, fall back to raw (non-dilated) LOS for shortcuts involving it.
+	// This lets string-pulling strip a leftover "leave the buffer" hop even
+	// after A* has produced it. Mid-route (graph → graph) anchors keep using
+	// the dilated oracle so clearance is preserved everywhere except the
+	// first/last spur, which by definition already violates it.
+	_losClearForPath(a, b) {
+		const ai = this._pathNodeIndex(a);
+		const bi = this._pathNodeIndex(b);
+		if ((ai < 0 && this._inObstacle(a.x, a.y)) || (bi < 0 && this._inObstacle(b.x, b.y)))
+			return this.losClearRaw(a.x, a.y, b.x, b.y);
+		return this.losClear(a.x, a.y, b.x, b.y, ai, bi);
+	}
+
 	// ---- Path smoothing (string-pulling / line-of-sight simplification) ----
 	// Walks the path from start; for each anchor, tries to skip ahead to the
 	// farthest node that still has LOS (against the non-dilated edges). This
@@ -761,7 +777,7 @@ export class LazyVisibilityGraph {
 	// O(n²) in path length — paths are short (10-30 hops), so plenty fast.
 	smoothPath(path) {
 		if (!path || path.length < 3) return path;
-		const clear = (a, b) => this.losClear(a.x, a.y, b.x, b.y, this._pathNodeIndex(a), this._pathNodeIndex(b));
+		const clear = (a, b) => this._losClearForPath(a, b);
 		const smoothed = [path[0]];
 		let anchor = 0;
 		while (anchor < path.length - 1) {
@@ -901,6 +917,14 @@ export class LazyVisibilityGraph {
 	// guarantees connectivity for arbitrary click points in open space.
 	queryPoint(px, py, exact = false, rawVisibility = false) {
 		if (this._inRawObstacle(px, py)) return { index: -1, x: px, y: py, _links: [], _isQuery: true };
+		// When the click point sits inside a clearance (dilation) buffer but
+		// outside the visual obstacle, the dilated LOS oracle rejects every
+		// ray leaving the buffer and only the buffer's own vertices remain
+		// visible — A* is then forced onto a spurious "leave" hop onto the
+		// obstacle's own dilated vertex. A route may legitimately start/end
+		// at the visual edge of an obstacle, so relax to raw (non-dilated)
+		// LOS for the spur from such a point.
+		const inDilation = !rawVisibility && this._inObstacle(px, py);
 		if (rawVisibility) {
 			const links = [];
 			for (let j = 0; j < this.nodeCount; j++) {
@@ -918,10 +942,10 @@ export class LazyVisibilityGraph {
 			for (let j = 0; j < this.nodeCount; j++) {
 				if (this.nodeBlocked[j]) continue;
 				const vx = this.nodeX[j], vy = this.nodeY[j];
-				if (this.losClear(px, py, vx, vy, -1, j))
-					links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
-			}
-			return { index: -1, x: px, y: py, _links: links, _isQuery: true };
+			if (inDilation ? this.losClearRaw(px, py, vx, vy) : this.losClear(px, py, vx, vy, -1, j))
+				links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
+		}
+		return { index: -1, x: px, y: py, _links: links, _isQuery: true };
 		}
 		const ng = this.nodeGrid;
 		const cx0 = ng.col(px), cy0 = ng.row(py);
@@ -943,9 +967,9 @@ export class LazyVisibilityGraph {
 						if (seen.has(j)) continue;
 						seen.add(j);
 						const vx = this.nodeX[j], vy = this.nodeY[j];
-						if (this.losClear(px, py, vx, vy, -1, j)) {
-							links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
-						}
+					if (inDilation ? this.losClearRaw(px, py, vx, vy) : this.losClear(px, py, vx, vy, -1, j)) {
+						links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
+					}
 					}
 				}
 			}
@@ -977,10 +1001,16 @@ export class LazyVisibilityGraph {
 		const START_IDX = -2;
 		const GOAL_IDX = -3;
 		let goalLinkMap = null;
-		if (goalIsOffGraph) {
-			const goalQuery = this.queryPoint(goal.x, goal.y, exact, rawVisibility);
-			goalLinkMap = new Map(goalQuery._links.map(l => [l.to, l.w]));
-		}
+	if (goalIsOffGraph) {
+		const goalQuery = this.queryPoint(goal.x, goal.y, exact, rawVisibility);
+		goalLinkMap = new Map(goalQuery._links.map(l => [l.to, l.w]));
+	}
+	// As with queryPoint: a goal (or off-graph start) marker that sits inside a
+	// clearance buffer must relax its final-spur LOS to raw, otherwise the goal
+	// spur is forced onto a buffer vertex of the obstacle the goal "almost
+	// touches". Mid-route invisibility still uses the dilated oracle.
+	const goalInDilation = goalIsOffGraph && !rawVisibility && this._inObstacle(goalX, goalY);
+	const startInDilation = startNode._isQuery && !rawVisibility && this._inObstacle(startNode.x, startNode.y);
 
 		// Weighted A*: f = g + W·h. W>1 trims the frontier (fewer node expansions,
 		// fewer lazy-visibility computations) at the cost of paths up to W× optimal.
@@ -1047,21 +1077,29 @@ export class LazyVisibilityGraph {
 				? startNode._links
 				: this.neighbors(cur.idx, exact, rawVisibility);
 			if (goalIsOffGraph) {
-				let goalLink = null;
-				if (cur.idx === START_IDX) {
-					if (rawVisibility ? this.losClearRaw(cur.x, cur.y, goalX, goalY) : this.losClear(cur.x, cur.y, goalX, goalY, -1, -1))
-						goalLink = {
-							to: GOAL_IDX,
-							w: Math.hypot(goalX - cur.x, goalY - cur.y),
-							cost: this.edgeCost(cur.x, cur.y, goalX, goalY),
-						};
-				} else if (goalLinkMap.has(cur.idx) && (rawVisibility ? this.losClearRaw(cur.x, cur.y, goalX, goalY) : this.losClear(cur.x, cur.y, goalX, goalY, cur.idx, -1))) {
+			let goalLink = null;
+			// _goalEdgeClear: (start↔goal direct, or current-node↔goal)
+			// dilated LOS has the endpoint-in-dilation relaxation applied so
+			// reaching a marker placed inside a clearance buffer doesn't get
+			// rejected just for crossing the obstacle's own dilated edge.
+			const _goalEdgeClear = (cx, cy, cIdx) =>
+				(rawVisibility || goalInDilation || (cIdx < 0 && startInDilation))
+					? this.losClearRaw(cx, cy, goalX, goalY)
+					: this.losClear(cx, cy, goalX, goalY, cIdx, -1);
+			if (cur.idx === START_IDX) {
+				if (_goalEdgeClear(cur.x, cur.y, -1))
 					goalLink = {
 						to: GOAL_IDX,
-						w: goalLinkMap.get(cur.idx),
+						w: Math.hypot(goalX - cur.x, goalY - cur.y),
 						cost: this.edgeCost(cur.x, cur.y, goalX, goalY),
 					};
-				}
+			} else if (goalLinkMap.has(cur.idx) && _goalEdgeClear(cur.x, cur.y, cur.idx)) {
+				goalLink = {
+					to: GOAL_IDX,
+					w: goalLinkMap.get(cur.idx),
+					cost: this.edgeCost(cur.x, cur.y, goalX, goalY),
+				};
+			}
 				if (goalLink) neighbours = neighbours.length ? neighbours.concat([goalLink]) : [goalLink];
 			}
 			for (let k = 0; k < neighbours.length; k++) {

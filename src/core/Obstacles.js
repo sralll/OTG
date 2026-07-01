@@ -419,7 +419,9 @@ function buildBridgeDeck(bridge, course, smoothed, riverWidth) {
 	const centerTangent = riverTangentAt(smoothed, centerCrossing.segment);
 	const referenceNormal = { x: -centerTangent.y, y: centerTangent.x };
 	const sideNormal = { x: -axis.y, y: axis.x };
-	const halfDeck = BRIDGE_FILL_WIDTH / 2;
+	// WIDE_MAIN_ROADS_50_FLAG: road-connected bridges carry a serialized 50%-wider deck width.
+	const deckWidth = Number.isFinite(bridge.width) ? bridge.width : BRIDGE_FILL_WIDTH;
+	const halfDeck = deckWidth / 2;
 	const shoreHalfWidth = (riverWidth || 5) / 2 + WATER_OUTLINE_WIDTH;
 	const leftOrigin = {
 		x: centerCrossing.point.x + sideNormal.x * halfDeck,

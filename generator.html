@@ -44,7 +44,7 @@
 <svg id="map" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
 
 <script type="module">
-import { generateWards } from './src/core/CityGen.js?v=26';
+import { generateWards } from './src/core/CityGen.js?v=31';
 import { extractObstacles, thickenPolyline } from './src/core/Obstacles.js?v=7';
 import { buildVisibilityGraph, dilatePolygon } from './src/core/VisibilityGraph.js?v=12';
 
@@ -94,6 +94,7 @@ const GATE_TOWER_OUTLINE_WIDTH = BUILDING_OUTLINE_WIDTH / 2;
 const WALL_TOWER_DIAMETER_SCALE = 2;
 const WATER_OUTLINE_WIDTH = 0.2;
 const HEDGE_WIDTH = 0.45;
+const BRIDGE_FILL_WIDTH = 1.6;
 
 let data = null, bounds = null;
 
@@ -125,40 +126,65 @@ function dist(a, b) {
 	return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-function pointKey(p) {
-	return `${p.x},${p.y}`;
+function wardBaseFill(w) {
+	const outerCity = w.type === 'outerGarden' || w.type === 'outerHighrise';
+	return w.water ? PALETTE.waterFill : (w.inner || outerCity) ? PALETTE.innerFill : PALETTE.outerFill;
 }
 
-function drawWaterShore(wards) {
-	const waterEdges = new Set();
-	for (const w of wards || []) {
-		if (!w.water || !w.polygon || w.polygon.length < 2) continue;
-		for (let i = 0; i < w.polygon.length; i++) {
-			const a = w.polygon[i];
-			const b = w.polygon[(i + 1) % w.polygon.length];
-			waterEdges.add(`${pointKey(a)}|${pointKey(b)}`);
-		}
-	}
+function polygonPath(poly) {
+	if (!poly || poly.length < 3) return '';
+	return `M${poly.map((p) => `${p.x},${p.y}`).join('L')}Z`;
+}
 
+// Two-pass water rendering: draw the dark outline strokes first (behind), then
+// the blue fills on top. This reproduces the old feMorphology(dilate) filter
+// exactly — the fill covers the inward half of each outline stroke, leaving
+// only a 0.2 outward dark ring visible — but as pure vector geometry with no
+// fullscreen raster, so pan/zoom never triggers a re-paint.
+function drawWaterBody(wards, river, riverGeometry, mapBounds) {
 	let d = '';
-	for (const w of wards || []) {
-		if (!w.water || !w.polygon || w.polygon.length < 2) continue;
-		for (let i = 0; i < w.polygon.length; i++) {
-			const a = w.polygon[i];
-			const b = w.polygon[(i + 1) % w.polygon.length];
-			if (!waterEdges.has(`${pointKey(b)}|${pointKey(a)}`)) d += `M${a.x},${a.y}L${b.x},${b.y}`;
-		}
-	}
-	if (!d) return;
+	for (const w of wards || []) if (w.water) d += polygonPath(w.polygon);
+	if (riverGeometry?.delta) d += deltaPath(riverGeometry.delta);
+	const hasRiver = riverGeometry && river?.width;
+	const outlineWidth = WATER_OUTLINE_WIDTH * 2;
 
-	const shore = document.createElementNS(SVGNS, 'path');
-	shore.setAttribute('d', d);
-	shore.setAttribute('fill', 'none');
-	shore.setAttribute('stroke', PALETTE.waterStroke);
-	shore.setAttribute('stroke-width', WATER_OUTLINE_WIDTH);
-	shore.setAttribute('stroke-linecap', 'butt');
-	shore.setAttribute('stroke-linejoin', 'round');
-	vp.appendChild(shore);
+	if (d) {
+		const outline = document.createElementNS(SVGNS, 'path');
+		outline.setAttribute('d', d);
+		outline.setAttribute('fill', 'none');
+		outline.setAttribute('stroke', PALETTE.waterStroke);
+		outline.setAttribute('stroke-width', outlineWidth);
+		outline.setAttribute('stroke-linejoin', 'round');
+		vp.appendChild(outline);
+	}
+	if (hasRiver) {
+		const outline = document.createElementNS(SVGNS, 'path');
+		outline.setAttribute('d', riverGeometry.pathD);
+		outline.setAttribute('fill', 'none');
+		outline.setAttribute('stroke', PALETTE.waterStroke);
+		outline.setAttribute('stroke-width', river.width + outlineWidth);
+		outline.setAttribute('stroke-linecap', river.delta ? 'butt' : 'round');
+		outline.setAttribute('stroke-linejoin', 'round');
+		vp.appendChild(outline);
+	}
+
+	if (d) {
+		const water = document.createElementNS(SVGNS, 'path');
+		water.setAttribute('d', d);
+		water.setAttribute('fill', PALETTE.waterFill);
+		water.setAttribute('stroke', 'none');
+		vp.appendChild(water);
+	}
+	if (hasRiver) {
+		const riverFill = document.createElementNS(SVGNS, 'path');
+		riverFill.setAttribute('d', riverGeometry.fillPathD || riverGeometry.pathD);
+		riverFill.setAttribute('fill', 'none');
+		riverFill.setAttribute('stroke', PALETTE.river);
+		riverFill.setAttribute('stroke-width', river.width);
+		riverFill.setAttribute('stroke-linecap', river.delta ? 'butt' : 'round');
+		riverFill.setAttribute('stroke-linejoin', 'round');
+		vp.appendChild(riverFill);
+	}
 }
 
 function previewDeltaFromPath(delta, path, width) {
@@ -188,15 +214,26 @@ function deltaPath(dl) {
 	if (dl.isConvex) d += ` L${dl.mouth.x},${dl.mouth.y}`;
 	d += ` L${dl.nextShore.x},${dl.nextShore.y}`;
 	d += ` C${dl.leftCtrl1.x},${dl.leftCtrl1.y} ${dl.leftCtrl2.x},${dl.leftCtrl2.y} ${dl.left.x},${dl.left.y}`;
-	return d + ' Z';
+	return d;
 }
 
-function deltaLandOutlinePath(dl) {
-	let d = `M${dl.right.x},${dl.right.y}`;
-	d += ` C${dl.rightCtrl1.x},${dl.rightCtrl1.y} ${dl.rightCtrl2.x},${dl.rightCtrl2.y} ${dl.prevShore.x},${dl.prevShore.y}`;
-	d += ` M${dl.nextShore.x},${dl.nextShore.y}`;
-	d += ` C${dl.leftCtrl1.x},${dl.leftCtrl1.y} ${dl.leftCtrl2.x},${dl.leftCtrl2.y} ${dl.left.x},${dl.left.y}`;
-	return d;
+function riverRenderGeometry(river) {
+	if (!river || !river.course || river.course.length < 2) return null;
+	const course = river.delta
+		? [{ x: (river.course[0].x + river.course[1].x) / 2, y: (river.course[0].y + river.course[1].y) / 2 }, ...river.course.slice(1)]
+		: river.course;
+	const visualCourse = chaikinSmooth(course, 3);
+	// The dark outline stops at the delta base (visualCourse[0]) so the mouth stays outline-free
+	// (water↔water). The blue fill, however, runs one segment further seaward to the actual mouth
+	// point, so it overlaps the delta fill — this removes the anti-aliasing hairline crack that
+	// otherwise appears where the separate river-fill and water-body-fill paths merely abut.
+	const fillCourse = river.delta ? [river.course[0], ...visualCourse] : visualCourse;
+	return {
+		visualCourse,
+		pathD: polyPath(visualCourse),
+		fillPathD: polyPath(fillCourse),
+		delta: river.delta ? previewDeltaFromPath(river.delta, visualCourse, river.width) : null,
+	};
 }
 
 function drawWall(wall, riverWidth, riverNodes) {
@@ -358,7 +395,8 @@ function drawBridges(river, visualCourse = null) {
 		const i = river.course.findIndex((p) => Math.abs(p.x - bridge.x) < 1e-6 && Math.abs(p.y - bridge.y) < 1e-6);
 		if (i <= 0 || i >= river.course.length - 1) continue;
 		const fill = '#e4d7b6';
-		const fillWidth = 1.6;
+		// WIDE_MAIN_ROADS_50_FLAG: road-connected bridges carry a serialized 50%-wider deck width.
+		const fillWidth = Number.isFinite(bridge.width) ? bridge.width : BRIDGE_FILL_WIDTH;
 		const sideOutlineWidth = 0.2;
 		let axis = null;
 		if (bridge.from && bridge.to) {
@@ -433,7 +471,14 @@ function drawDocks(docks) {
 			const uy = dy / len;
 			// Extend the black outline slightly past the sea-side end so it forms a flat end cap.
 			const seaCap = { x: pier.to.x + ux * outlineWidth / 10, y: pier.to.y + uy * outlineWidth / 10 };
-			const dFill = `M${pier.from.x},${pier.from.y} L${pier.to.x},${pier.to.y}`;
+			// The pier's landward end sits exactly on the shore boundary, so the land-side half of the
+			// shore outline stroke pokes out between the pier and the land, visually "cutting off" the
+			// dock. Run the fill (only) a touch inland — it shares the city-ward colour, so it merges
+			// seamlessly into the land while covering that outline. The black side-rims still stop at
+			// the shore, so no new outline appears on land.
+			const landOverlap = WATER_OUTLINE_WIDTH * 2;
+			const landFrom = { x: pier.from.x - ux * landOverlap, y: pier.from.y - uy * landOverlap };
+			const dFill = `M${landFrom.x},${landFrom.y} L${pier.to.x},${pier.to.y}`;
 			const dOutline = `M${pier.from.x},${pier.from.y} L${seaCap.x},${seaCap.y}`;
 			for (const [stroke, width, d] of [[PALETTE.bridgeDockOutline, outlineWidth, dOutline], [fill, fillWidth, dFill]]) {
 				const path = document.createElementNS(SVGNS, 'path');
@@ -680,54 +725,23 @@ function drawObstacles(d) {
 function render(d) {
 	while (vp.firstChild) vp.removeChild(vp.firstChild);
 	for (const w of d.wards) {
+		if (w.water) continue;
 		if (!w.polygon || w.polygon.length < 3) continue;
 		const el = document.createElementNS(SVGNS, 'polygon');
 		el.setAttribute('points', w.polygon.map((p) => p.x + ',' + p.y).join(' '));
-		const fill = w.water ? PALETTE.waterFill : w.inner ? PALETTE.innerFill : PALETTE.outerFill;
-		el.setAttribute('fill', fill);
+		el.setAttribute('fill', wardBaseFill(w));
 		el.setAttribute('stroke', 'none');
 		vp.appendChild(el);
 	}
-	drawWaterShore(d.wards);
+	const riverGeometry = riverRenderGeometry(d.river);
 	drawBlocks(d.blocks);
 	drawBuildings(d.buildings);
 	drawHedges(d.hedges);
 	drawCathedralHedges(d.cathedralHedges);
 	drawRoads(d.roads);
-	if (d.river && d.river.course && d.river.course.length >= 2) {
-		const course = d.river.delta
-			? [{ x: (d.river.course[0].x + d.river.course[1].x) / 2, y: (d.river.course[0].y + d.river.course[1].y) / 2 }, ...d.river.course.slice(1)]
-			: d.river.course;
-		const visualCourse = chaikinSmooth(course, 3);
-		const pathD = polyPath(visualCourse);
-		const mk = (stroke, w) => {
-			const e = document.createElementNS(SVGNS, 'path');
-			e.setAttribute('d', pathD); e.setAttribute('fill', 'none');
-			e.setAttribute('stroke', stroke); e.setAttribute('stroke-width', w);
-			e.setAttribute('stroke-linecap', d.river.delta ? 'butt' : 'round'); e.setAttribute('stroke-linejoin', 'round');
-			return e;
-		};
-
-		if (d.river.delta) {
-			// Delta base width must match the river stroke EXACTLY so there's no visible step
-			// between the fan mouth and the river. Add a tiny +0.2 overlap so the delta fill
-			// slides under the stroke (prevents anti-aliasing hairline).
-			const dl = previewDeltaFromPath(d.river.delta, visualCourse, d.river.width + 0.2);
-			vp.appendChild(mk(PALETTE.riverBank, d.river.width + WATER_OUTLINE_WIDTH * 2));
-			const fill = document.createElementNS(SVGNS, 'path');
-			fill.setAttribute('d', deltaPath(dl)); fill.setAttribute('fill', PALETTE.river);
-			fill.setAttribute('stroke', 'none');
-			vp.appendChild(fill);
-			const landOutline = document.createElementNS(SVGNS, 'path');
-			landOutline.setAttribute('d', deltaLandOutlinePath(dl)); landOutline.setAttribute('fill', 'none');
-			landOutline.setAttribute('stroke', PALETTE.riverBank); landOutline.setAttribute('stroke-width', WATER_OUTLINE_WIDTH);
-			landOutline.setAttribute('stroke-linecap', 'round'); landOutline.setAttribute('stroke-linejoin', 'round');
-			vp.appendChild(landOutline);
-			vp.appendChild(mk(PALETTE.river, d.river.width));
-		} else {
-			vp.appendChild(mk(PALETTE.riverBank, d.river.width + WATER_OUTLINE_WIDTH * 2));
-			vp.appendChild(mk(PALETTE.river, d.river.width));
-		}
+	drawWaterBody(d.wards, d.river, riverGeometry, d.bounds);
+	if (riverGeometry) {
+		const visualCourse = riverGeometry.visualCourse;
 		drawBridges(d.river, visualCourse);
 	}
 	drawDocks(d.docks);
@@ -830,7 +844,7 @@ svg.addEventListener('pointermove', (e) => {
 		tx = sx - (sx - tx) * f; ty = sy - (sy - ty) * f; scale *= f; lm = { x: mx, y: my }; ld = d; apply();
 	}
 });
-const up = (e) => { pts.delete(e.pointerId); reset(); if (pts.size === 0) svg.style.cursor = 'grab'; };
+const up = (e) => { pts.delete(e.pointerId); reset(); if (pts.size === 0) { svg.style.cursor = 'grab'; } };
 svg.addEventListener('pointerup', up); svg.addEventListener('pointercancel', up);
 svg.addEventListener('wheel', (e) => { e.preventDefault(); const r = svg.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top, f = e.deltaY < 0 ? 1.1 : 1 / 1.1; tx = sx - (sx - tx) * f; ty = sy - (sy - ty) * f; scale *= f; apply(); }, { passive: false });
 
@@ -849,6 +863,8 @@ function routePathLength(path) {
 		len += Math.hypot(path[i].x - path[i-1].x, path[i].y - path[i-1].y);
 	return len;
 }
+const ROUTE_BARRIER_DRAW_WIDTH = 0.8;
+const ROUTE_BARRIER_SLIDE_FRACTION = 0.05;
 const ROUTE_INSIGNIFICANT_BARRIER_KINDS = new Set(['hedge']);
 function routePointInFlatPolygon(px, py, poly) {
 	let inside = false;
@@ -885,7 +901,9 @@ function findSmartBarrier(path, visGraph) {
 	const MAX_HALF = 12;
 	const STEP = 0.25;
 	const MARGIN = 1.0;
-	const SAMPLES = 30;
+	const CENTER_FRACTION = 0.5;
+	const SLIDE_SAMPLES = 32;
+	const FALLBACK_SAMPLES = 30;
 
 	// Walk the route to the point at `frac` of its length, then probe perpendicular
 	// to find the corridor wall on each side. `leftHit`/`rightHit` say whether a real
@@ -902,6 +920,8 @@ function findSmartBarrier(path, visGraph) {
 				const norm = segLen || 1;
 				const px = -(path[i].y - path[i-1].y) / norm;
 				const py = (path[i].x - path[i-1].x) / norm;
+				const distFromPrev = targetLen - accum;
+				const distToNext = accum + segLen - targetLen;
 				let leftDist = MAX_HALF, rightDist = MAX_HALF;
 				let leftHit = false, rightHit = false;
 				for (let d = STEP; d <= MAX_HALF; d += STEP) {
@@ -910,7 +930,7 @@ function findSmartBarrier(path, visGraph) {
 				for (let d = STEP; d <= MAX_HALF; d += STEP) {
 					if (routePointInSignificantRawObstacle(mx - px * d, my - py * d, visGraph)) { rightDist = d; rightHit = true; break; }
 				}
-				return { mx, my, px, py, leftDist, rightDist, leftHit, rightHit };
+				return { frac, mx, my, px, py, leftDist, rightDist, leftHit, rightHit, distFromPrev, distToNext };
 			}
 			accum += segLen;
 		}
@@ -922,27 +942,58 @@ function findSmartBarrier(path, visGraph) {
 		mx: p.mx, my: p.my,
 		ax: p.mx + p.px * (p.leftDist + MARGIN), ay: p.my + p.py * (p.leftDist + MARGIN),
 		bx: p.mx - p.px * (p.rightDist + MARGIN), by: p.my - p.py * (p.rightDist + MARGIN),
+		len: p.leftDist + p.rightDist + MARGIN * 2,
 	});
+	const isClearOfRouteNodes = (p) =>
+		Math.min(p.distFromPrev, p.distToNext) >= ROUTE_BARRIER_DRAW_WIDTH;
 
-	// Preferred placement: ~50% of route length (statistically the most decisive
-	// point), but slid to the nearest *enclosed* sample — one with an obstacle on
-	// BOTH sides, so the wall actually seals an alley instead of ending in open
-	// space at a junction (which the path would just round). Narrowest-anywhere is
-	// kept only as a fallback for open maps that have no enclosed corridor at all.
+	// Preferred placement: slide within +/-5% of the route midpoint and choose the
+	// shortest enclosed alley bar that is not sitting on a bracketing route vertex.
+	// Narrowest-anywhere is kept only as a fallback for open maps that have no
+	// enclosed corridor in the midpoint window.
+	let bestClearEnclosed = null, bestClearScore = Infinity;
 	let bestEnclosed = null, bestEnclosedScore = Infinity;
-	let bestFallback = null, bestFallbackWidth = Infinity;
-	for (let s = 0; s <= SAMPLES; s++) {
-		const frac = 0.25 + 0.5 * (s / SAMPLES);
+	let bestFallback = null, bestFallbackScore = Infinity;
+	const minFrac = Math.max(0, CENTER_FRACTION - ROUTE_BARRIER_SLIDE_FRACTION);
+	const maxFrac = Math.min(1, CENTER_FRACTION + ROUTE_BARRIER_SLIDE_FRACTION);
+	for (let s = 0; s <= SLIDE_SAMPLES; s++) {
+		const frac = minFrac + (maxFrac - minFrac) * (s / SLIDE_SAMPLES);
 		const p = probe(frac);
 		if (!p) continue;
-		if (p.leftHit && p.rightHit) {
-			const score = Math.abs(frac - 0.5);
-			if (score < bestEnclosedScore) { bestEnclosedScore = score; bestEnclosed = wallAt(p); }
-		}
 		const width = p.leftDist + p.rightDist;
-		if (width < bestFallbackWidth) { bestFallbackWidth = width; bestFallback = wallAt(p); }
+		const centerPenalty = Math.abs(frac - CENTER_FRACTION) * 1e-3;
+		if (p.leftHit && p.rightHit) {
+			const score = width + centerPenalty;
+			if (isClearOfRouteNodes(p) && score < bestClearScore) {
+				bestClearScore = score;
+				bestClearEnclosed = wallAt(p);
+			}
+			if (score < bestEnclosedScore) {
+				bestEnclosedScore = score;
+				bestEnclosed = wallAt(p);
+			}
+		}
+		if (width + centerPenalty < bestFallbackScore) {
+			bestFallbackScore = width + centerPenalty;
+			bestFallback = wallAt(p);
+		}
 	}
-	return bestEnclosed || bestFallback;
+	if (bestClearEnclosed || bestEnclosed) return bestClearEnclosed || bestEnclosed;
+
+	let broadEnclosed = null, broadEnclosedScore = Infinity;
+	let broadFallback = null, broadFallbackScore = Infinity;
+	for (let s = 0; s <= FALLBACK_SAMPLES; s++) {
+		const frac = 0.25 + 0.5 * (s / FALLBACK_SAMPLES);
+		const p = probe(frac);
+		if (!p) continue;
+		const width = p.leftDist + p.rightDist;
+		if (p.leftHit && p.rightHit) {
+			const score = Math.abs(frac - CENTER_FRACTION);
+			if (score < broadEnclosedScore) { broadEnclosedScore = score; broadEnclosed = wallAt(p); }
+		}
+		if (width < broadFallbackScore) { broadFallbackScore = width; broadFallback = wallAt(p); }
+	}
+	return broadEnclosed || bestFallback || broadFallback;
 }
 function drawEndpointMarkers(g, color) {
 	for (const p of routeEndpoints) {
@@ -1082,7 +1133,7 @@ function computeRouteOptions(startPt, goalPt, visGraph) {
 		return { ok: false, reason: 'distance', paths, selected: null, routeLengthSlots, routeSideSlots, routeSideLabelSlots, routeIndexes: [], blockFastest: false, barriers, skippedBarriers: [], dt, timeout };
 	}
 
-	if (bestPair.sideGap < ROUTE_STRESS_MIN_SIDE_GAP) {
+	if (bestPair.sideGap < ROUTE_STRESS_MIN_SIDE_GAP || selected[0].side * selected[1].side >= 0) {
 		const routeLengthSlots = emptyRouteSlots();
 		const routeSideSlots = emptyRouteSlots();
 		const routeSideLabelSlots = emptyRouteSlots();
@@ -1142,7 +1193,7 @@ function drawComputedRoute(g, result) {
 		line.setAttribute('x1', b.ax); line.setAttribute('y1', b.ay);
 		line.setAttribute('x2', b.bx); line.setAttribute('y2', b.by);
 		line.setAttribute('stroke', '#a033f0');
-		line.setAttribute('stroke-width', 0.8);
+		line.setAttribute('stroke-width', ROUTE_BARRIER_DRAW_WIDTH);
 		line.setAttribute('stroke-linecap', 'butt');
 		g.appendChild(line);
 	}
@@ -1219,13 +1270,17 @@ function routeTestRandomSettings(seed) {
 		walls: Math.random() >= 0.25,
 	};
 }
-const ROUTE_STRESS_MAX_RUNS = 100;
-const ROUTE_STRESS_MIN_DIST = 30;
-const ROUTE_STRESS_MAX_DIST = 100;
+const ROUTE_STRESS_MAX_RUNS = 1000;
+const ROUTE_STRESS_MIN_DIST = 40;
+const ROUTE_STRESS_MAX_DIST = 120;
 const ROUTE_STRESS_MIN_SIDE_GAP = 10; // min average side-position gap in map units for a route pair
 const ROUTE_STRESS_ROUTE_ATTEMPT_PAUSE = 20;
-const ROUTE_STRESS_EXPORT_EVERY = 1000;
+const ROUTE_STRESS_EXPORT_EVERY = 100;
 const ROUTE_STRESS_OUTSIDE_WALL_MAX_DIST = 12;
+const ROUTE_STRESS_POINT_POOL_SIZE = 64;
+const ROUTE_STRESS_INTERIOR_BIAS_POWER = 3;
+const ROUTE_STRESS_INTERIOR_BIAS_CAP = 12;
+const ROUTE_STRESS_INTERIOR_BIAS_EPS = 0.25;
 let routeStressRunning = false;
 let routeStressAbort = false;
 let routeStressLog = [];
@@ -1282,7 +1337,19 @@ function routeTestPointAllowedForStress(pt, ward, wall) {
 	return null;
 }
 
+function routeTestPickWeightedPoint(pool) {
+	let total = 0;
+	for (const p of pool) total += p.weight;
+	let r = Math.random() * total;
+	for (const p of pool) {
+		r -= p.weight;
+		if (r <= 0) return p;
+	}
+	return pool[pool.length - 1] || null;
+}
+
 function routeTestPickPoint(candidates, visGraph, wall = null) {
+	const pool = [];
 	for (let attempt = 0; attempt < 500; attempt++) {
 		const item = candidates[(Math.random() * candidates.length) | 0];
 		const b = item.bbox;
@@ -1294,11 +1361,28 @@ function routeTestPickPoint(candidates, visGraph, wall = null) {
 			if (!routeTestPointInPolygon(pt, item.ward.polygon)) continue;
 			const area = routeTestPointAllowedForStress(pt, item.ward, wall);
 			if (!area) continue;
-			if (visGraph._inObstacle ? visGraph._inObstacle(pt.x, pt.y) : visGraph._inRawObstacle(pt.x, pt.y)) continue;
-			return { ...pt, wardType: item.ward.type || 'generic', area };
+			if (visGraph._inRawObstacle && visGraph._inRawObstacle(pt.x, pt.y)) continue;
+			const boundaryDist = routeTestDistanceToClosedPolyline(pt, item.ward.polygon);
+			const biasedDist = Math.min(boundaryDist, ROUTE_STRESS_INTERIOR_BIAS_CAP) + ROUTE_STRESS_INTERIOR_BIAS_EPS;
+			pool.push({
+				...pt,
+				wardType: item.ward.type || 'generic',
+				area,
+				boundaryDist,
+				weight: Math.pow(biasedDist, ROUTE_STRESS_INTERIOR_BIAS_POWER),
+			});
+			if (pool.length >= ROUTE_STRESS_POINT_POOL_SIZE) {
+				const picked = routeTestPickWeightedPoint(pool);
+				if (!picked) return null;
+				const { weight, ...out } = picked;
+				return out;
+			}
 		}
 	}
-	return null;
+	const picked = routeTestPickWeightedPoint(pool);
+	if (!picked) return null;
+	const { weight, ...out } = picked;
+	return out;
 }
 
 function routeTestPickPair(candidates, visGraph, wall = null, rejectionCounts = null) {

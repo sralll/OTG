@@ -364,7 +364,17 @@ function offsetCutChainEdges(half, start, count, gap) {
 		lines.push({ p: new Point(a.x + nx, a.y + ny), dx, dy, nx, ny });
 	}
 
-	const offset = [new Point(rotated[0].x + lines[0].nx, rotated[0].y + lines[0].ny)];
+	const boundaryIntersection = (line, a, b, fallback) => {
+		const edge = b.subtract(a);
+		if (edge.length < 1e-9) return fallback;
+		const hit = GeomUtils.intersectLines(line.p.x, line.p.y, line.dx, line.dy, a.x, a.y, edge.x, edge.y);
+		if (!hit || hit.y < -1e-5 || hit.y > 1 + 1e-5) return fallback;
+		const p = new Point(a.x + edge.x * hit.y, a.y + edge.y * hit.y);
+		return Number.isFinite(p.x) && Number.isFinite(p.y) ? p : fallback;
+	};
+
+	const startFallback = new Point(rotated[0].x + lines[0].nx, rotated[0].y + lines[0].ny);
+	const offset = [boundaryIntersection(lines[0], rotated[rotated.length - 1], rotated[0], startFallback)];
 	for (let i = 1; i < count; i++) {
 		const prev = lines[i - 1];
 		const next = lines[i];
@@ -380,7 +390,8 @@ function offsetCutChainEdges(half, start, count, gap) {
 		offset.push(p);
 	}
 	const last = lines[lines.length - 1];
-	offset.push(new Point(rotated[count].x + last.nx, rotated[count].y + last.ny));
+	const endFallback = new Point(rotated[count].x + last.nx, rotated[count].y + last.ny);
+	offset.push(boundaryIntersection(last, rotated[count], rotated[count + 1], endFallback));
 
 	const result = new Polygon(offset.concat(rotated.slice(count + 1)));
 	if (
@@ -723,7 +734,7 @@ export function sliceWard(block, params) {
 	return { lots, alleys: bisector.cuts };
 }
 
-function lotMinWidth(poly) {
+export function lotMinWidth(poly) {
 	if (!poly || poly.length < 3) return 0;
 	const corners = obb(poly);
 	const w = Point.distance(corners[0], corners[1]);
@@ -731,17 +742,21 @@ function lotMinWidth(poly) {
 	return Math.min(w, h);
 }
 
-function longestEdgeIndex(poly) {
-	let best = 0;
-	let bestLen = -Infinity;
+function weightedRandomEdgeIndex(poly) {
+	let total = 0;
+	const weights = [];
 	for (let i = 0; i < poly.length; i++) {
 		const len = Point.distance(poly[i], poly[(i + 1) % poly.length]);
-		if (len > bestLen) {
-			best = i;
-			bestLen = len;
-		}
+		const w = len * len;
+		weights.push(w);
+		total += w;
 	}
-	return best;
+	let r = Random.float() * total;
+	for (let i = 0; i < poly.length; i++) {
+		r -= weights[i];
+		if (r <= 0) return i;
+	}
+	return poly.length - 1;
 }
 
 function inwardNormal(poly, edgeIndex) {
@@ -996,7 +1011,7 @@ function wardEdgeAlignedDirs(poly, entryEdge, inward, angleMin, angleMax) {
 }
 
 function makeEdgeElbowCut(poly, params) {
-	if (!poly || poly.length < 4) return null;
+	if (!poly || poly.length < 3) return null;
 	const minLotArea = params.minLotArea || 40;
 	const minLotAngle = params.minLotAngle || Math.PI / 9;
 	const gap = params.gap || 0;
@@ -1008,16 +1023,16 @@ function makeEdgeElbowCut(poly, params) {
 	// tangent (parallel to a previous slice) — vs a random turn. TUNE THIS RATIO via
 	// params.elbowAlignProb — wards.js sets it (see createCommonWardGeometry).
 	const elbowAlignProb = params.elbowAlignProb != null ? params.elbowAlignProb : 0.7;
-	const edgeIndex = longestEdgeIndex(poly);
-	const a = poly[edgeIndex];
-	const b = poly[(edgeIndex + 1) % poly.length];
-	const edge = b.subtract(a);
-	const edgeLen = edge.length;
-	if (edgeLen < 1e-6) return null;
-	const inward = inwardNormal(poly, edgeIndex);
-	if (inward.length < 1e-6) return null;
 
 	for (let attempt = 0; attempt < (params.attempts || 14); attempt++) {
+		const edgeIndex = weightedRandomEdgeIndex(poly);
+		const a = poly[edgeIndex];
+		const b = poly[(edgeIndex + 1) % poly.length];
+		const edge = b.subtract(a);
+		const edgeLen = edge.length;
+		if (edgeLen < 1e-6) continue;
+		const inward = inwardNormal(poly, edgeIndex);
+		if (inward.length < 1e-6) continue;
 		const slotCount = params.maxCuts || 2;
 		const slot = attempt % Math.max(1, slotCount);
 		const baseT = (slot + 1) / (slotCount + 1);
@@ -1049,22 +1064,22 @@ function makeEdgeElbowCut(poly, params) {
 }
 
 function makeEdgeStraightCut(poly, params) {
-	if (!poly || poly.length < 4) return null;
+	if (!poly || poly.length < 3) return null;
 	const minLotArea = params.minLotArea || 40;
 	const minLotAngle = params.minLotAngle || Math.PI / 9;
 	const gap = params.gap || 0;
 	const minLotWidth = params.minLotWidth || 0;
 	const minLotNeck = params.minLotNeck || 0;
-	const edgeIndex = longestEdgeIndex(poly);
-	const a = poly[edgeIndex];
-	const b = poly[(edgeIndex + 1) % poly.length];
-	const edge = b.subtract(a);
-	const edgeLen = edge.length;
-	if (edgeLen < 1e-6) return null;
-	const inward = inwardNormal(poly, edgeIndex);
-	if (inward.length < 1e-6) return null;
 
 	for (let attempt = 0; attempt < (params.attempts || 14); attempt++) {
+		const edgeIndex = weightedRandomEdgeIndex(poly);
+		const a = poly[edgeIndex];
+		const b = poly[(edgeIndex + 1) % poly.length];
+		const edge = b.subtract(a);
+		const edgeLen = edge.length;
+		if (edgeLen < 1e-6) continue;
+		const inward = inwardNormal(poly, edgeIndex);
+		if (inward.length < 1e-6) continue;
 		const t = Math.max(0.12, Math.min(0.88, 0.5 + (Random.float() - 0.5) * 0.62));
 		const entry = new Point(a.x + edge.x * t, a.y + edge.y * t);
 		const exit = rayExit(poly, entry, inward, edgeIndex);
@@ -1079,13 +1094,13 @@ function makeEdgeStraightCut(poly, params) {
 
 export function sliceWardEdgeElbows(block, params = {}) {
 	const gap = params.gap || 0;
-	// Reject/remove lots that pinch to a thin neck. `neckFloor` is the final (post-shrink)
-	// minimum; the cutter validates full-size lots, which lose ~gap of neck to the later
-	// shrink(gap/2) on both facing edges, so it gets the larger budget `neckFloor + gap`.
-	const neckFloor = params.minLotNeck != null ? params.minLotNeck : (gap > 0 ? gap * 1.2 : 0);
+	// During cutting, only reject halves that are too narrow to contain the alley setback.
+	// The vertex-to-nonincident-edge neck heuristic is intentionally not used here: smoothed or
+	// clipped ward boundaries can contain tiny local stair-steps, and those read as false "necks"
+	// even when the block is broadly wide enough to slice.
 	const cutParams = gap > 0
-		? { ...params, gap: 0, minLotWidth: 2 * gap, minLotNeck: neckFloor + gap }
-		: { ...params, minLotNeck: neckFloor };
+		? { ...params, gap: 0, minLotWidth: 2 * gap, minLotNeck: 0 }
+		: { ...params, minLotNeck: 0 };
 	const schedule = params.schedule || ['elbow', 'straight', 'elbow'];
 	const maxFailedInRow = params.maxFailedInRow != null ? params.maxFailedInRow : 3;
 	let lots = [block];
@@ -1136,7 +1151,6 @@ export function sliceWardEdgeElbows(block, params = {}) {
 
 	// TEMP: keep lots even when the variable one-sided setback makes a thin neck. Re-enable once
 	// setback-aware validation can distinguish ugly geometry from whole missing buildings.
-	// if (neckFloor > 0) lots = lots.filter((lot) => lot && lot.length >= 3 && minNeckWidth(lot) >= neckFloor);
 
 	// Post-process: chamfer corners sharper than chamferAngle (default 30°).
 	if (params.chamfer !== false) {

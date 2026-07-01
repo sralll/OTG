@@ -33,6 +33,170 @@ function samePoint(a, b) {
 	return Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.y - b.y) < 1e-6;
 }
 
+function pointSegmentDistance(p, a, b) {
+	const dx = b.x - a.x;
+	const dy = b.y - a.y;
+	const l2 = dx * dx + dy * dy || 1;
+	let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2;
+	t = Math.max(0, Math.min(1, t));
+	return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t));
+}
+
+function pointDistanceToPolyline(p, path) {
+	let best = Infinity;
+	for (let i = 0; i < path.length - 1; i++)
+		best = Math.min(best, pointSegmentDistance(p, path[i], path[i + 1]));
+	return best;
+}
+
+function polygonDistanceToPoint(poly, point) {
+	if (pointInPolygon(point, poly)) return 0;
+	let best = Infinity;
+	for (let i = 0; i < poly.length; i++)
+		best = Math.min(best, pointSegmentDistance(point, poly[i], poly[(i + 1) % poly.length]));
+	return best;
+}
+
+function pointInPolygon(p, poly) {
+	let inside = false;
+	for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+		const a = poly[i];
+		const b = poly[j];
+		const crosses = (a.y > p.y) !== (b.y > p.y);
+		if (crosses) {
+			const x = ((b.x - a.x) * (p.y - a.y)) / ((b.y - a.y) || 1e-12) + a.x;
+			if (p.x < x) inside = !inside;
+		}
+	}
+	return inside;
+}
+
+function chaikinSmooth(pts, iterations) {
+	let a = pts;
+	for (let it = 0; it < iterations; it++) {
+		const h = [a[0]];
+		for (let i = 1, n = a.length - 1; i < n; i++) {
+			const g = a[i], p = a[i - 1], nx = a[i + 1];
+			h.push({ x: g.x * 0.75 + p.x * 0.25, y: g.y * 0.75 + p.y * 0.25 });
+			h.push({ x: g.x * 0.75 + nx.x * 0.25, y: g.y * 0.75 + nx.y * 0.25 });
+		}
+		h.push(a[a.length - 1]);
+		a = h;
+	}
+	return a;
+}
+
+function visualRiverPath(river) {
+	if (!river || !river.course || river.course.length < 2) return [];
+	const course = river.delta
+		? [{ x: (river.course[0].x + river.course[1].x) / 2, y: (river.course[0].y + river.course[1].y) / 2 }, ...river.course.slice(1)]
+		: river.course;
+	return chaikinSmooth(course, 3);
+}
+
+function bezierPoint(a, c1, c2, b, t) {
+	const mt = 1 - t;
+	const mt2 = mt * mt;
+	const t2 = t * t;
+	return {
+		x: a.x * mt2 * mt + 3 * c1.x * mt2 * t + 3 * c2.x * mt * t2 + b.x * t2 * t,
+		y: a.y * mt2 * mt + 3 * c1.y * mt2 * t + 3 * c2.y * mt * t2 + b.y * t2 * t,
+	};
+}
+
+function previewDeltaFromPath(delta, path, width) {
+	if (!delta || path.length < 2) return null;
+	const p0 = path[0], p1 = path[1];
+	const dx = p1.x - p0.x, dy = p1.y - p0.y;
+	const len = Math.hypot(dx, dy) || 1;
+	const tx = dx / len, ty = dy / len;
+	const hw = width / 2;
+	const a = { x: p0.x - ty * hw, y: p0.y + tx * hw };
+	const b = { x: p0.x + ty * hw, y: p0.y - tx * hw };
+	const right = Math.hypot(a.x - delta.right.x, a.y - delta.right.y) <= Math.hypot(b.x - delta.right.x, b.y - delta.right.y) ? a : b;
+	const left = right === a ? b : a;
+	const ctrlLen = Math.max(Math.hypot(delta.right.x - delta.rightCtrl1.x, delta.right.y - delta.rightCtrl1.y), len * 0.5);
+	return {
+		...delta,
+		right,
+		rightCtrl1: { x: right.x - tx * ctrlLen, y: right.y - ty * ctrlLen },
+		leftCtrl2: { x: left.x - tx * ctrlLen, y: left.y - ty * ctrlLen },
+		left,
+	};
+}
+
+function visualDeltaMouthPolygon(river, samples = 24) {
+	if (!river || !river.delta) return null;
+	const path = visualRiverPath(river);
+	const dl = previewDeltaFromPath(river.delta, path, river.width || 0);
+	if (!dl) return null;
+	const pts = [];
+	for (let i = 0; i <= samples; i++)
+		pts.push(bezierPoint(dl.right, dl.rightCtrl1, dl.rightCtrl2, dl.prevShore, i / samples));
+	if (dl.isConvex) pts.push(dl.mouth);
+	pts.push(dl.nextShore);
+	for (let i = 1; i <= samples; i++)
+		pts.push(bezierPoint(dl.nextShore, dl.leftCtrl1, dl.leftCtrl2, dl.left, i / samples));
+	return pts;
+}
+
+function segmentsIntersect(a, b, c, d) {
+	const abx = b.x - a.x, aby = b.y - a.y;
+	const cdx = d.x - c.x, cdy = d.y - c.y;
+	const acx = c.x - a.x, acy = c.y - a.y;
+	const denom = abx * cdy - aby * cdx;
+	if (Math.abs(denom) < 1e-9) return false;
+	const t = (acx * cdy - acy * cdx) / denom;
+	const u = (acx * aby - acy * abx) / denom;
+	return t >= -1e-9 && t <= 1 + 1e-9 && u >= -1e-9 && u <= 1 + 1e-9;
+}
+
+function segmentSegmentDistance(a, b, c, d) {
+	if (segmentsIntersect(a, b, c, d)) return 0;
+	return Math.min(
+		pointSegmentDistance(a, c, d),
+		pointSegmentDistance(b, c, d),
+		pointSegmentDistance(c, a, b),
+		pointSegmentDistance(d, a, b)
+	);
+}
+
+function polygonsIntersect(a, b) {
+	for (const p of a) if (pointInPolygon(p, b)) return true;
+	for (const p of b) if (pointInPolygon(p, a)) return true;
+	for (let i = 0; i < a.length; i++)
+		for (let j = 0; j < b.length; j++)
+			if (segmentsIntersect(a[i], a[(i + 1) % a.length], b[j], b[(j + 1) % b.length]))
+				return true;
+	return false;
+}
+
+function polygonDistanceToPolygon(a, b) {
+	if (!a || !b || a.length < 3 || b.length < 3) return Infinity;
+	if (polygonsIntersect(a, b)) return 0;
+	let best = Infinity;
+	for (let i = 0; i < a.length; i++)
+		for (let j = 0; j < b.length; j++)
+			best = Math.min(best, segmentSegmentDistance(a[i], a[(i + 1) % a.length], b[j], b[(j + 1) % b.length]));
+	return best;
+}
+
+function polygonDistanceToPolyline(poly, path, step = 0.35) {
+	let best = Infinity;
+	for (const p of path) if (pointInPolygon(p, poly)) return 0;
+	for (let i = 0; i < poly.length; i++) {
+		const a = poly[i];
+		const b = poly[(i + 1) % poly.length];
+		const len = Math.hypot(b.x - a.x, b.y - a.y);
+		const steps = Math.max(1, Math.ceil(len / step));
+		for (let k = 0; k <= steps; k++) {
+			const p = { x: a.x + ((b.x - a.x) * k) / steps, y: a.y + ((b.y - a.y) * k) / steps };
+			best = Math.min(best, pointDistanceToPolyline(p, path));
+		}
+	}
+	return best;
+}
+
 function routePointOwnerKinds(vg, p) {
 	for (let i = 0; i < vg.nodeCount; i++) {
 		if (Math.hypot(vg.nodeX[i] - p.x, vg.nodeY[i] - p.y) > 1e-6) continue;
@@ -95,8 +259,71 @@ const sizes = [6, 10, 15, 24];
 	check(route && route.path.length >= 2, 'seed=42 bridge-side route is passable');
 	if (route) {
 		check(route.path.length === 4, 'seed=42 bridge-side route avoids the far-side bridge hop');
-		check(route.path.some((p) => Math.abs(p.x - 8.015819) < 1e-4 && Math.abs(p.y - 5.056725) < 1e-4), 'seed=42 bridge-side route exits from the near bridge side');
+		// WIDE_MAIN_ROADS_50_FLAG: wider road-connected bridge shifts the near-side portal vertex.
+		check(route.path.some((p) => Math.abs(p.x - 8.421314) < 1e-4 && Math.abs(p.y - 5.049534) < 1e-4), 'seed=42 bridge-side route exits from the near bridge side');
 	}
+}
+
+for (const seed of [4, 5, 9, 42, 44, 64]) {
+	const data = generateWards({
+		seed,
+		size: 15,
+		plaza: true,
+		coast: true,
+		river: true,
+		walls: true,
+		streets: true,
+	});
+	const plaza = data.wards.find((w) => w.type === 'plaza');
+	const riverPath = visualRiverPath(data.river);
+	const clearance = (data.river?.width || 0) / 2 + 1.0;
+	check(plaza && riverPath.length >= 2, `seed=${seed}: has plaza and river for plaza clearance regression`);
+	if (plaza && riverPath.length >= 2) {
+		for (const f of data.features || []) {
+			if (f.kind !== 'tree' || !pointInPolygon(f, plaza.polygon)) continue;
+			const d = pointDistanceToPolyline(f, riverPath);
+			check(d >= clearance - 0.05, `seed=${seed}: plaza tree keeps river clearance (${d.toFixed(3)} >= ${(clearance - 0.05).toFixed(3)})`);
+		}
+		for (const b of data.buildings || []) {
+			if (b.class !== 'plazaBuilding') continue;
+			const d = polygonDistanceToPolyline(b.polygon, riverPath);
+			check(d >= clearance - 0.05, `seed=${seed}: plaza building keeps river clearance (${d.toFixed(3)} >= ${(clearance - 0.05).toFixed(3)})`);
+		}
+	}
+}
+
+{
+	const data = generateWards({
+		seed: 7,
+		size: 30,
+		plaza: true,
+		coast: true,
+		river: true,
+		walls: true,
+		streets: true,
+		outerRatio: 4,
+		roadDensity: 5,
+		gates: -1,
+	});
+	const riverPath = visualRiverPath(data.river);
+	const clearance = (data.river?.width || 0) / 2 + 2.0 + 0.25;
+	let minBuildingDistance = Infinity;
+	for (const b of data.buildings || [])
+		minBuildingDistance = Math.min(minBuildingDistance, polygonDistanceToPolyline(b.polygon, riverPath));
+	check(
+		minBuildingDistance >= clearance - 0.08,
+		`seed=7: buildings keep river/shore clearance (${minBuildingDistance.toFixed(3)} >= ${(clearance - 0.08).toFixed(3)})`
+	);
+
+	const mouth = visualDeltaMouthPolygon(data.river);
+	const mouthClearance = 2.0 + 0.25;
+	let minMouthDistance = Infinity;
+	for (const b of data.buildings || [])
+		minMouthDistance = Math.min(minMouthDistance, polygonDistanceToPolygon(b.polygon, mouth));
+	check(
+		minMouthDistance >= mouthClearance - 0.08,
+		`seed=7: buildings keep river-mouth passage (${minMouthDistance.toFixed(3)} >= ${(mouthClearance - 0.08).toFixed(3)})`
+	);
 }
 
 {
@@ -185,8 +412,10 @@ const sizes = [6, 10, 15, 24];
 	});
 	const vg = buildVisibilityGraph(extractObstacles(data), { clearance: 0.2 });
 	const route = vg.astar(
-		{ x: -37.084557847483644, y: 6.493791266869135 },
-		{ x: -60.073747658371836, y: -14.547162119367517 },
+		// Tower/river-mouth corner chamfers (TOWER_CLEARANCE, riverWidth/2) shift buildable
+		// areas and later building placement; keep both fixtures on open ground.
+		{ x: -37, y: 6.5 },
+		{ x: -80, y: -15 },
 		{ exact: true, timeBudgetMs: 0, maxExpansions: 1000000 },
 	);
 	check(route && route.path.length >= 2, 'seed=42 house-corner route is passable');
@@ -194,6 +423,30 @@ const sizes = [6, 10, 15, 24];
 		const usesWaterNode = route.path.some((p) => routePointOwnerKinds(vg, p).some((kind) => kind === 'water' || kind === 'river' || kind === 'delta'));
 		check(!usesWaterNode, 'seed=42 house-corner route does not need a shore tangent node');
 	}
+}
+
+{
+	const data = generateWards({ seed: 42, size: 30, outerRatio: 4, roadDensity: 5, gates: -1 });
+	const towerRadius = 1.6;
+	let closest = Infinity;
+	let closestLabel = '';
+	for (const tower of data.wall.towers || []) {
+		for (let i = 0; i < data.blocks.length; i++) {
+			const d = polygonDistanceToPoint(data.blocks[i], tower);
+			if (d < closest) {
+				closest = d;
+				closestLabel = `block ${i}`;
+			}
+		}
+		for (let i = 0; i < data.buildings.length; i++) {
+			const d = polygonDistanceToPoint(data.buildings[i].polygon, tower);
+			if (d < closest) {
+				closest = d;
+				closestLabel = `${data.buildings[i].class || 'building'} ${i}`;
+			}
+		}
+	}
+	check(closest >= towerRadius - 1e-6, `seed=42 UI defaults: ${closestLabel} clears wall tower radius (${closest.toFixed(3)} >= ${towerRadius.toFixed(3)})`);
 }
 
 for (const seed of seeds) {

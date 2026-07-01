@@ -47,6 +47,9 @@ function serializeBridge(bridge) {
 		...serializePoint(point),
 		from: serializePoint(bridge.from),
 		to: serializePoint(bridge.to),
+		// WIDE_MAIN_ROADS_50_FLAG: expose road-connected bridge width for renderer/routing.
+		roadConnected: !!bridge.roadConnected,
+		width: Number.isFinite(bridge.width) ? bridge.width : undefined,
 	};
 }
 
@@ -237,14 +240,21 @@ function collapse(vmap, v0, v1) {
 
 const WALL_THICKNESS = 1.9; // pc.THICKNESS in reference
 const DEFAULT_BLOCK_INSET = 0.6;
-const ROAD_BLOCK_INSET = 1.0;
-const SHORE_PATH_INSET = ROAD_BLOCK_INSET * 2;
+// WIDE_MAIN_ROADS_50_FLAG: set false to restore the previous 2.0-wide main roads.
+const WIDE_MAIN_ROADS_50_FLAG = true;
+const BASE_MAIN_ROAD_WIDTH = 2.0;
+const MAIN_ROAD_WIDTH = BASE_MAIN_ROAD_WIDTH * (WIDE_MAIN_ROADS_50_FLAG ? 1.5 : 1.0);
+const ROAD_BLOCK_INSET = MAIN_ROAD_WIDTH / 2;
+const SHORE_PATH_INSET = BASE_MAIN_ROAD_WIDTH;
+const WARD_GEOMETRY_WIDTHS = { main: MAIN_ROAD_WIDTH, regular: 1.0, alley: 0.8 };
+const BASE_BRIDGE_FILL_WIDTH = 1.6;
+const ROAD_CONNECTED_BRIDGE_WIDTH = BASE_BRIDGE_FILL_WIDTH * (WIDE_MAIN_ROADS_50_FLAG ? 1.5 : 1.0);
 const RIVER_CLEARANCE_EPS = 0.25;
 const PASSAGE_MARGIN = 1.2;
 const PLAZA_RIVER_TREE_MARGIN = 1.0;
-// Halved from 4.4 (was eating ~half of small blocks near towers). Matches the
-// generator's tower-radius (~1.9) + a small passage margin, not a full turret.
-const TOWER_CLEARANCE = 2.1;
+const WALL_TOWER_RADIUS = 1.6;
+const WALL_TOWER_NODE_TOLERANCE = WARD_GEOMETRY_WIDTHS.alley;
+const TOWER_CLEARANCE = WALL_TOWER_RADIUS + WALL_TOWER_NODE_TOLERANCE;
 
 function addEdgeRef(map, a, b) {
 	let s = map.get(a);
@@ -255,11 +265,6 @@ function addEdgeRef(map, a, b) {
 function hasEdgeRef(map, a, b) {
 	const s = map.get(a);
 	return !!(s && s.has(b));
-}
-
-function setMax(map, key, value) {
-	const current = map.get(key);
-	if (current == null || value > current) map.set(key, value);
 }
 
 function buildShoreEdges(cells) {
@@ -292,20 +297,85 @@ function isActiveWallEdge(ctx, v0, v1) {
 	return false;
 }
 
-function clippedCorner(poly, sourceShape, corner, clearance) {
+function isActiveWallTowerVertex(ctx, v) {
+	if (!ctx.wallShape) return false;
+	const i = ctx.wallShape.indexOf(v);
+	if (i === -1) return false;
+	if (ctx.wallGates && ctx.wallGates.includes(v)) return false;
+	if (ctx.wallTowers && ctx.wallTowers.includes(v)) return true;
+	const prev = !ctx.wallSegments || ctx.wallSegments[(i + ctx.wallShape.length - 1) % ctx.wallShape.length] !== false;
+	const next = !ctx.wallSegments || ctx.wallSegments[i] !== false;
+	return prev || next;
+}
+
+function nearestSourceVertex(sourceShape, point, maxDistance = 1e-6) {
+	let best = null;
+	let bestDistance = maxDistance;
+	for (const v of sourceShape) {
+		const d = Point.distance(v, point);
+		if (d <= bestDistance) {
+			best = v;
+			bestDistance = d;
+		}
+	}
+	return best;
+}
+
+function nearestBuildableNodeInTower(poly, tower, radius) {
+	if (!poly || !tower || !(radius > 0)) return null;
+	let best = null;
+	let bestDistance = radius;
+	for (const v of poly) {
+		const d = Point.distance(v, tower);
+		if (d <= bestDistance) {
+			best = v;
+			bestDistance = d;
+		}
+	}
+	return best;
+}
+
+function clippedTowerIntrusion(poly, tower, clearance, fallbackDir = null) {
+	if (!poly || poly.length < 3 || !tower || !(clearance > 0)) return poly;
+	const intruding = nearestBuildableNodeInTower(poly, tower, clearance);
+	if (!intruding) return poly;
+
+	let dir = intruding.subtract(tower);
+	if (dir.length <= 1e-6 && fallbackDir) dir = fallbackDir.subtract(tower);
+	if (dir.length <= 1e-6) dir = poly.centroid.subtract(tower);
+	if (dir.length <= 1e-6) return poly;
+	dir.normalize(1);
+
+	const tangent = new Point(-dir.y, dir.x);
+	const cutCenter = tower.add(dir.scale(clearance));
+	const capped = clipToOffsetSide(poly, cutCenter.subtract(tangent), cutCenter.add(tangent), -1, 0);
+	if (capped && capped.length >= 3 && Math.abs(capped.square) >= Math.abs(poly.square) * 0.01)
+		return capped;
+	return poly;
+}
+
+function clippedCorner(poly, sourceShape, corner, clearance, useRadialCap = true) {
 	if (!poly || poly.length < 3 || !(clearance > 0)) return poly;
 
 	const idx = sourceShape.indexOf(corner);
 	if (idx === -1) return poly;
+	const dir = sourceShape.centroid.subtract(corner);
+	if (useRadialCap && dir.length > 1e-6) {
+		dir.normalize(1);
+		const n = new Point(-dir.y, dir.x);
+		const cutCenter = corner.add(dir.scale(clearance));
+		const capped = clipToOffsetSide(poly, cutCenter.subtract(n), cutCenter.add(n), -1, 0);
+		if (capped && capped.length >= 3 && Math.abs(capped.square) >= Math.abs(poly.square) * 0.01)
+			return capped;
+	}
+
 	const prev = sourceShape[(idx + sourceShape.length - 1) % sourceShape.length];
 	const next = sourceShape[(idx + 1) % sourceShape.length];
 	const prevLen = Point.distance(corner, prev);
 	const nextLen = Point.distance(corner, next);
 	if (prevLen < 1e-6 || nextLen < 1e-6) return poly;
 
-	// Cap the chamfer at 35% of each adjacent edge (was 45%) and keep >= 65% of the
-	// block area (was 55%) so a tower can't wipe out a small block.
-	const reach = Math.min(clearance, prevLen * 0.35, nextLen * 0.35);
+	const reach = Math.min(clearance, prevLen * 0.65, nextLen * 0.65);
 	if (!(reach > 1e-6)) return poly;
 
 	const a = corner.add(prev.subtract(corner).norm(reach));
@@ -315,7 +385,7 @@ function clippedCorner(poly, sourceShape, corner, clearance) {
 
 	let best = poly;
 	let bestDistance = -Infinity;
-	const minKeptArea = Math.abs(poly.square) * 0.65;
+	const minKeptArea = Math.abs(poly.square) * 0.35;
 	for (const half of halves) {
 		if (!half || half.length < 3 || Math.abs(half.square) < minKeptArea) continue;
 		const d = Point.distance(half.center, corner);
@@ -327,14 +397,50 @@ function clippedCorner(poly, sourceShape, corner, clearance) {
 	return best;
 }
 
-function clipObstacleCorners(poly, sourceShape, nodeClearance) {
+function clipObstacleCorners(poly, sourceShape, ctx) {
+	if (!poly || poly.length < 3 || !ctx) return poly;
 	let clipped = poly;
-	for (const v of sourceShape) {
-		const clearance = nodeClearance.get(v) || 0;
-		if (clearance > 0) clipped = clippedCorner(clipped, sourceShape, v, clearance);
-		if (!clipped || clipped.length < 3) return poly; // fall back to the un-clipped block
+
+	// --- Wall tower corner chamfer ---
+	// Edge clipping pushes buildable area away from straight wall segments. Only
+	// add the tower-cap chamfer if the resulting buildable polygon still has a
+	// node inside the rendered tower radius plus one alley-width tolerance.
+	if (ctx.wallTowers) {
+		const towerNodeRadius = WALL_TOWER_RADIUS + WALL_TOWER_NODE_TOLERANCE;
+		for (const tower of ctx.wallTowers) {
+			const corner = nearestSourceVertex(sourceShape, tower);
+			if (!corner || !isActiveWallTowerVertex(ctx, corner)) continue;
+			const next = clippedTowerIntrusion(clipped, tower, towerNodeRadius, corner);
+			if (next === clipped) continue;
+			if (next && next.length >= 3) {
+				clipped = next;
+			} else {
+				return null;
+			}
+		}
 	}
-	return clipped || poly;
+
+	// --- River-mouth corner chamfer ---
+	// Where the river enters the water: a ward corner that is both a river node and
+	// touches a water ward (shore vertex). The sharp buildable-area tip there pokes
+	// into the river/water junction; clip it by half the river width.
+	if (ctx.riverData && ctx.riverData.course && ctx.shoreEdges && ctx.riverWidth > 0) {
+		const riverSet = new Set(ctx.riverData.course);
+		let riverCorner = null;
+		let riverCount = 0;
+		for (const v of sourceShape) {
+			if (riverSet.has(v) && ctx.shoreEdges.has(v)) {
+				riverCorner = v;
+				riverCount++;
+			}
+		}
+		if (riverCount === 1) {
+			const riverClipped = clippedCorner(clipped, sourceShape, riverCorner, ctx.riverWidth / 2);
+			if (riverClipped && riverClipped.length >= 3) clipped = riverClipped;
+		}
+	}
+
+	return clipped;
 }
 
 function lineSignedDistance(a, b, p) {
@@ -397,6 +503,27 @@ function pointSegmentDistance(p, a, b) {
 	let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2;
 	t = Math.max(0, Math.min(1, t));
 	return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t));
+}
+
+function segmentsIntersect(a, b, c, d) {
+	const abx = b.x - a.x, aby = b.y - a.y;
+	const cdx = d.x - c.x, cdy = d.y - c.y;
+	const acx = c.x - a.x, acy = c.y - a.y;
+	const denom = abx * cdy - aby * cdx;
+	if (Math.abs(denom) < 1e-9) return false;
+	const t = (acx * cdy - acy * cdx) / denom;
+	const u = (acx * aby - acy * abx) / denom;
+	return t >= -1e-9 && t <= 1 + 1e-9 && u >= -1e-9 && u <= 1 + 1e-9;
+}
+
+function segmentSegmentDistance(a, b, c, d) {
+	if (segmentsIntersect(a, b, c, d)) return 0;
+	return Math.min(
+		pointSegmentDistance(a, c, d),
+		pointSegmentDistance(b, c, d),
+		pointSegmentDistance(c, a, b),
+		pointSegmentDistance(d, a, b)
+	);
 }
 
 function pointInPolygon(point, poly) {
@@ -503,6 +630,59 @@ function sampledRiverCourse(river) {
 	return chaikinSmooth(course, 3);
 }
 
+function cubicPoint(a, c1, c2, b, t) {
+	const mt = 1 - t;
+	const mt2 = mt * mt;
+	const t2 = t * t;
+	return new Point(
+		a.x * mt2 * mt + 3 * c1.x * mt2 * t + 3 * c2.x * mt * t2 + b.x * t2 * t,
+		a.y * mt2 * mt + 3 * c1.y * mt2 * t + 3 * c2.y * mt * t2 + b.y * t2 * t
+	);
+}
+
+function renderedDeltaMouth(river, path) {
+	if (!river || !river.delta || !path || path.length < 2) return null;
+	const delta = river.delta;
+	const p0 = path[0];
+	const p1 = path[1];
+	const dx = p1.x - p0.x;
+	const dy = p1.y - p0.y;
+	const len = Math.hypot(dx, dy) || 1;
+	const tx = dx / len;
+	const ty = dy / len;
+	const hw = (river.width || 0) / 2;
+	const a = new Point(p0.x - ty * hw, p0.y + tx * hw);
+	const b = new Point(p0.x + ty * hw, p0.y - tx * hw);
+	const right = Point.distance(a, delta.right) <= Point.distance(b, delta.right) ? a : b;
+	const left = right === a ? b : a;
+	const ctrlLen = Math.max(Point.distance(delta.right, delta.rightCtrl1), len * 0.5);
+	return {
+		...delta,
+		right,
+		rightCtrl1: new Point(right.x - tx * ctrlLen, right.y - ty * ctrlLen),
+		leftCtrl2: new Point(left.x - tx * ctrlLen, left.y - ty * ctrlLen),
+		left,
+	};
+}
+
+function sampledDeltaMouthPolygon(river, samples = 18) {
+	const path = sampledRiverCourse(river);
+	const dl = renderedDeltaMouth(river, path);
+	if (!dl) return null;
+	const pts = [];
+	const rightCtrl2 = new Point(dl.rightCtrl2.x, dl.rightCtrl2.y);
+	const prevShore = new Point(dl.prevShore.x, dl.prevShore.y);
+	for (let i = 0; i <= samples; i++)
+		pts.push(cubicPoint(dl.right, dl.rightCtrl1, rightCtrl2, prevShore, i / samples));
+	if (dl.isConvex) pts.push(new Point(dl.mouth.x, dl.mouth.y));
+	const nextShore = new Point(dl.nextShore.x, dl.nextShore.y);
+	pts.push(nextShore);
+	const leftCtrl1 = new Point(dl.leftCtrl1.x, dl.leftCtrl1.y);
+	for (let i = 1; i <= samples; i++)
+		pts.push(cubicPoint(nextShore, leftCtrl1, dl.leftCtrl2, dl.left, i / samples));
+	return new Polygon(pts);
+}
+
 function pathTouchesCell(path, cell, clearance) {
 	for (const p of path)
 		if (pointInPolygon(p, cell) || pointPolygonDistance(p, cell) <= clearance)
@@ -519,23 +699,75 @@ function minDistanceToPolyline(poly, path) {
 	return best;
 }
 
+function nearestPolylineSegmentToPolygon(poly, path) {
+	const best = { distance: Infinity, segment: -1, pathInside: false };
+	if (!poly || poly.length < 3 || !path || path.length < 2) return best;
+
+	for (let i = 0; i < path.length - 1; i++) {
+		const a = path[i];
+		const b = path[i + 1];
+		const segmentInside = pointInPolygon(a, poly) || pointInPolygon(b, poly);
+		if (segmentInside) {
+			const d = Math.min(pointPolygonDistance(a, poly), pointPolygonDistance(b, poly));
+			if (!best.pathInside || d < best.distance) {
+				best.distance = d;
+				best.segment = i;
+				best.pathInside = true;
+			}
+		}
+		poly.forEdge((v0, v1) => {
+			const d = segmentSegmentDistance(v0, v1, a, b);
+			if (!best.pathInside && d < best.distance) {
+				best.distance = d;
+				best.segment = i;
+			}
+		});
+	}
+	return best;
+}
+
+function nearestObstacleEdgeToPolygon(poly, obstacle) {
+	const best = { distance: Infinity, edge: -1, intersects: false };
+	if (!poly || poly.length < 3 || !obstacle || obstacle.length < 3) return best;
+
+	for (const p of poly) {
+		if (!pointInPolygon(p, obstacle)) continue;
+		for (let i = 0; i < obstacle.length; i++) {
+			const d = pointSegmentDistance(p, obstacle[i], obstacle[(i + 1) % obstacle.length]);
+			if (d < best.distance) {
+				best.distance = d;
+				best.edge = i;
+				best.intersects = true;
+			}
+		}
+	}
+
+	for (let i = 0; i < obstacle.length; i++) {
+		const a = obstacle[i];
+		const b = obstacle[(i + 1) % obstacle.length];
+		if (pointInPolygon(a, poly)) {
+			best.distance = 0;
+			best.edge = i;
+			best.intersects = true;
+			return best;
+		}
+		poly.forEdge((v0, v1) => {
+			const d = segmentSegmentDistance(v0, v1, a, b);
+			if (d < best.distance) {
+				best.distance = d;
+				best.edge = i;
+				best.intersects = best.intersects || d <= 1e-6;
+			}
+		});
+	}
+	return best;
+}
+
 function pointDistanceToPolyline(point, path) {
 	if (!point || !path || path.length < 2) return Infinity;
 	let best = Infinity;
 	for (let i = 0; i < path.length - 1; i++)
 		best = Math.min(best, pointSegmentDistance(point, path[i], path[i + 1]));
-	return best;
-}
-
-function nearestVertexToPolyline(poly, path) {
-	let best = { distance: Infinity, segment: -1 };
-	if (!poly || poly.length < 3 || !path || path.length < 2) return best;
-	for (const v of poly) {
-		for (let i = 0; i < path.length - 1; i++) {
-			const d = pointSegmentDistance(v, path[i], path[i + 1]);
-			if (d < best.distance) best = { distance: d, segment: i };
-		}
-	}
 	return best;
 }
 
@@ -552,13 +784,23 @@ function clipRiverObstacle(poly, cell, river, detectionExtra = 0) {
 	const path = sampledRiverCourse(river);
 	if (path.length < 2) return poly;
 	const clearance = river.width / 2 + SHORE_PATH_INSET + RIVER_CLEARANCE_EPS;
-	if (!pathTouchesCell(path, cell, clearance + detectionExtra) && !pathTouchesCell(path, poly, clearance + detectionExtra))
+	const detectionClearance = clearance + detectionExtra;
+	const cellNear = nearestPolylineSegmentToPolygon(cell, path);
+	const polyNear = nearestPolylineSegmentToPolygon(poly, path);
+	if (
+		!pathTouchesCell(path, cell, detectionClearance) &&
+		!pathTouchesCell(path, poly, detectionClearance) &&
+		!cellNear.pathInside &&
+		!polyNear.pathInside &&
+		cellNear.distance > detectionClearance &&
+		polyNear.distance > detectionClearance
+	)
 		return poly;
 
 	let clipped = poly;
 	for (let pass = 0; pass < 12; pass++) {
-		const nearest = nearestVertexToPolyline(clipped, path);
-		if (nearest.distance >= clearance - 1e-6 || nearest.segment < 0) return clipped;
+		const nearest = nearestPolylineSegmentToPolygon(clipped, path);
+		if ((!nearest.pathInside && nearest.distance >= clearance - 1e-6) || nearest.segment < 0) return clipped;
 		const before = Math.abs(clipped.square);
 		const next = cutAwayFromSegment(clipped, cell, path[nearest.segment], path[nearest.segment + 1], clearance);
 		if (!next || next.length < 3) return null;
@@ -566,9 +808,34 @@ function clipRiverObstacle(poly, cell, river, detectionExtra = 0) {
 		clipped = next;
 	}
 
-	// If a tiny remnant still lies under the water stroke itself, drop that remnant rather
-	// than drawing a grey shard below the river.
-	return minDistanceToPolyline(clipped, path) < river.width / 2 ? null : clipped;
+	// If a tiny remnant still lies under the river/shore corridor itself, drop that remnant
+	// rather than drawing a grey shard below the water stroke or its bank.
+	const nearest = nearestPolylineSegmentToPolygon(clipped, path);
+	return nearest.pathInside || nearest.distance < clearance - 0.05 ? null : clipped;
+}
+
+function clipRiverMouthObstacle(poly, cell, river) {
+	if (!river || !river.delta || !poly || poly.length < 3) return poly;
+	const mouth = sampledDeltaMouthPolygon(river);
+	if (!mouth || mouth.length < 3) return poly;
+	const clearance = SHORE_PATH_INSET + RIVER_CLEARANCE_EPS;
+	let clipped = poly;
+
+	for (let pass = 0; pass < 14; pass++) {
+		const nearest = nearestObstacleEdgeToPolygon(clipped, mouth);
+		if (!nearest.intersects && nearest.distance >= clearance - 1e-6) return clipped;
+		if (nearest.edge < 0) return clipped;
+		const before = Math.abs(clipped.square);
+		const a = mouth[nearest.edge];
+		const b = mouth[(nearest.edge + 1) % mouth.length];
+		const next = cutAwayFromSegment(clipped, cell, a, b, clearance);
+		if (!next || next.length < 3) return null;
+		if (Math.abs(before - Math.abs(next.square)) < 1e-6) break;
+		clipped = next;
+	}
+
+	const nearest = nearestObstacleEdgeToPolygon(clipped, mouth);
+	return nearest.intersects || nearest.distance < clearance - 0.05 ? null : clipped;
 }
 
 function cleanupBuildablePolygon(poly) {
@@ -623,19 +890,41 @@ function computeAvailableArea(cell, ctx) {
 		const riverDetectionExtra = cellHasActiveWallEdge(cell, ctx) ? WALL_THICKNESS : 0;
 		const riverClipped = clipRiverObstacle(base, cell, ctx.riverData, riverDetectionExtra);
 		if (!riverClipped || riverClipped.length < 3) return null;
-		return cleanupBuildablePolygon(clipObstacleCorners(riverClipped, cell, ctx.nodeClearance));
+		const mouthClipped = clipRiverMouthObstacle(riverClipped, cell, ctx.riverData);
+		if (!mouthClipped || mouthClipped.length < 3) return null;
+		const cleaned = cleanupBuildablePolygon(clipObstacleCorners(mouthClipped, cell, ctx));
+		if (!cleaned || cleaned.length < 3) return null;
+		const cleanedRiverClipped = clipRiverObstacle(cleaned, cell, ctx.riverData, riverDetectionExtra);
+		if (!cleanedRiverClipped || cleanedRiverClipped.length < 3) return null;
+		return clipRiverMouthObstacle(cleanedRiverClipped, cell, ctx.riverData);
 	} catch (e) { return null; }
 }
 
-function randomEdgeIndexes(poly, count) {
-	const indexes = poly.map((_, i) => i);
-	for (let i = indexes.length - 1; i > 0; i--) {
-		const j = Random.int(0, i + 1);
-		const t = indexes[i];
-		indexes[i] = indexes[j];
-		indexes[j] = t;
+function annotateRoadConnectedBridges(riverData, streetData) {
+	if (!riverData || !riverData.bridges || !streetData) return;
+	const paths = [
+		...(streetData.streets || []),
+		...(streetData.roads || []),
+		...(streetData.arteries || []),
+	];
+	for (const bridge of riverData.bridges) {
+		const point = bridge.point || bridge;
+		const roadConnected = paths.some((path) => path && path.includes(point));
+		// WIDE_MAIN_ROADS_50_FLAG: only bridges touched by generated road paths get the 50% deck bump.
+		bridge.roadConnected = roadConnected;
+		if (roadConnected) bridge.width = ROAD_CONNECTED_BRIDGE_WIDTH;
 	}
-	return indexes.slice(0, Math.min(count, indexes.length));
+}
+
+function randomItems(items, count) {
+	const out = items.slice();
+	for (let i = out.length - 1; i > 0; i--) {
+		const j = Random.int(0, i + 1);
+		const t = out[i];
+		out[i] = out[j];
+		out[j] = t;
+	}
+	return out.slice(0, Math.min(count, out.length));
 }
 
 function clipPlazaFromRiver(poly, cell, river) {
@@ -647,8 +936,9 @@ function clipPlazaFromRiver(poly, cell, river) {
 
 	let clipped = poly;
 	for (let pass = 0; pass < 12; pass++) {
-		const nearest = nearestVertexToPolyline(clipped, path);
-		if (nearest.distance >= clearance - 1e-6 || nearest.segment < 0) return clipped;
+		const nearest = nearestPolylineSegmentToPolygon(clipped, path);
+		if (!nearest.pathInside && nearest.distance >= clearance - 1e-6) return clipped;
+		if (nearest.segment < 0) return clipped;
 		const before = Math.abs(clipped.square);
 		const next = cutAwayFromSegment(clipped, cell, path[nearest.segment], path[nearest.segment + 1], clearance);
 		if (!next || next.length < 3) return null;
@@ -656,7 +946,19 @@ function clipPlazaFromRiver(poly, cell, river) {
 		clipped = next;
 	}
 
-	return minDistanceToPolyline(clipped, path) < clearance * 0.9 ? null : clipped;
+	const nearest = nearestPolylineSegmentToPolygon(clipped, path);
+	return nearest.pathInside || nearest.distance < clearance * 0.9 ? null : clipped;
+}
+
+// Reduce the plaza's buildable area by respecting the river: clip the plaza
+// polygon away from the river course by half the river width plus a margin, so
+// trees and the plaza building can be placed on the remainder without going
+// into the water. Returns null when nothing buildable remains.
+function reducePlazaForRiver(plaza, river) {
+	if (!plaza || !plaza.shape || plaza.shape.length < 3) return null;
+	const reduced = clipPlazaFromRiver(plaza.shape, plaza.shape, river);
+	if (!reduced || reduced.length < 3) return null;
+	return reduced;
 }
 
 function addPlazaTreeRings(plaza, riverData) {
@@ -664,9 +966,15 @@ function addPlazaTreeRings(plaza, riverData) {
 	const saved = Random.getSeed();
 	const area = Math.abs(plaza.shape.square);
 	const scale = Math.sqrt(area);
+	// First reduce the plaza's buildable area by the river clearance (half river
+	// width + margin), then shrink that reduced area for the tree ring frame.
+	const reduced = reducePlazaForRiver(plaza, riverData);
+	if (!reduced) {
+		Random.reset(saved);
+		return;
+	}
 	const inset = Math.max(1.4, Math.min(3.0, scale * 0.08));
-	const frameBase = plaza.shape.shrinkRobust(inset) || plaza.shape.shrinkEq(inset);
-	const frame = clipPlazaFromRiver(frameBase, plaza.shape, riverData);
+	const frame = reduced.shrinkRobust(inset) || reduced.shrinkEq(inset);
 	const riverPath = sampledRiverCourse(riverData);
 	const riverClearance = riverPath.length >= 2 ? (riverData.width || 0) / 2 + PLAZA_RIVER_TREE_MARGIN : 0;
 	if (!frame || frame.length < 3 || Math.abs(frame.square) < area * 0.25) {
@@ -686,7 +994,7 @@ function addPlazaTreeRings(plaza, riverData) {
 		return;
 	}
 
-	const picked = randomEdgeIndexes(edges, 3);
+	const picked = randomItems(edges, 3);
 	const spacing = Math.max(2.6, Math.min(3.8, scale * (0.17 + Random.float() * 0.03)));
 	for (const i of picked) {
 		const a = frame[i];
@@ -716,42 +1024,40 @@ function createPlazaBuilding(plaza, riverData) {
 	const axis = longestEdgeAxis(plaza.shape);
 	if (!axis) return null;
 
+	// Reduce the plaza's buildable area by the river clearance (half river width
+	// + margin) before sizing the building, so it never sits in the water.
+	const reduced = reducePlazaForRiver(plaza, riverData);
+	if (!reduced || reduced.length < 3 || Math.abs(reduced.square) < area * 0.08) return null;
+
 	const scale = Math.sqrt(area);
 	const inset = Math.max(2.0, Math.min(4.0, scale * 0.13));
-	const base = plaza.shape.shrinkRobust(inset) || plaza.shape.shrinkEq(inset);
+	const usable = reduced.shrinkRobust(inset) || reduced.shrinkEq(inset);
+	if (!usable || usable.length < 3 || Math.abs(usable.square) < area * 0.08) return null;
+
 	const plazaCenter = plaza.shape.centroid;
-	const riverClipped = clipPlazaFromRiver(base, plaza.shape, riverData);
-	const candidates = [];
-	if (riverClipped && pointInPolygon(plazaCenter, riverClipped)) candidates.push(riverClipped);
-	if (base) candidates.push(base);
+	let center = plazaCenter;
+	if (!pointInPolygon(center, usable)) center = usable.centroid;
+	if (!pointInPolygon(center, usable)) center = usable.center;
+	if (!pointInPolygon(center, usable)) return null;
 
-	for (const usable of candidates) {
-		if (!usable || usable.length < 3 || Math.abs(usable.square) < area * 0.08) continue;
+	const perp = new Point(-axis.y, axis.x);
+	const along = projectionExtents(usable, center, axis);
+	const across = projectionExtents(usable, center, perp);
+	const halfAlong = Math.min(along.max, -along.min);
+	const halfAcross = Math.min(across.max, -across.min);
+	if (!(halfAlong > 0.9 && halfAcross > 0.45)) return null;
 
-		let center = plazaCenter;
-		if (!pointInPolygon(center, usable)) center = usable.centroid;
-		if (!pointInPolygon(center, usable)) center = usable.center;
-		if (!pointInPolygon(center, usable)) continue;
-
-		const perp = new Point(-axis.y, axis.x);
-		const along = projectionExtents(usable, center, axis);
-		const across = projectionExtents(usable, center, perp);
-		const halfAlong = Math.min(along.max, -along.min);
-		const halfAcross = Math.min(across.max, -across.min);
-		if (!(halfAlong > 0.9 && halfAcross > 0.45)) continue;
-
-		let halfLen = Math.min(halfAlong * 0.42, scale * 0.17);
-		let halfWid = Math.min(halfAcross * 0.38, scale * 0.065, halfLen * 0.42);
-		for (let attempt = 0; attempt < 6; attempt++) {
-			if (halfLen < 0.9 || halfWid < 0.38) break;
-			const footprint = orientedRect(center, axis, halfLen, halfWid);
-			if (polygonFitsInside(usable, footprint, 0.45)) {
-				footprint.class = 'plazaBuilding';
-				return footprint;
-			}
-			halfLen *= 0.86;
-			halfWid *= 0.86;
+	let halfLen = Math.min(halfAlong * 0.42, scale * 0.17);
+	let halfWid = Math.min(halfAcross * 0.38, scale * 0.065, halfLen * 0.42);
+	for (let attempt = 0; attempt < 6; attempt++) {
+		if (halfLen < 0.9 || halfWid < 0.38) break;
+		const footprint = orientedRect(center, axis, halfLen, halfWid);
+		if (polygonFitsInside(usable, footprint, 0.45)) {
+			footprint.class = 'plazaBuilding';
+			return footprint;
 		}
+		halfLen *= 0.86;
+		halfWid *= 0.86;
 	}
 
 	return null;
@@ -762,16 +1068,13 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 
 	// River edges map (shared Point identity)
 	const riverEdges = new Map();
-	const nodeClearance = new Map();
 	if (riverData && riverData.course) {
 		for (let i = 0; i < riverData.course.length - 1; i++) {
 			const a = riverData.course[i], b = riverData.course[i + 1];
 			addEdgeRef(riverEdges, a, b);
 			addEdgeRef(riverEdges, b, a);
 		}
-		for (const v of riverData.course) setMax(nodeClearance, v, riverData.width / 2 + SHORE_PATH_INSET + RIVER_CLEARANCE_EPS);
 	}
-	if (wallData && wallData.towers) for (const t of wallData.towers) setMax(nodeClearance, t, TOWER_CLEARANCE);
 	const shoreEdges = buildShoreEdges(cells);
 
 	const plazaCell = plazaEnabled && inner.length > 0 ? inner[0] : null;
@@ -789,6 +1092,9 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 	const model = {
 		center, inner: innerPatches, patches,
 		plaza: plazaCell ? patchMap.get(plazaCell) : null,
+		wall: wallData,
+		water: riverData ? { riverPath: riverData.course } : null,
+		riverWidth: riverData ? riverData.width : 0,
 		arteries,
 		gates: wallData ? wallData.gates : [],
 		cityRadius: 1,
@@ -847,10 +1153,12 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 	const ctx = {
 		riverEdges, riverWidth: riverData ? riverData.width : 0,
 		riverData,
-		shoreEdges, nodeClearance,
+		shoreEdges,
 		roads: rawRoads, plazaCell,
 		wallShape: wallData ? wallData.shape : null,
 		wallSegments: wallData ? wallData.segments : null,
+		wallGates: wallData ? wallData.gates : null,
+		wallTowers: wallData ? wallData.towers : null,
 	};
 
 	const blocks = [];
@@ -869,23 +1177,24 @@ function buildBuildings(cells, inner, center, wallData, streetData, riverData, p
 			p.block = avail;
 			blocks.push(avail);
 			if ((p.type === 'generic' || p.type === 'gate') && p.withinCity) {
-				for (const b of createCommonWardGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				for (const b of createCommonWardGeometry(model, p, WARD_GEOMETRY_WIDTHS)) buildings.push(b);
 				if (p.alleys) alleys.push(...p.alleys);
 			} else if (p.type === 'cathedral' && p.withinCity) {
-				for (const b of createCathedralGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				for (const b of createCathedralGeometry(model, p, WARD_GEOMETRY_WIDTHS)) buildings.push(b);
 				if (p.alleys) alleys.push(...p.alleys);
 				if (p.cathedralHedges) cathedralHedges.push(...p.cathedralHedges);
 			} else if (p.type === 'park' && p.withinCity) {
-				for (const b of createParkGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				for (const b of createParkGeometry(model, p, WARD_GEOMETRY_WIDTHS)) buildings.push(b);
 				if (p.hedges) hedges.push(...p.hedges);
 			} else if (p.type === 'outerGarden' && !p.withinCity) {
-				for (const b of createOuterGardenGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				for (const b of createOuterGardenGeometry(model, p, WARD_GEOMETRY_WIDTHS)) buildings.push(b);
 				if (p.hedges) hedges.push(...p.hedges);
 				if (p.cathedralHedges) cathedralHedges.push(...p.cathedralHedges);
 			} else if (p.type === 'outerHighrise' && !p.withinCity) {
-				for (const b of createOuterHighriseGeometry(model, p, { main: 2.0, regular: 1.0, alley: 0.8 })) buildings.push(b);
+				for (const b of createOuterHighriseGeometry(model, p, WARD_GEOMETRY_WIDTHS)) buildings.push(b);
 				if (p.alleys) alleys.push(...p.alleys);
 				if (p.hedges) hedges.push(...p.hedges);
+				if (p.cathedralHedges) cathedralHedges.push(...p.cathedralHedges);
 			}
 		}
 	}
@@ -934,6 +1243,7 @@ export function generateWards(params = {}) {
 			const riverData = river && center ? buildRiver(cells, center, { innerCells: inner }) : null;
 			if (wallData && riverData) suppressWallSegmentsOnRiver(wallData, riverData);
 			if (wallData || riverData) addObstacleCrossings(cells, wallData, riverData);
+			annotateRoadConnectedBridges(riverData, streetData);
 			if (wallData && riverData) displaceWallTowers(wallData, riverData);
 			const dockData = buildDocks(cells, inner, { river: riverData });
 			if (inner.length >= Math.min(size, 4)) result = { cells, b, inner, center, river: riverData, wall: wallData, streets: streetData, docks: dockData };
