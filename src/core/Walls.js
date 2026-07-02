@@ -191,7 +191,6 @@ export function suppressWallSegmentsOnRiver(wall, river) {
 		const b = wall.edges[i].end;
 		if (edges.get(a) && edges.get(a).has(b)) wall.segments[i] = false;
 	}
-	rebuildTowers(wall);
 }
 
 function connectionCounts(cells) {

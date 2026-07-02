@@ -10,7 +10,7 @@ import { GeomUtils } from './GeomUtils.js';
 import { Random } from './Random.js';
 import { Cutter } from './Cutter.js';
 import { amin } from './arrays.js';
-import { sliceWardEdgeElbows, sliceWard, minNeckWidth, lotMinWidth, slicePolygonAlongElbow } from './AlleySlicer.js';
+import { sliceWardEdgeElbows, sliceWard, minNeckWidth, nonLocalMinNeckWidth, lotMinWidth, slicePolygonAlongElbow } from './AlleySlicer.js';
 import { recordFeature, recordRemovedTriangle } from './features.js';
 
 // Open patch types are kept as open space (no shrunken block). 'water' included so water
@@ -814,7 +814,19 @@ function entranceNotchFits(lot, p1, q1, q2, p2, alley) {
 	return true;
 }
 
-function buildLotWithEntrancePlans(lot, plans, alley, area0) {
+function passesLotShapeFloors(lot, opts = {}) {
+	if (!lot || lot.length < 3) return false;
+	const minLotWidth = opts.minLotWidth || 0;
+	const minLotNeck = opts.minLotNeck || 0;
+	const minLotNeckLocalSkip = opts.minLotNeckLocalSkip != null
+		? opts.minLotNeckLocalSkip
+		: (minLotNeck > 0 ? minLotNeck * 1.35 : 0);
+	if (minLotWidth > 0 && lotMinWidth(lot) < minLotWidth) return false;
+	if (minLotNeck > 0 && nonLocalMinNeckWidth(lot, minLotNeckLocalSkip) < minLotNeck) return false;
+	return true;
+}
+
+function buildLotWithEntrancePlans(lot, plans, alley, area0, opts = {}) {
 	const out = new Polygon();
 	const byEdge = new Map();
 	for (const plan of plans) {
@@ -843,6 +855,7 @@ function buildLotWithEntrancePlans(lot, plans, alley, area0) {
 	if (Math.sign(cleaned.square) !== Math.sign(lot.square)) return false;
 	if (Math.abs(cleaned.square) < area0 * 0.48) return false;
 	if (minNeckWidth(cleaned) < Math.max(0.28, alley * 0.42)) return false;
+	if (!passesLotShapeFloors(cleaned, opts)) return false;
 	return cleaned;
 }
 
@@ -932,6 +945,9 @@ function addHousingEntrance(lot, alley, opts = {}) {
 
 			const plan = makeEntrancePlan(lot, edgeIndex, start, width, depth);
 			if (!plan || !entranceNotchFits(lot, plan.p1, plan.q1, plan.q2, plan.p2, alley)) continue;
+			const tentativePlans = plans.concat(plan);
+			const tentativeLot = buildLotWithEntrancePlans(lot, tentativePlans, alley, area0, opts);
+			if (!tentativeLot) continue;
 			intervals.push([lo, hi]);
 			plans.push(plan);
 			if (Random.bool(fillProb)) fills.push(entranceFillPolygon(plan.p1, plan.q1, plan.q2, plan.p2));
@@ -939,7 +955,7 @@ function addHousingEntrance(lot, alley, opts = {}) {
 	}
 
 	if (plans.length === 0) return { lot, fills: [] };
-	const cleaned = buildLotWithEntrancePlans(lot, plans, alley, area0);
+	const cleaned = buildLotWithEntrancePlans(lot, plans, alley, area0, opts);
 	if (!cleaned) return { lot, fills: [] };
 	return { lot: cleaned, fills };
 }
@@ -955,7 +971,7 @@ function addHousingEntrances(geometry, alley, opts = {}) {
 	return out;
 }
 
-function addLargestLotInset(geometry, alley) {
+function addLargestLotInset(geometry, alley, opts = {}) {
 	if (!geometry || geometry.length === 0 || !(alley > 0)) return geometry;
 
 	let bestIndex = -1;
@@ -972,7 +988,11 @@ function addLargestLotInset(geometry, alley) {
 	if (bestIndex === -1) return geometry;
 
 	const lot = geometry[bestIndex];
-	const minInsetLotWidth = alley;
+	const minInsetLotWidth = opts.minLotWidth || alley;
+	const minInsetLotNeck = opts.minLotNeck || minInsetLotWidth;
+	const minInsetLotNeckLocalSkip = opts.minLotNeckLocalSkip != null
+		? opts.minLotNeckLocalSkip
+		: (minInsetLotNeck > 0 ? minInsetLotNeck * 1.35 : 0);
 	const excludedInsetEdges = edgeLengthExtremaIndices(lot);
 	for (const edgeIndex of convexCornerEdgeIndices(lot, alley * 0.75, excludedInsetEdges)) {
 		const a = lot[edgeIndex];
@@ -981,28 +1001,30 @@ function addLargestLotInset(geometry, alley) {
 		const len = edge.length;
 		if (!(len > 1e-6)) continue;
 
-		const distance = alley * (1 + Random.float() * 2);
-		const side = sideForShape(lot, a, b);
-		const clipped = clipOneSideWithInsetShape(lot, a, b, side, distance);
-		if (!clipped) continue;
-		const { insetLot, insetShape } = clipped;
-		insetShape.class = 'largestLotInset';
-		markEntranceExcludedEdge(insetLot, a, b, side, distance);
+		for (let attempt = 0; attempt < 4; attempt++) {
+			const distance = alley * (1 + Random.float() * 2);
+			const side = sideForShape(lot, a, b);
+			const clipped = clipOneSideWithInsetShape(lot, a, b, side, distance);
+			if (!clipped) continue;
+			const { insetLot, insetShape } = clipped;
+			insetShape.class = 'largestLotInset';
+			markEntranceExcludedEdge(insetLot, a, b, side, distance);
 
-		if (
-			!insetLot ||
-			insetLot.length < 3 ||
-			!insetLot.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)) ||
-			lotMinWidth(insetLot) < minInsetLotWidth ||
-			minNeckWidth(insetLot) < minInsetLotWidth ||
-			Math.abs(insetLot.square) < bestArea * 0.35 ||
-			Math.abs(insetShape.square) < 1e-6
-		) continue;
+			if (
+				!insetLot ||
+				insetLot.length < 3 ||
+				!insetLot.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)) ||
+				lotMinWidth(insetLot) < minInsetLotWidth ||
+				nonLocalMinNeckWidth(insetLot, minInsetLotNeckLocalSkip) < minInsetLotNeck ||
+				Math.abs(insetLot.square) < bestArea * 0.35 ||
+				Math.abs(insetShape.square) < 1e-6
+			) continue;
 
-		const out = geometry.slice();
-		out[bestIndex] = insetLot;
-		out.push(insetShape);
-		return out;
+			const out = geometry.slice();
+			out[bestIndex] = insetLot;
+			out.push(insetShape);
+			return out;
+		}
 	}
 
 	return geometry;
@@ -1088,14 +1110,22 @@ export function createCommonWardGeometry(model, patch, widths) {
 		// a previous slice — vs a random angle. TUNE HERE: raise toward 1 for more grid-aligned
 		// lots, lower for more variety.
 		elbowAlignProb: 0.7,
+		// Minimum overall lot thickness. The slicer pads this by the alley gap while testing
+		// candidate cuts, because each accepted lot is inset afterward.
+		minLotWidth: widths.alley * 4,
 		// Minimum building "waist": no lot may pinch thinner than this. Bounds the worst neck
 		// in the ward. TUNE HERE (× widths.alley) — higher = thicker, chunkier buildings.
-		minLotNeck: widths.alley * 2.5,
+		minLotNeck: widths.alley * 3.5,
 		schedule: ['elbow', 'straight', 'elbow'],
-		maxFailedInRow: 4, // one extra retry to recover the stricter thin-neck rejections
-		attempts: 18,
+		maxFailedInRow: 6, // extra retries to recover the stricter thin-neck rejections
+		attempts: 32,
 		minLotArea: Math.max(45, widths.main * widths.main * 12),
 		minLotAngle: Math.PI / 4,
+	};
+	const lotShapeGuards = {
+		minLotWidth: params.minLotWidth,
+		minLotNeck: params.minLotNeck,
+		minLotNeckLocalSkip: params.minLotNeck * 1.35,
 	};
 
 	// Very small blocks are already navigation-relevant as courtyards; don't shred them — but a
@@ -1107,15 +1137,18 @@ export function createCommonWardGeometry(model, patch, widths) {
 
 	const { lots, alleys } = sliceWardEdgeElbows(preparedBlock, params);
 	patch.alleys = alleys || [];
-	let geometry = (lots && lots.length > 0 ? lots : [preparedBlock]).map((lot) => roundedAcuteCorners(lot, params.minLotAngle));
-	geometry = geometry.filter((lot) => lot && lot.length >= 3);
-	geometry = addLargestLotInset(geometry, params.gap);
-	geometry = addHousingEntrances(geometry, params.gap, {
-		fillProb: 1,
+	let geometry = (lots && lots.length > 0 ? lots : [preparedBlock]).map((lot) => {
+		const rounded = roundedAcuteCorners(lot, params.minLotAngle);
+		return passesLotShapeFloors(rounded, lotShapeGuards) ? rounded : lot;
 	});
-	// Final guard: drop any lot that pinches below minLotNeck — both lots left waisted by the
-	// corner rounding above and whole-ward blocks the slicer couldn't cut (returned as one lot).
-	// This is what actually bounds the ward's worst neck; a thin sliver becomes open space.
+	geometry = geometry.filter((lot) => lot && lot.length >= 3);
+	geometry = addLargestLotInset(geometry, params.gap, lotShapeGuards);
+	geometry = addHousingEntrances(geometry, params.gap, {
+		fillProb: 0.67,
+		...lotShapeGuards,
+	});
+	// Shape details above keep the original lot whenever their modification would violate the
+	// width/neck floors, so stricter limits do not create empty gaps.
 	return geometry;
 }
 
@@ -1548,13 +1581,14 @@ function lineBoundaryIntersections(poly, center, dir) {
 	return hits;
 }
 
-function stairHighrise(center, axis, halfLen, halfWid) {
+function stairHighrise(center, axis, halfLen, halfWid, profile = {}) {
 	const perp = new Point(-axis.y, axis.x);
-	const steps = 3 + Math.trunc(Random.float() * 2);
+	const steps = profile.steps || (3 + Math.trunc(Random.float() * 2));
 	const stepLen = (halfLen * 2) / steps;
 	const notchHalfWid = halfWid * (OUTER_HIGHRISE_NOTCH_WIDTH_SCALE / OUTER_HIGHRISE_WIDTH_SCALE);
 	const maxSquareNotch = Math.min(notchHalfWid * 0.86, stepLen);
-	const notch = Math.min(maxSquareNotch, notchHalfWid * (0.46 + Random.float() * 0.26));
+	const notchScale = profile.notchScale != null ? profile.notchScale : 0.46 + Random.float() * 0.26;
+	const notch = Math.min(maxSquareNotch, notchHalfWid * notchScale);
 	const sx = Random.bool() ? 1 : -1;
 	const sy = Random.bool() ? 1 : -1;
 	const top = [[-halfLen, halfWid]];
@@ -1583,12 +1617,14 @@ function stairHighrise(center, axis, halfLen, halfWid) {
 	)));
 }
 
-function ascendingStairHighrise(center, axis, halfLen, halfWid) {
+function ascendingStairHighrise(center, axis, halfLen, halfWid, profile = {}) {
 	const perp = new Point(-axis.y, axis.x);
-	const steps = 3 + Math.trunc(Random.float() * 2);
+	const steps = profile.steps || (3 + Math.trunc(Random.float() * 2));
 	const stepLen = (halfLen * 2) / steps;
-	const stepRise = (halfWid * (1.12 + Random.float() * 0.38)) / steps;
-	const band = halfWid * (1.05 + Random.float() * 0.15);
+	const riseScale = profile.riseScale != null ? profile.riseScale : 1.12 + Random.float() * 0.38;
+	const bandScale = profile.bandScale != null ? profile.bandScale : 1.05 + Random.float() * 0.15;
+	const stepRise = (halfWid * riseScale) / steps;
+	const band = halfWid * bandScale;
 	const sx = Random.bool() ? 1 : -1;
 	const sy = Random.bool() ? 1 : -1;
 	const bottom = [[-halfLen, -halfWid]];
@@ -1615,10 +1651,12 @@ function ascendingStairHighrise(center, axis, halfLen, halfWid) {
 	)));
 }
 
-function lShapeHighrise(center, axis, halfLen, halfWid) {
+function lShapeHighrise(center, axis, halfLen, halfWid, profile = {}) {
 	const perp = new Point(-axis.y, axis.x);
-	const cutAlong = halfLen * (0.36 + Random.float() * 0.24);
-	const cutAcross = halfWid * (0.34 + Random.float() * 0.26);
+	const cutAlongScale = profile.cutAlongScale != null ? profile.cutAlongScale : 0.36 + Random.float() * 0.24;
+	const cutAcrossScale = profile.cutAcrossScale != null ? profile.cutAcrossScale : 0.34 + Random.float() * 0.26;
+	const cutAlong = halfLen * cutAlongScale;
+	const cutAcross = halfWid * cutAcrossScale;
 	const xCut = halfLen - cutAlong;
 	const yCut = halfWid - cutAcross;
 	const sx = Random.bool() ? 1 : -1;
@@ -1636,38 +1674,89 @@ function lShapeHighrise(center, axis, halfLen, halfWid) {
 	return poly;
 }
 
-function highriseFootprint(center, axis, halfLen, halfWid, kind) {
-	if (kind === 'stepped') return stairHighrise(center, axis, halfLen, halfWid);
-	if (kind === 'ascendingStair') return ascendingStairHighrise(center, axis, halfLen, halfWid);
-	return lShapeHighrise(center, axis, halfLen, halfWid);
+function highriseFootprint(center, axis, halfLen, halfWid, kind, profile = {}) {
+	if (kind === 'stepped') return stairHighrise(center, axis, halfLen, halfWid, profile.stepped);
+	if (kind === 'ascendingStair') return ascendingStairHighrise(center, axis, halfLen, halfWid, profile.ascendingStair);
+	return lShapeHighrise(center, axis, halfLen, halfWid, profile.lShape);
 }
 
 function randomHighriseKind() {
 	const r = Random.float();
-	if (r < 0.34) return 'ascendingStair';
-	if (r < 0.82) return 'stepped';
+	if (r < 0.46) return 'ascendingStair';
+	if (r < 0.66) return 'stepped';
 	return 'lShape';
 }
 
 const OUTER_HIGHRISE_WIDTH_SCALE = 0.65;
 const OUTER_HIGHRISE_NOTCH_WIDTH_SCALE = 0.5;
 
-function highriseMinDims(kind) {
-	if (kind === 'lShape') return { halfLen: 1.65, halfWid: 0.70 * OUTER_HIGHRISE_WIDTH_SCALE };
-	return kind === 'ascendingStair'
-		? { halfLen: 3.40, halfWid: 2.25 * OUTER_HIGHRISE_WIDTH_SCALE }
-		: { halfLen: 3.40, halfWid: 2.25 * OUTER_HIGHRISE_WIDTH_SCALE };
+function createHighriseWardProfile(length, width, target, minGap) {
+	const rows = width >= 5.2 && target >= 2 ? 2 : 1;
+	const slots = Math.max(1, Math.ceil(target / rows));
+	const margin = Math.max(0.4, minGap * 0.7);
+	const slotLen = Math.max(0, (length - (slots - 1) * minGap - 2 * margin) / slots);
+	const slotWid = Math.max(0, (width - (rows - 1) * minGap - 2 * margin) / rows);
+	const profile = {
+		fixedSize: true,
+		lShape: {
+			baseLengthFill: 0.90 + Random.float() * 0.06,
+			widthFill: 0.34 + Random.float() * 0.06,
+			aspectDiv: 2.75 + Random.float() * 0.35,
+			cutAlongScale: 0.40 + Random.float() * 0.16,
+			cutAcrossScale: 0.38 + Random.float() * 0.16,
+		},
+		ascendingStair: {
+			steps: 3 + Math.trunc(Random.float() * 2),
+			baseLengthFill: 0.90 + Random.float() * 0.06,
+			lengthScale: 1.22 + Random.float() * 0.08,
+			widthFill: 0.94 + Random.float() * 0.08,
+			aspectDiv: 1.22 + Random.float() * 0.22,
+			riseScale: 1.18 + Random.float() * 0.24,
+			bandScale: 1.08 + Random.float() * 0.10,
+		},
+		stepped: {
+			steps: 3 + Math.trunc(Random.float() * 2),
+			baseLengthFill: 0.90 + Random.float() * 0.06,
+			lengthScale: 1.10 + Random.float() * 0.06,
+			widthFill: 0.94 + Random.float() * 0.08,
+			aspectDiv: 1.22 + Random.float() * 0.22,
+			notchScale: 0.52 + Random.float() * 0.16,
+		},
+	};
+	for (const kind of ['lShape', 'ascendingStair', 'stepped']) {
+		const kindProfile = profile[kind];
+		const minDims = highriseMinDims(kind);
+		let halfLen = slotLen * 0.5 * (kindProfile.baseLengthFill || 0.92);
+		let halfWid;
+		if (kind === 'lShape') {
+			halfWid = Math.min(slotWid * 0.5 * kindProfile.widthFill, halfLen / kindProfile.aspectDiv) * OUTER_HIGHRISE_WIDTH_SCALE;
+		} else {
+			halfLen *= kindProfile.lengthScale;
+			halfWid = Math.min(slotWid * 0.5 * kindProfile.widthFill, halfLen / kindProfile.aspectDiv) * OUTER_HIGHRISE_WIDTH_SCALE;
+		}
+		kindProfile.halfLen = Math.max(halfLen, minDims.halfLen);
+		kindProfile.halfWid = Math.max(halfWid, minDims.halfWid);
+	}
+	return profile;
 }
 
-function buildHighriseAt(base, center, axis, halfLen, halfWid, kind) {
+function highriseMinDims(kind) {
+	if (kind === 'lShape') return { halfLen: 6.80, halfWid: 3.85 * OUTER_HIGHRISE_WIDTH_SCALE };
+	return kind === 'ascendingStair'
+		? { halfLen: 7.30, halfWid: 4.95 * OUTER_HIGHRISE_WIDTH_SCALE }
+		: { halfLen: 7.80, halfWid: 5.30 * OUTER_HIGHRISE_WIDTH_SCALE };
+}
+
+function buildHighriseAt(base, center, axis, halfLen, halfWid, kind, profile = {}) {
 	const minDims = highriseMinDims(kind);
 	for (let attempt = 0; attempt < 5; attempt++) {
 		if (halfLen < minDims.halfLen || halfWid < minDims.halfWid) return null;
-		const b = highriseFootprint(center, axis, halfLen, halfWid, kind);
+		const b = highriseFootprint(center, axis, halfLen, halfWid, kind, profile);
 		if (polygonFitsInside(base, b, 0.6)) {
 			b.class = 'highrise';
 			return b;
 		}
+		if (profile.fixedSize) return null;
 		halfLen *= 0.86;
 		halfWid *= 0.86;
 	}
@@ -1732,7 +1821,7 @@ function highriseTargetCount(usable, axis) {
 // Each slot fits one building scaled to most of its cell, so the ward fills evenly. Zig-zag
 // kinds get a wider halfWid baseline so they read as larger, chunkier buildings.
 function placeHighriseBuildingsSlotted(usable, axis, slotCount, rowCount, opts) {
-	const { length, width, minGap, minHalfWid, maxAspect } = opts;
+	const { length, width, minGap, minHalfWid, maxAspect, profile, placementAttempts = 48 } = opts;
 	if (slotCount < 1 || rowCount < 1) return [];
 	const center = usable.centroid;
 	const perp = new Point(-axis.y, axis.x);
@@ -1756,21 +1845,14 @@ function placeHighriseBuildingsSlotted(usable, axis, slotCount, rowCount, opts) 
 			const alongSlot = startAlong + col * (slotLen + minGap);
 
 			let placed = null;
-			for (let attempt = 0; attempt < 16 && !placed; attempt++) {
+			for (let attempt = 0; attempt < placementAttempts && !placed; attempt++) {
 				const kind = randomHighriseKind();
-				// Building takes most of its slot's along-axis extent.
-				let halfLen = slotLen * 0.5 * (0.82 + Random.float() * 0.12);
-				// halfWid: L-shapes stay close to the old rectangle envelope; zig-zags fill more
-				// of the slot so the steps don't visually shrink the footprint.
-				let halfWid;
-				if (kind === 'lShape') {
-					halfWid = Math.min(slotWid * 0.5 * (0.30 + Random.float() * 0.12), halfLen / (2.6 + Random.float() * 0.6)) * OUTER_HIGHRISE_WIDTH_SCALE;
-				} else if (kind === 'ascendingStair') {
-					halfLen *= 1.16 + Random.float() * 0.10;
-					halfWid = Math.min(slotWid * 0.5 * (0.88 + Random.float() * 0.14), halfLen / (1.18 + Random.float() * 0.32)) * OUTER_HIGHRISE_WIDTH_SCALE;
-				} else {
-					halfLen *= 1.04 + Random.float() * 0.08;
-					halfWid = Math.min(slotWid * 0.5 * (0.88 + Random.float() * 0.14), halfLen / (1.18 + Random.float() * 0.32)) * OUTER_HIGHRISE_WIDTH_SCALE;
+				const kindProfile = (profile && profile[kind]) || {};
+				let halfLen = kindProfile.halfLen;
+				let halfWid = kindProfile.halfWid;
+				if (!(halfLen > 0 && halfWid > 0)) {
+					halfLen = slotLen * 0.5 * (kindProfile.baseLengthFill || 0.88);
+					halfWid = slotWid * 0.5 * (kindProfile.widthFill || 0.7) * OUTER_HIGHRISE_WIDTH_SCALE;
 				}
 				const minDims = highriseMinDims(kind);
 				halfLen = Math.max(halfLen, minDims.halfLen);
@@ -1779,13 +1861,13 @@ function placeHighriseBuildingsSlotted(usable, axis, slotCount, rowCount, opts) 
 				if (halfWid < minHalfWid || halfLen < 1.65) continue;
 
 				// Small jitter inside the slot so trials with the same grid produce variety.
-				const alongJitter = (Random.float() - 0.5) * Math.max(0, slotLen - 2 * halfLen) * 0.7;
-				const acrossJitter = (Random.float() - 0.5) * Math.max(0, slotWid - 2 * halfWid) * 0.4;
+				const alongJitter = (Random.float() - 0.5) * Math.max(minGap * 1.2, slotLen - 2 * halfLen) * 0.9;
+				const acrossJitter = (Random.float() - 0.5) * Math.max(minGap * 1.0, slotWid - 2 * halfWid) * 0.65;
 				const c = new Point(
 					center.x + axis.x * (alongSlot + alongJitter) + perp.x * (acrossSlot + acrossJitter),
 					center.y + axis.y * (alongSlot + alongJitter) + perp.y * (acrossSlot + acrossJitter)
 				);
-				const building = buildHighriseAt(usable, c, axis, halfLen, halfWid, kind);
+				const building = buildHighriseAt(usable, c, axis, halfLen, halfWid, kind, profile);
 				if (!building) continue;
 				if (buildings.some((other) => polygonDistance(building, other) < minGap)) continue;
 				placed = building;
@@ -1808,42 +1890,44 @@ function createHighriseBuildings(block, axis) {
 	if (length < 3.8 || width < 1.8) return [];
 
 	const target = highriseTargetCount(usable, axis);
-	const opts = { length, width, minGap: 0.55, minHalfWid: 0.70 * OUTER_HIGHRISE_WIDTH_SCALE, maxAspect: 4.2 / OUTER_HIGHRISE_WIDTH_SCALE };
+	const minGap = 0.55;
+	const profile = createHighriseWardProfile(length, width, target, minGap);
+	const opts = { length, width, minGap, minHalfWid: 0.70 * OUTER_HIGHRISE_WIDTH_SCALE, maxAspect: 4.2 / OUTER_HIGHRISE_WIDTH_SCALE, profile, placementAttempts: 72 };
 
-	// 5 layout trials with varied slot/row counts; keep the densest by total building area.
-	const trials = [
-		{ slots: target, rows: 1 },
-		{ slots: Math.max(1, target - 1), rows: 1 },
-		{ slots: target + 1, rows: 1 },
-		{ slots: target + 2, rows: 1 },
-	];
+	// Multiple slot/row layouts with repeated placement attempts; keep the densest result,
+	// using area only as the tie-breaker. Stricter minimum footprints need the extra search.
+	const trials = [];
+	const addTrial = (slots, rows) => {
+		slots = Math.max(1, slots);
+		rows = Math.max(1, rows);
+		if (!trials.some((t) => t.slots === slots && t.rows === rows)) trials.push({ slots, rows });
+	};
+	for (let slots = target - 1; slots <= target + 2; slots++) addTrial(slots, 1);
 	if (width >= 5.2 && target >= 2) {
-		trials.push({ slots: Math.max(1, Math.ceil(target / 2)), rows: 2 });
-		trials.push({ slots: Math.max(2, Math.ceil((target + 1) / 2)), rows: 2 });
-		trials.push({ slots: Math.max(2, Math.ceil((target + 2) / 2)), rows: 2 });
-	} else {
-		trials.push({ slots: target, rows: 1 });
-		trials.push({ slots: Math.max(1, target - 1), rows: 1 });
+		for (let slots = Math.ceil((target - 1) / 2); slots <= Math.ceil((target + 3) / 2); slots++) addTrial(slots, 2);
 	}
 
 	let best = [];
 	let bestArea = -1;
 	for (const trial of trials) {
-		const buildings = placeHighriseBuildingsSlotted(usable, axis, trial.slots, trial.rows, opts);
-		let area = 0;
-		for (const b of buildings) area += Math.abs(b.square);
-		if (area > bestArea) {
-			bestArea = area;
-			best = buildings;
+		for (let repeat = 0; repeat < 5; repeat++) {
+			const buildings = placeHighriseBuildingsSlotted(usable, axis, trial.slots, trial.rows, opts);
+			let area = 0;
+			for (const b of buildings) area += Math.abs(b.square);
+			if (buildings.length > best.length || (buildings.length === best.length && area > bestArea)) {
+				bestArea = area;
+				best = buildings;
+			}
 		}
 	}
 
 	if (best.length === 0) {
 		const kind = width > 4.5 && length > 6.0 ? randomHighriseKind() : 'lShape';
 		const minDims = highriseMinDims(kind);
-		const halfWid = Math.max(minDims.halfWid, Math.min(width * 0.2, length * 0.09) * OUTER_HIGHRISE_WIDTH_SCALE);
-		const halfLen = Math.max(minDims.halfLen, Math.min(length * 0.28, halfWid * opts.maxAspect));
-		const b = buildHighriseAt(usable, center, axis, halfLen, halfWid, kind);
+		const kindProfile = profile[kind] || {};
+		const halfWid = Math.max(minDims.halfWid, kindProfile.halfWid || 0);
+		const halfLen = Math.max(minDims.halfLen, kindProfile.halfLen || 0);
+		const b = buildHighriseAt(usable, center, axis, halfLen, halfWid, kind, profile);
 		if (b) best = [b];
 	}
 	return best;

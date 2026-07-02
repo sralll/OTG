@@ -915,7 +915,7 @@ export class LazyVisibilityGraph {
 	// Uses EXPANDING RINGS: starts at neighborRing cells and doubles until
 	// at least one visible node is found or the whole grid is covered. This
 	// guarantees connectivity for arbitrary click points in open space.
-	queryPoint(px, py, exact = false, rawVisibility = false) {
+	queryPoint(px, py, exact = false, rawVisibility = false, acceptPoint = null) {
 		if (this._inRawObstacle(px, py)) return { index: -1, x: px, y: py, _links: [], _isQuery: true };
 		// When the click point sits inside a clearance (dilation) buffer but
 		// outside the visual obstacle, the dilated LOS oracle rejects every
@@ -930,6 +930,7 @@ export class LazyVisibilityGraph {
 			for (let j = 0; j < this.nodeCount; j++) {
 				if (this.nodeBlocked[j]) continue;
 				const vx = this.nodeX[j], vy = this.nodeY[j];
+				if (acceptPoint && !acceptPoint(vx, vy)) continue;
 				if (this.losClearRaw(px, py, vx, vy))
 					links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
 			}
@@ -942,10 +943,11 @@ export class LazyVisibilityGraph {
 			for (let j = 0; j < this.nodeCount; j++) {
 				if (this.nodeBlocked[j]) continue;
 				const vx = this.nodeX[j], vy = this.nodeY[j];
-			if (inDilation ? this.losClearRaw(px, py, vx, vy) : this.losClear(px, py, vx, vy, -1, j))
-				links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
-		}
-		return { index: -1, x: px, y: py, _links: links, _isQuery: true };
+				if (acceptPoint && !acceptPoint(vx, vy)) continue;
+				if (inDilation ? this.losClearRaw(px, py, vx, vy) : this.losClear(px, py, vx, vy, -1, j))
+					links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
+			}
+			return { index: -1, x: px, y: py, _links: links, _isQuery: true };
 		}
 		const ng = this.nodeGrid;
 		const cx0 = ng.col(px), cy0 = ng.row(py);
@@ -967,9 +969,10 @@ export class LazyVisibilityGraph {
 						if (seen.has(j)) continue;
 						seen.add(j);
 						const vx = this.nodeX[j], vy = this.nodeY[j];
-					if (inDilation ? this.losClearRaw(px, py, vx, vy) : this.losClear(px, py, vx, vy, -1, j)) {
-						links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
-					}
+						if (acceptPoint && !acceptPoint(vx, vy)) continue;
+						if (inDilation ? this.losClearRaw(px, py, vx, vy) : this.losClear(px, py, vx, vy, -1, j)) {
+							links.push({ to: j, w: Math.hypot(vx - px, vy - py), cost: Math.hypot(vx - px, vy - py) });
+						}
 					}
 				}
 			}
@@ -983,14 +986,13 @@ export class LazyVisibilityGraph {
 	// Off-graph points use expanding-ring queryPoint so they always find visible
 	// graph nodes (unless fully enclosed by obstacles).
 	astar(start, goal, opts = {}) {
+		this.lastAstarTimedOut = false;
+		this.lastAstarRejectedByLateralLimit = false;
 		// EXPERIMENTAL EXACT ROUTING SWITCH: { exact: true } trades speed for a
 		// fuller visibility graph during route testing. Omit the option to keep
 		// the older lazy local-neighbour behaviour.
 		const exact = !!opts.exact;
 		const rawVisibility = !!opts.rawVisibility;
-		const startNode = (typeof start === 'number')
-			? { index: start, x: this.nodeX[start], y: this.nodeY[start], _links: null, _isQuery: false }
-			: this.queryPoint(start.x, start.y, exact, rawVisibility);
 
 		// For off-graph goals: precompute which graph nodes can see the goal.
 		// A* terminates when any of those nodes is popped → append goal to path.
@@ -998,11 +1000,31 @@ export class LazyVisibilityGraph {
 		const goalX = goalIsOffGraph ? goal.x : this.nodeX[goal];
 		const goalY = goalIsOffGraph ? goal.y : this.nodeY[goal];
 		const goalNodeIndex = goalIsOffGraph ? -1 : goal;
+		const startX = (typeof start === 'number') ? this.nodeX[start] : start.x;
+		const startY = (typeof start === 'number') ? this.nodeY[start] : start.y;
+		const sgDx = goalX - startX;
+		const sgDy = goalY - startY;
+		const sgLen = Math.hypot(sgDx, sgDy);
+		let acceptRouteNode = null;
+		if (Number.isFinite(opts.maxStartGoalPerpendicularFactor) && opts.maxStartGoalPerpendicularFactor >= 0 && sgLen > EPS) {
+			// Reject graph nodes whose perpendicular distance from the direct
+			// start-goal line exceeds factor * |start-goal|.
+			const maxPerp = sgLen * opts.maxStartGoalPerpendicularFactor + POINT_EPS;
+			acceptRouteNode = (x, y) => {
+				const perp = Math.abs(sgDx * (y - startY) - sgDy * (x - startX)) / sgLen;
+				if (perp <= maxPerp) return true;
+				this.lastAstarRejectedByLateralLimit = true;
+				return false;
+			};
+		}
+		const startNode = (typeof start === 'number')
+			? { index: start, x: this.nodeX[start], y: this.nodeY[start], _links: null, _isQuery: false }
+			: this.queryPoint(start.x, start.y, exact, rawVisibility, acceptRouteNode);
 		const START_IDX = -2;
 		const GOAL_IDX = -3;
 		let goalLinkMap = null;
 	if (goalIsOffGraph) {
-		const goalQuery = this.queryPoint(goal.x, goal.y, exact, rawVisibility);
+		const goalQuery = this.queryPoint(goal.x, goal.y, exact, rawVisibility, acceptRouteNode);
 		goalLinkMap = new Map(goalQuery._links.map(l => [l.to, l.w]));
 	}
 	// As with queryPoint: a goal (or off-graph start) marker that sits inside a
@@ -1059,7 +1081,10 @@ export class LazyVisibilityGraph {
 		while (open.length > 0 && iterations++ < MAX_ITER) {
 			// (A) Wall-clock budget: bail to "no route" rather than grinding the
 			// whole graph on a heuristic-defeating cross-river detour.
-			if (timeBudgetMs > 0 && (iterations & ASTAR_BUDGET_CHECK_MASK) === 0 && _now() - tStart > timeBudgetMs) return null;
+			if (timeBudgetMs > 0 && (iterations & ASTAR_BUDGET_CHECK_MASK) === 0 && _now() - tStart > timeBudgetMs) {
+				this.lastAstarTimedOut = true;
+				return null;
+			}
 			const cur = pop();
 			if (cur.g > (gScore.get(cur.idx) ?? Infinity) + EPS) continue;
 			if (closed.has(cur.idx)) continue;
@@ -1107,6 +1132,7 @@ export class LazyVisibilityGraph {
 				if (closed.has(e.to)) continue;
 				const ex = e.to === GOAL_IDX ? goalX : this.nodeX[e.to];
 				const ey = e.to === GOAL_IDX ? goalY : this.nodeY[e.to];
+				if (acceptRouteNode && !acceptRouteNode(ex, ey)) continue;
 				const baseCost = Number.isFinite(e.cost) ? e.cost : this.edgeCost(cur.x, cur.y, ex, ey);
 				const tentative = cur.g + baseCost;
 				if (gScore.has(e.to) && tentative >= gScore.get(e.to)) continue;

@@ -44,9 +44,9 @@
 <svg id="map" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
 
 <script type="module">
-import { generateWards } from './src/core/CityGen.js?v=31';
+import { generateWards } from './src/core/CityGen.js?v=33';
 import { extractObstacles, thickenPolyline } from './src/core/Obstacles.js?v=7';
-import { buildVisibilityGraph, dilatePolygon } from './src/core/VisibilityGraph.js?v=12';
+import { buildVisibilityGraph, dilatePolygon } from './src/core/VisibilityGraph.js?v=13';
 
 let visibilityGraph = null;
 const ROUTE_VISIBILITY_GRAPH_OPTIONS = {
@@ -93,6 +93,7 @@ const BUILDING_OUTLINE_WIDTH = 0.18;
 const GATE_TOWER_OUTLINE_WIDTH = BUILDING_OUTLINE_WIDTH / 2;
 const WALL_TOWER_DIAMETER_SCALE = 2;
 const WATER_OUTLINE_WIDTH = 0.2;
+const RIVER_MOUTH_FILL_OVERLAP = WATER_OUTLINE_WIDTH;
 const HEDGE_WIDTH = 0.45;
 const BRIDGE_FILL_WIDTH = 1.6;
 
@@ -223,11 +224,16 @@ function riverRenderGeometry(river) {
 		? [{ x: (river.course[0].x + river.course[1].x) / 2, y: (river.course[0].y + river.course[1].y) / 2 }, ...river.course.slice(1)]
 		: river.course;
 	const visualCourse = chaikinSmooth(course, 3);
-	// The dark outline stops at the delta base (visualCourse[0]) so the mouth stays outline-free
-	// (water↔water). The blue fill, however, runs one segment further seaward to the actual mouth
-	// point, so it overlaps the delta fill — this removes the anti-aliasing hairline crack that
-	// otherwise appears where the separate river-fill and water-body-fill paths merely abut.
-	const fillCourse = river.delta ? [river.course[0], ...visualCourse] : visualCourse;
+	let fillCourse = visualCourse;
+	if (river.delta && visualCourse.length >= 2) {
+		const p0 = visualCourse[0], p1 = visualCourse[1];
+		const dx = p1.x - p0.x, dy = p1.y - p0.y;
+		const len = Math.hypot(dx, dy) || 1;
+		// Only the blue fill gets a sub-outline-width overlap into the mouth. The
+		// bank outline still stops at the handoff, so the raw river cannot spill
+		// back through the river-mouth area.
+		fillCourse = [{ x: p0.x - (dx / len) * RIVER_MOUTH_FILL_OVERLAP, y: p0.y - (dy / len) * RIVER_MOUTH_FILL_OVERLAP }, ...visualCourse.slice(1)];
+	}
 	return {
 		visualCourse,
 		pathD: polyPath(visualCourse),
@@ -1019,11 +1025,14 @@ function drawPathLine(g, path, color) {
 // EXPERIMENTAL EXACT ROUTING: set false to return route clicks/stress tests to
 // the previous faster local-neighbour visibility graph.
 const ROUTE_USE_EXACT_VISIBILITY = false;
-const ROUTE_ASTAR_OPTIONS = ROUTE_USE_EXACT_VISIBILITY ? { exact: true } : {};
+const ROUTE_LATERAL_ASTAR_OPTIONS = { maxStartGoalPerpendicularFactor: 1 };
+const ROUTE_ASTAR_OPTIONS = ROUTE_USE_EXACT_VISIBILITY
+	? { ...ROUTE_LATERAL_ASTAR_OPTIONS, exact: true }
+	: ROUTE_LATERAL_ASTAR_OPTIONS;
 const ROUTE_EXTRA_ASTAR_OPTIONS = { ...ROUTE_ASTAR_OPTIONS, timeBudgetMs: 200 };
 const ROUTE_MANUAL_ASTAR_OPTIONS = ROUTE_USE_EXACT_VISIBILITY
-	? { exact: true, timeBudgetMs: 0, maxExpansions: 1000000 }
-	: {};
+	? { ...ROUTE_LATERAL_ASTAR_OPTIONS, exact: true, timeBudgetMs: 0, maxExpansions: 1000000 }
+	: ROUTE_LATERAL_ASTAR_OPTIONS;
 const ROUTE_STRESS_ALTERNATE_ATTEMPTS = 4;
 const ROUTE_MANUAL_ALTERNATE_ATTEMPTS = 3;
 
@@ -1043,11 +1052,13 @@ function computeRouteOptions(startPt, goalPt, visGraph) {
 	// stress log tell a genuine geometric reject ('side'/'distinct'/'distance')
 	// apart from one caused by A* timing out on a hard cross-river detour.
 	let timeout = false;
+	let lateralRejected = false;
 
 	for (let attempt = 0; attempt < ROUTE_STRESS_ALTERNATE_ATTEMPTS; attempt++) {
 		const astarOptions = attempt >= 2 ? ROUTE_EXTRA_ASTAR_OPTIONS : ROUTE_ASTAR_OPTIONS;
 		const result = visGraph.astar(startPt, goalPt, astarOptions);
 		if (visGraph.lastAstarTimedOut) timeout = true;
+		if (!result && visGraph.lastAstarRejectedByLateralLimit) lateralRejected = true;
 		if (!result || result.path.length < 2) break;
 		const path = result.path;
 		const len = routePathLength(path);
@@ -1068,7 +1079,7 @@ function computeRouteOptions(startPt, goalPt, visGraph) {
 	const dt = performance.now() - t0;
 
 	if (paths.length === 0) {
-		return { ok: false, reason: 'timeout', paths, selected: null, routeLengthSlots: emptyRouteSlots(), routeSideSlots: emptyRouteSlots(), routeSideLabelSlots: emptyRouteSlots(), routeIndexes: [], blockFastest: false, barriers, skippedBarriers: [], dt, timeout: true };
+		return { ok: false, reason: lateralRejected ? 'side' : 'timeout', paths, selected: null, routeLengthSlots: emptyRouteSlots(), routeSideSlots: emptyRouteSlots(), routeSideLabelSlots: emptyRouteSlots(), routeIndexes: [], blockFastest: false, barriers, skippedBarriers: [], dt, timeout };
 	}
 	if (paths.length === 1) {
 		const routeLengthSlots = emptyRouteSlots();

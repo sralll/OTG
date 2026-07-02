@@ -697,7 +697,7 @@ export function sliceWard(block, params) {
 				if (minLotWidth > 0 && lotMinWidth(lot) < minLotWidth) return false;
 				if (params.minLotArea != null && Math.abs(lot.square) < params.minLotArea) return false;
 				if (params.minLotAngle != null && minAngle(lot) < params.minLotAngle) return false;
-				if (cutNeck > 0 && minNeckWidth(lot) < cutNeck) return false;
+				if (cutNeck > 0 && nonLocalMinNeckWidth(lot, cutNeck * 1.35) < cutNeck) return false;
 			}
 			return true;
 		};
@@ -865,10 +865,45 @@ function chamferLots(lots, minAngle, size, edgeFrac) {
 // In ~`prob` of lots, set back ONE side deeper than the rest: clip a single random edge inward
 // by an extra normal-random amount, scaled to up to double the usual gap/2 inset (mean ~the
 // usual, ranging 0..~gap). If that would leave a tiny remnant, keep the uniformly-shrunk lot.
-function shrinkOneSideDeeper(lot, gap, prob, minArea = 0) {
+function isConvexInsetCorner(poly, i) {
+	if (!poly || poly.length < 3) return false;
+	const n = poly.length;
+	const prev = poly[(i + n - 1) % n];
+	const cur = poly[i];
+	const next = poly[(i + 1) % n];
+	const ux = cur.x - prev.x;
+	const uy = cur.y - prev.y;
+	const vx = next.x - cur.x;
+	const vy = next.y - cur.y;
+	const turn = ux * vy - uy * vx;
+	const sign = poly.square >= 0 ? 1 : -1;
+	return turn * sign > 1e-7;
+}
+
+function shuffledEdgeIndices(count) {
+	const out = [];
+	for (let i = 0; i < count; i++) out.push(i);
+	for (let i = out.length - 1; i > 0; i--) {
+		const j = Random.int(0, i + 1);
+		const t = out[i];
+		out[i] = out[j];
+		out[j] = t;
+	}
+	return out;
+}
+
+function setbackTouchesOnlyChosenSide(parts, edgeIndex, vertexCount) {
+	if (!parts || parts.crossings !== 2) return false;
+	const nextIndex = (edgeIndex + 1) % vertexCount;
+	const allowed = new Set([edgeIndex, nextIndex]);
+	if (!parts.removedOriginalIndices || parts.removedOriginalIndices.length !== 2) return false;
+	for (const i of parts.removedOriginalIndices) if (!allowed.has(i)) return false;
+	return allowed.has(parts.removedOriginalIndices[0]) && allowed.has(parts.removedOriginalIndices[1]);
+}
+
+function shrinkOneSideDeeper(lot, gap, prob, minArea = 0, minNeck = 0, minNeckLocalSkip = 0) {
 	if (!lot || lot.length < 3 || !(gap > 0) || !(prob > 0)) return lot;
 	if (!Random.bool(prob)) return lot;
-	const idx = Random.int(0, lot.length);
 	const extra = Random.normal() * gap; // mean ~gap/2 (the usual distance), up to ~gap (double)
 	if (!(extra > 1e-6)) return lot;
 	const area0 = Math.abs(lot.square);
@@ -876,33 +911,54 @@ function shrinkOneSideDeeper(lot, gap, prob, minArea = 0) {
 	if (!(width0 > gap * 1.5)) return lot;
 	const distance = Math.min(extra, width0 * 0.22);
 	if (!(distance > 1e-6)) return lot;
-	try {
-		const clipped = clipOneSideInset(lot, idx, distance);
-		if (
-			clipped &&
-			clipped.length >= 3 &&
-			clipped.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)) &&
-			Math.abs(clipped.square) > Math.max(area0 * 0.72, minArea > 0 ? minArea * 0.75 : 0) &&
-			lotMinWidth(clipped) > Math.max(gap * 0.55, width0 * 0.45)
-		) return clipped;
-	} catch (e) { /* keep the uniformly-shrunk lot */ }
+
+	for (const idx of shuffledEdgeIndices(lot.length)) {
+		const nextIndex = (idx + 1) % lot.length;
+		if (!isConvexInsetCorner(lot, idx) || !isConvexInsetCorner(lot, nextIndex)) continue;
+		try {
+			const clippedParts = splitOneSideInset(lot, idx, distance);
+			if (!setbackTouchesOnlyChosenSide(clippedParts, idx, lot.length)) continue;
+			const clipped = clippedParts ? clippedParts.kept : null;
+			if (
+				clipped &&
+				clipped.length >= 3 &&
+				clipped.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)) &&
+				Math.abs(clipped.square) > Math.max(area0 * 0.72, minArea > 0 ? minArea * 0.75 : 0) &&
+				lotMinWidth(clipped) > Math.max(gap * 0.55, width0 * 0.45) &&
+				(minNeck <= 0 || nonLocalMinNeckWidth(clipped, minNeckLocalSkip) >= minNeck)
+			) return clipped;
+		} catch (e) {
+			// Try another edge; if none work, keep the uniformly-shrunk lot.
+		}
+	}
 	return lot;
 }
 
-function clipOneSideInset(lot, edgeIndex, distance) {
+function compactInsetPoints(points) {
+	const out = [];
+	for (const p of points) {
+		if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+		const last = out[out.length - 1];
+		if (!last || Point.distance(last, p) > 1e-6) out.push(p);
+	}
+	if (out.length > 1 && Point.distance(out[0], out[out.length - 1]) <= 1e-6) out.pop();
+	return out;
+}
+
+function splitOneSideInset(lot, edgeIndex, distance) {
 	const n = lot.length;
-	if (n < 3 || !(distance > 0)) return lot;
+	if (n < 3 || !(distance > 0)) return null;
 	const a = lot[edgeIndex];
 	const b = lot[(edgeIndex + 1) % n];
 	const dx = b.x - a.x;
 	const dy = b.y - a.y;
 	const len = Math.hypot(dx, dy);
 	const areaSign = lot.square >= 0 ? 1 : -1;
-	if (len < 1e-9) return lot;
+	if (len < 1e-9) return null;
 
 	const ax = a.x + (-dy / len) * distance * areaSign;
 	const ay = a.y + (dx / len) * distance * areaSign;
-	const inside = (p) => (dx * (p.y - ay) - dy * (p.x - ax)) * areaSign >= -1e-7;
+	const signed = (p) => (dx * (p.y - ay) - dy * (p.x - ax)) * areaSign;
 	const intersect = (p, q) => {
 		const sx = q.x - p.x;
 		const sy = q.y - p.y;
@@ -911,18 +967,39 @@ function clipOneSideInset(lot, edgeIndex, distance) {
 		return new Point(p.x + sx * t.y, p.y + sy * t.y);
 	};
 
-	const out = [];
+	const kept = [];
+	const removed = [];
+	const removedOriginalIndices = [];
+	let crossings = 0;
 	let prev = lot[n - 1];
-	let prevInside = inside(prev);
+	let prevD = signed(prev);
+	let prevInside = prevD >= -1e-7;
 	for (let i = 0; i < n; i++) {
 		const cur = lot[i];
-		const curInside = inside(cur);
-		if (curInside !== prevInside) out.push(intersect(prev, cur));
-		if (curInside) out.push(cur);
+		const curD = signed(cur);
+		const curInside = curD >= -1e-7;
+		const curRemoved = curD <= 1e-7;
+		if (curInside !== prevInside) {
+			crossings++;
+			const hit = intersect(prev, cur);
+			kept.push(hit);
+			removed.push(hit);
+		}
+		if (curInside) kept.push(cur);
+		if (curRemoved) {
+			removed.push(cur);
+			removedOriginalIndices.push(i);
+		}
 		prev = cur;
+		prevD = curD;
 		prevInside = curInside;
 	}
-	return new Polygon(out);
+	return {
+		kept: new Polygon(compactInsetPoints(kept)),
+		removed: new Polygon(compactInsetPoints(removed)),
+		removedOriginalIndices,
+		crossings,
+	};
 }
 
 // Distance from point p to segment [a, b].
@@ -956,7 +1033,42 @@ function minNeckWidth(poly) {
 	return best;
 }
 
-function validElbowLots(halves, ranges, gap, minLotArea, minLotAngle, minLotWidth, minLotNeck = 0) {
+function boundaryIndexDistance(prefix, perimeter, a, b) {
+	const d = Math.abs(prefix[a] - prefix[b]);
+	return Math.min(d, perimeter - d);
+}
+
+// Like minNeckWidth, but ignores vertex/edge pairs that are close along the polygon boundary.
+// This keeps tiny local stair-steps and chamfer artifacts from vetoing otherwise healthy lots,
+// while still catching real waists where two distant boundary runs nearly touch.
+export function nonLocalMinNeckWidth(poly, localBoundarySkip = 0) {
+	if (!poly || poly.length < 4) return Infinity;
+	const n = poly.length;
+	const prefix = [0];
+	for (let i = 0; i < n; i++) {
+		prefix.push(prefix[i] + Point.distance(poly[i], poly[(i + 1) % n]));
+	}
+	const perimeter = prefix[n];
+	if (perimeter <= 1e-6) return Infinity;
+
+	let best = Infinity;
+	for (let i = 0; i < n; i++) {
+		const v = poly[i];
+		for (let j = 0; j < n; j++) {
+			if (j === i || j === (i + n - 1) % n) continue;
+			if (localBoundarySkip > 0) {
+				const d0 = boundaryIndexDistance(prefix, perimeter, i, j);
+				const d1 = boundaryIndexDistance(prefix, perimeter, i, (j + 1) % n);
+				if (Math.min(d0, d1) < localBoundarySkip) continue;
+			}
+			const d = pointSegmentDistance(v, poly[j], poly[(j + 1) % n]);
+			if (d < best) best = d;
+		}
+	}
+	return best;
+}
+
+function validElbowLots(halves, ranges, gap, minLotArea, minLotAngle, minLotWidth, minLotNeck = 0, minLotNeckLocalSkip = 0) {
 	const lots = [];
 	for (let i = 0; i < halves.length; i++) {
 		let lot = halves[i];
@@ -965,7 +1077,7 @@ function validElbowLots(halves, ranges, gap, minLotArea, minLotAngle, minLotWidt
 		if (!lot || lot.length < 3) return null;
 		if (Math.abs(lot.square) < minLotArea) return null;
 		if (minAngle(lot) < minLotAngle) return null;
-		if (minLotNeck > 0 && minNeckWidth(lot) < minLotNeck) return null;
+		if (minLotNeck > 0 && nonLocalMinNeckWidth(lot, minLotNeckLocalSkip) < minLotNeck) return null;
 		lots.push(lot);
 	}
 	return lots;
@@ -1017,6 +1129,7 @@ function makeEdgeElbowCut(poly, params) {
 	const gap = params.gap || 0;
 	const minLotWidth = params.minLotWidth || 0;
 	const minLotNeck = params.minLotNeck || 0;
+	const minLotNeckLocalSkip = params.minLotNeckLocalSkip || 0;
 	const angleMin = params.elbowAngleMin || Math.PI / 9;
 	const angleMax = params.elbowAngleMax || Math.PI / 2;
 	// Probability the elbow's second leg is aligned to a block edge — normal (perpendicular) OR
@@ -1056,7 +1169,7 @@ function makeEdgeElbowCut(poly, params) {
 			if (!exit || exit.edge === edgeIndex || exit.t < Math.sqrt(minLotArea)) continue;
 			const cut = [entry, elbow, exit.point];
 			const split = splitAlong(poly, edgeIndex, exit.edge, cut);
-			const lots = validElbowLots(split.halves, split.ranges, gap, minLotArea, minLotAngle, minLotWidth, minLotNeck);
+			const lots = validElbowLots(split.halves, split.ranges, gap, minLotArea, minLotAngle, minLotWidth, minLotNeck, minLotNeckLocalSkip);
 			if (lots) return { lots, alley: cut };
 		}
 	}
@@ -1070,6 +1183,7 @@ function makeEdgeStraightCut(poly, params) {
 	const gap = params.gap || 0;
 	const minLotWidth = params.minLotWidth || 0;
 	const minLotNeck = params.minLotNeck || 0;
+	const minLotNeckLocalSkip = params.minLotNeckLocalSkip || 0;
 
 	for (let attempt = 0; attempt < (params.attempts || 14); attempt++) {
 		const edgeIndex = weightedRandomEdgeIndex(poly);
@@ -1086,7 +1200,7 @@ function makeEdgeStraightCut(poly, params) {
 		if (!exit || exit.t < Math.sqrt(minLotArea) * 2) continue;
 		const cut = [entry, exit.point];
 		const split = splitAlong(poly, edgeIndex, exit.edge, cut);
-		const lots = validElbowLots(split.halves, split.ranges, gap, minLotArea, minLotAngle, minLotWidth, minLotNeck);
+		const lots = validElbowLots(split.halves, split.ranges, gap, minLotArea, minLotAngle, minLotWidth, minLotNeck, minLotNeckLocalSkip);
 		if (lots) return { lots, alley: cut };
 	}
 	return null;
@@ -1094,13 +1208,22 @@ function makeEdgeStraightCut(poly, params) {
 
 export function sliceWardEdgeElbows(block, params = {}) {
 	const gap = params.gap || 0;
-	// During cutting, only reject halves that are too narrow to contain the alley setback.
-	// The vertex-to-nonincident-edge neck heuristic is intentionally not used here: smoothed or
-	// clipped ward boundaries can contain tiny local stair-steps, and those read as false "necks"
-	// even when the block is broadly wide enough to slice.
-	const cutParams = gap > 0
-		? { ...params, gap: 0, minLotWidth: 2 * gap, minLotNeck: 0 }
-		: { ...params, minLotNeck: 0 };
+	const widthFloor = params.minLotWidth != null ? params.minLotWidth : (gap > 0 ? 2 * gap : 0);
+	const neckFloor = params.minLotNeck != null ? params.minLotNeck : 0;
+	// Validate the full-size child lots before accepting a cut. They later lose about `gap` of
+	// total width to the alley setback, so pad the requested final floors here and retry elsewhere
+	// when a candidate split would make a skinny building.
+	const cutWidth = gap > 0 ? widthFloor + gap : widthFloor;
+	const cutNeck = gap > 0 && neckFloor > 0 ? neckFloor + gap : neckFloor;
+	const cutParams = {
+		...params,
+		gap: 0,
+		minLotWidth: cutWidth,
+		minLotNeck: cutNeck,
+		minLotNeckLocalSkip: params.minLotNeckLocalSkip != null
+			? params.minLotNeckLocalSkip
+			: (cutNeck > 0 ? cutNeck * 1.35 : 0),
+	};
 	const schedule = params.schedule || ['elbow', 'straight', 'elbow'];
 	const maxFailedInRow = params.maxFailedInRow != null ? params.maxFailedInRow : 3;
 	let lots = [block];
@@ -1142,7 +1265,14 @@ export function sliceWardEdgeElbows(block, params = {}) {
 				const shrunk = lot.shrinkRobust(gap / 2);
 				if (shrunk && shrunk.length >= 3 && Math.abs(shrunk.square) > area0 * 0.15) shrunkLot = shrunk;
 			} catch (e) { /* fall back to full-size lot */ }
-			return shrinkOneSideDeeper(shrunkLot, gap, oneSideProb, params.minLotArea || 0);
+			return shrinkOneSideDeeper(
+				shrunkLot,
+				gap,
+				oneSideProb,
+				params.minLotArea || 0,
+				neckFloor,
+				cutParams.minLotNeckLocalSkip
+			);
 		});
 		// Variable setbacks are a local shape detail; they must not change the random stream for
 		// later wards, or unrelated alley cuts can differ and appear as missing lots.

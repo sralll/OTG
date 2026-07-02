@@ -71,6 +71,25 @@ function pointInPolygon(p, poly) {
 	return inside;
 }
 
+function polygonCentroid(poly) {
+	let x = 0, y = 0;
+	for (const p of poly) {
+		x += p.x;
+		y += p.y;
+	}
+	return { x: x / poly.length, y: y / poly.length };
+}
+
+function polygonArea(poly) {
+	let sum = 0;
+	for (let i = 0; i < poly.length; i++) {
+		const a = poly[i];
+		const b = poly[(i + 1) % poly.length];
+		sum += a.x * b.y - a.y * b.x;
+	}
+	return Math.abs(sum) / 2;
+}
+
 function chaikinSmooth(pts, iterations) {
 	let a = pts;
 	for (let it = 0; it < iterations; it++) {
@@ -240,6 +259,35 @@ const sizes = [6, 10, 15, 24];
 
 {
 	const data = generateWards({
+		seed: 1918711411,
+		size: 30,
+		plaza: true,
+		coast: true,
+		river: true,
+		walls: true,
+		streets: true,
+		outerRatio: 4,
+		roadDensity: 5,
+		gates: -1,
+	});
+	const target = data.wards
+		.filter((w) => !w.water && w.type === 'outerGarden')
+		.map((w) => ({ ward: w, c: polygonCentroid(w.polygon) }))
+		.reduce((best, item) => {
+			const d = Math.hypot(item.c.x - 54.3, item.c.y + 206.8);
+			return !best || d < best.distance ? { ...item, distance: d } : best;
+		}, null);
+	check(target && target.distance < 5, 'seed=1918711411 has the west-of-river outer garden ward');
+	if (target) {
+		const blocks = data.blocks.filter((b) => pointInPolygon(polygonCentroid(b), target.ward.polygon));
+		const buildings = data.buildings.filter((b) => pointInPolygon(polygonCentroid(b.polygon), target.ward.polygon));
+		check(blocks.length > 0, 'seed=1918711411 west-of-river outer garden keeps its block');
+		check(buildings.length > 0, 'seed=1918711411 west-of-river outer garden keeps its buildings');
+	}
+}
+
+{
+	const data = generateWards({
 		seed: 42,
 		size: 30,
 		plaza: true,
@@ -262,6 +310,68 @@ const sizes = [6, 10, 15, 24];
 		// WIDE_MAIN_ROADS_50_FLAG: wider road-connected bridge shifts the near-side portal vertex.
 		check(route.path.some((p) => Math.abs(p.x - 8.421314) < 1e-4 && Math.abs(p.y - 5.049534) < 1e-4), 'seed=42 bridge-side route exits from the near bridge side');
 	}
+}
+
+{
+	let highrises = 0;
+	let stepped = 0;
+	let minArea = Infinity;
+	const minAreaByKind = { stepped: Infinity, ascendingStair: Infinity, lShape: Infinity };
+	let stairRhythmChecks = 0;
+	let stairRhythmViolations = 0;
+	for (let seed = 1; seed <= 20; seed++) {
+		const data = generateWards({
+			seed,
+			size: 30,
+			plaza: true,
+			coast: true,
+			river: true,
+			walls: true,
+			streets: true,
+			outerRatio: 4,
+			roadDensity: 5,
+			gates: -1,
+		});
+		const highriseWards = data.wards.filter((w) => !w.water && w.type === 'outerHighrise');
+		const stairRhythms = new Map();
+		for (const b of data.buildings || []) {
+			if (b.class !== 'highrise') continue;
+			highrises++;
+			const vertices = b.polygon.length;
+			const kind = vertices === 12 || vertices === 16
+				? 'stepped'
+				: vertices === 14 || vertices === 19
+					? 'ascendingStair'
+					: vertices === 6
+						? 'lShape'
+						: null;
+			const area = polygonArea(b.polygon);
+			minArea = Math.min(minArea, area);
+			if (kind) minAreaByKind[kind] = Math.min(minAreaByKind[kind], area);
+			if (kind === 'stepped') stepped++;
+			if (kind === 'stepped' || kind === 'ascendingStair') {
+				const c = polygonCentroid(b.polygon);
+				const wardIndex = highriseWards.findIndex((w) => pointInPolygon(c, w.polygon));
+				if (wardIndex >= 0) {
+					const key = `${wardIndex}:${kind}`;
+					if (!stairRhythms.has(key)) stairRhythms.set(key, new Set());
+					stairRhythms.get(key).add(vertices);
+				}
+			}
+		}
+		for (const rhythm of stairRhythms.values()) {
+			stairRhythmChecks++;
+			if (rhythm.size > 1) stairRhythmViolations++;
+		}
+	}
+	check(highrises > 1000, `outer highrise regression has enough samples (${highrises})`);
+	check(stepped / highrises < 0.40, `outer highrise stepped/H-like frequency stays reduced (${(stepped / highrises).toFixed(3)} < 0.400)`);
+	check(minArea >= 12.0, `outer highrise minimum footprint area is not tiny (${minArea.toFixed(3)} >= 12.000)`);
+	check(minAreaByKind.stepped >= 36.0, `stepped outer highrises keep a larger minimum (${minAreaByKind.stepped.toFixed(3)} >= 36.000)`);
+	check(minAreaByKind.ascendingStair >= 22.0, `ascending-stair outer highrises keep a larger minimum (${minAreaByKind.ascendingStair.toFixed(3)} >= 22.000)`);
+	check(minAreaByKind.lShape >= 12.0, `L-shaped outer highrises keep a larger minimum (${minAreaByKind.lShape.toFixed(3)} >= 12.000)`);
+	check(stairRhythmChecks > 100, `outer highrise stair rhythm regression has enough ward samples (${stairRhythmChecks})`);
+	check(stairRhythmViolations === 0, `outer highrise stair rhythm is fixed per ward (${stairRhythmViolations} mixed rhythms)`);
 }
 
 for (const seed of [4, 5, 9, 42, 44, 64]) {
@@ -345,6 +455,28 @@ for (const seed of [4, 5, 9, 42, 44, 64]) {
 	const route = vg.astar(start, goal, { exact: true, timeBudgetMs: 0, maxExpansions: 1000000 });
 	check(vg.losClear(start.x, start.y, goal.x, goal.y, -1, -1), 'seed=42 clear direct route has line of sight');
 	check(route && route.path.length === 2, 'seed=42 clear direct route is not detoured by soft barriers');
+}
+
+{
+	const vg = buildVisibilityGraph({
+		polygons: [{
+			kind: 'building',
+			polygon: [
+				{ x: 4, y: -11 },
+				{ x: 6, y: -11 },
+				{ x: 6, y: 11 },
+				{ x: 4, y: 11 },
+			],
+		}],
+		lines: [],
+		portals: [],
+	}, { clearance: 0 });
+	const start = { x: 0, y: 0 };
+	const goal = { x: 10, y: 0 };
+	const unrestricted = vg.astar(start, goal, { exact: true, timeBudgetMs: 0, maxExpansions: 100000 });
+	check(unrestricted && unrestricted.path.some((p) => Math.abs(p.y) > 10), 'unrestricted synthetic route can detour beyond the start-goal lateral limit');
+	const bounded = vg.astar(start, goal, { exact: true, timeBudgetMs: 0, maxExpansions: 100000, maxStartGoalPerpendicularFactor: 1 });
+	check(!bounded && vg.lastAstarRejectedByLateralLimit, 'route rejects nodes farther sideways than the start-goal distance');
 }
 
 {
@@ -447,6 +579,21 @@ for (const seed of [4, 5, 9, 42, 44, 64]) {
 		}
 	}
 	check(closest >= towerRadius - 1e-6, `seed=42 UI defaults: ${closestLabel} clears wall tower radius (${closest.toFixed(3)} >= ${towerRadius.toFixed(3)})`);
+}
+
+{
+	const data = generateWards({ seed: 1035038042, size: 30, outerRatio: 4, roadDensity: 5, gates: -1 });
+	const required = [
+		{ x: 65.24961837909154, y: -26.236711778965844 },
+		{ x: -24.94066648870882, y: -86.58624741790842 },
+	];
+	for (const p of required)
+		check(
+			data.river.bridges.some((b) => samePoint(b, p)),
+			`seed=1035038042 has a bridge at wall-river road crossing (${p.x.toFixed(3)}, ${p.y.toFixed(3)})`,
+		);
+	const bridgePortals = extractObstacles(data).portals.filter((p) => p.kind === 'bridge');
+	check(bridgePortals.length === data.river.bridges.length, 'seed=1035038042 exposes every bridge as an obstacle portal');
 }
 
 for (const seed of seeds) {

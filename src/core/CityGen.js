@@ -33,6 +33,10 @@ import { clearFeatures, recordFeature, takeFeatures } from './features.js';
 // reference constant: pc.LTOWER_RADIUS = 2.5 (used as the junction-merge floor 3*LTOWER_RADIUS)
 const LTOWER_RADIUS = 2.5;
 
+// TEMP PERF TEST: only build decoration wards this many shared-edge steps from
+// the inner city. Set to null to restore full outer-ward generation.
+const TEMP_OUTER_WARD_EDGE_LIMIT = 2;
+
 function polar(r, a) {
 	return new Point(r * Math.cos(a), r * Math.sin(a));
 }
@@ -169,6 +173,47 @@ function selectCity(cells, size) {
 		if (inner.length >= size) break;
 	}
 	return inner;
+}
+
+function limitOuterWardsByEdgeDistance(cells, inner, maxDistance) {
+	if (!Number.isFinite(maxDistance) || maxDistance < 0 || !inner || inner.length === 0) return cells;
+
+	const edgeCells = new Map();
+	const addCellEdge = (a, b, cell) => {
+		let byEnd = edgeCells.get(a);
+		if (!byEnd) edgeCells.set(a, (byEnd = new Map()));
+		let owners = byEnd.get(b);
+		if (!owners) byEnd.set(b, (owners = []));
+		owners.push(cell);
+	};
+	for (const cell of cells)
+		for (let i = 0; i < cell.length; i++)
+			addCellEdge(cell[i], cell[(i + 1) % cell.length], cell);
+
+	const distances = new Map();
+	const queue = [];
+	for (const cell of inner) {
+		distances.set(cell, 0);
+		queue.push(cell);
+	}
+
+	for (let head = 0; head < queue.length; head++) {
+		const cell = queue[head];
+		const nextDistance = distances.get(cell) + 1;
+		if (nextDistance > maxDistance) continue;
+		for (let i = 0; i < cell.length; i++) {
+			const reverse = edgeCells.get(cell[(i + 1) % cell.length]);
+			const neighbours = reverse ? reverse.get(cell[i]) : null;
+			if (!neighbours) continue;
+			for (const candidate of neighbours) {
+				if (distances.has(candidate) || candidate === cell) continue;
+				distances.set(candidate, nextDistance);
+				queue.push(candidate);
+			}
+		}
+	}
+
+	return cells.filter((cell) => distances.has(cell));
 }
 
 // ---- City.optimizeJunctions (reference) ----
@@ -798,7 +843,7 @@ function clipRiverObstacle(poly, cell, river, detectionExtra = 0) {
 		return poly;
 
 	let clipped = poly;
-	for (let pass = 0; pass < 12; pass++) {
+	for (let pass = 0; pass < 24; pass++) {
 		const nearest = nearestPolylineSegmentToPolygon(clipped, path);
 		if ((!nearest.pathInside && nearest.distance >= clearance - 1e-6) || nearest.segment < 0) return clipped;
 		const before = Math.abs(clipped.square);
@@ -1256,13 +1301,14 @@ export function generateWards(params = {}) {
 	// Collect chamfer "features" (trees/fountains dropped where corner triangles are cut
 	// off) only from the surviving generation, not from any discarded retries above.
 	clearFeatures();
+	const visibleCells = limitOuterWardsByEdgeDistance(result.cells, result.inner, TEMP_OUTER_WARD_EDGE_LIMIT);
 	const { blocks, buildings, alleys, hedges, cathedralHedges, wardTypes } = buildBuildings(
-		result.cells, result.inner, result.center,
+		visibleCells, result.inner, result.center,
 		result.wall, result.streets, result.river, plaza
 	);
 	const features = takeFeatures();
 
-	const wards = result.cells.map((cell) => ({
+	const wards = visibleCells.map((cell) => ({
 		polygon: cell.map((v) => ({ x: v.x, y: v.y })),
 		inner: !!cell.withinCity,
 		water: !!cell.water,
